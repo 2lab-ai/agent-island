@@ -57,7 +57,7 @@ class NotchPanel: NSPanel {
         // We use global event monitors to detect hover/clicks on the notch area
         ignoresMouseEvents = true
 
-        isReleasedWhenClosed = false
+        isReleasedWhenClosed = true
         acceptsMouseMovedEvents = false
     }
 

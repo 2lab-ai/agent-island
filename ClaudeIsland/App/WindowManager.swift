@@ -24,10 +24,12 @@ class WindowManager {
             return nil
         }
 
-        // Close existing window
-        windowController?.window?.close()
+        if let existingController = windowController {
+            existingController.window?.orderOut(nil)
+            existingController.window?.close()
+            windowController = nil
+        }
 
-        // Create new window controller
         windowController = NotchWindowController(screen: screen)
         windowController?.showWindow(nil)
 
