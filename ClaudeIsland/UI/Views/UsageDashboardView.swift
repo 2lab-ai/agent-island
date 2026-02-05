@@ -424,9 +424,24 @@ private struct ProfileUsageRow: View {
             }
 
             HStack(spacing: 10) {
-                UsageServicePill(label: "Claude", info: snapshot?.output?.claude)
-                UsageServicePill(label: "Codex", info: snapshot?.output?.codex)
-                UsageServicePill(label: "Gemini", info: snapshot?.output?.gemini)
+                UsageServiceCard(
+                    label: "Claude",
+                    email: snapshot?.identities.claudeEmail,
+                    info: snapshot?.output?.claude,
+                    windows: [.fiveHour, .sevenDay]
+                )
+                UsageServiceCard(
+                    label: "Codex",
+                    email: snapshot?.identities.codexEmail,
+                    info: snapshot?.output?.codex,
+                    windows: [.fiveHour, .sevenDay]
+                )
+                UsageServiceCard(
+                    label: "Gemini",
+                    email: snapshot?.identities.geminiEmail,
+                    info: snapshot?.output?.gemini,
+                    windows: [.fiveHour]
+                )
             }
 
             if let message = snapshot?.errorMessage {
@@ -488,9 +503,24 @@ private struct CurrentUsageRow: View {
             }
 
             HStack(spacing: 10) {
-                UsageServicePill(label: "Claude", info: snapshot?.output?.claude)
-                UsageServicePill(label: "Codex", info: snapshot?.output?.codex)
-                UsageServicePill(label: "Gemini", info: snapshot?.output?.gemini)
+                UsageServiceCard(
+                    label: "Claude",
+                    email: snapshot?.identities.claudeEmail,
+                    info: snapshot?.output?.claude,
+                    windows: [.fiveHour, .sevenDay]
+                )
+                UsageServiceCard(
+                    label: "Codex",
+                    email: snapshot?.identities.codexEmail,
+                    info: snapshot?.output?.codex,
+                    windows: [.fiveHour, .sevenDay]
+                )
+                UsageServiceCard(
+                    label: "Gemini",
+                    email: snapshot?.identities.geminiEmail,
+                    info: snapshot?.output?.gemini,
+                    windows: [.fiveHour]
+                )
             }
 
             if let message = snapshot?.errorMessage {
@@ -519,45 +549,172 @@ private struct CurrentUsageRow: View {
     }
 }
 
-private struct UsageServicePill: View {
+private struct UsageServiceCard: View {
+    enum Window: CaseIterable {
+        case fiveHour
+        case sevenDay
+
+        var label: String {
+            switch self {
+            case .fiveHour: "5h"
+            case .sevenDay: "7d"
+            }
+        }
+    }
+
     let label: String
+    let email: String?
     let info: CLIUsageInfo?
+    let windows: [Window]
 
     var body: some View {
-        HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 6) {
             Text(label)
                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.45))
+                .foregroundColor(.white.opacity(0.6))
 
-            Spacer(minLength: 6)
+            if let email, !email.isEmpty {
+                Text(email)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.35))
+                    .lineLimit(1)
+            }
 
-            Text(summaryText)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(summaryColor)
+            if let info, !info.available {
+                Text("Not installed")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(TerminalColors.dim)
+            } else if let info, info.error {
+                Text("ERR")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(TerminalColors.amber)
+            } else {
+                ForEach(windows, id: \.label) { window in
+                    UsageWindowRow(
+                        window: window,
+                        percentUsed: percentUsed(for: window),
+                        resetAt: resetAt(for: window)
+                    )
+                }
+            }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 7)
-        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color.white.opacity(0.05))
         )
     }
 
-    private var summaryText: String {
-        guard let info else { return "--" }
-        if !info.available { return "--" }
-        if info.error { return "ERR" }
-
-        let five = info.fiveHourPercent.map { "\(Int($0.rounded()))" } ?? "--"
-        let seven = info.sevenDayPercent.map { "\(Int($0.rounded()))" } ?? "--"
-        return "\(five)/\(seven)"
+    private func percentUsed(for window: Window) -> Double? {
+        guard let info, info.available, !info.error else { return nil }
+        switch window {
+        case .fiveHour: return info.fiveHourPercent
+        case .sevenDay: return info.sevenDayPercent
+        }
     }
 
-    private var summaryColor: Color {
-        guard let info else { return TerminalColors.dim }
-        if !info.available { return TerminalColors.dim }
-        if info.error { return TerminalColors.amber }
+    private func resetAt(for window: Window) -> Date? {
+        guard let info, info.available, !info.error else { return nil }
+        switch window {
+        case .fiveHour: return info.fiveHourReset
+        case .sevenDay: return info.sevenDayReset
+        }
+    }
+}
+
+private struct UsageWindowRow: View {
+    let window: UsageServiceCard.Window
+    let percentUsed: Double?
+    let resetAt: Date?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(window.label)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.35))
+                .frame(width: 18, alignment: .leading)
+
+            MiniUsageBar(fraction: remainingFraction)
+                .frame(height: 6)
+                .frame(width: 46)
+
+            Text(remainingPercentString)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(remainingColor)
+                .frame(width: 32, alignment: .trailing)
+
+            Spacer(minLength: 6)
+
+            Text(timeRemainingString)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.28))
+        }
+    }
+
+    private var remainingFraction: Double {
+        guard let percentUsed else { return 0 }
+        let used = max(0, min(100, percentUsed))
+        return max(0, min(1, (100 - used) / 100))
+    }
+
+    private var remainingPercentString: String {
+        guard let percentUsed else { return "--" }
+        let used = max(0, min(100, percentUsed))
+        let remaining = max(0, min(100, 100 - used))
+        return "\(Int(remaining.rounded()))%"
+    }
+
+    private var remainingColor: Color {
+        guard let percentUsed else { return TerminalColors.dim }
+        let used = max(0, min(100, percentUsed))
+        let remaining = max(0, min(100, 100 - used))
+        if remaining < 10 { return TerminalColors.red }
+        if remaining < 25 { return TerminalColors.amber }
+        return TerminalColors.green
+    }
+
+    private var timeRemainingString: String {
+        guard let resetAt else { return "--" }
+        let seconds = max(0, Int(resetAt.timeIntervalSince(Date())))
+        return formatDuration(seconds)
+    }
+
+    private func formatDuration(_ seconds: Int) -> String {
+        if seconds < 60 { return "<1m" }
+
+        var remaining = seconds
+        let days = remaining / 86_400
+        remaining %= 86_400
+        let hours = remaining / 3_600
+        remaining %= 3_600
+        let minutes = remaining / 60
+
+        if days > 0 { return "\(days)d\(hours)h\(minutes)m" }
+        if hours > 0 { return "\(hours)h\(minutes)m" }
+        return "\(minutes)m"
+    }
+}
+
+private struct MiniUsageBar: View {
+    let fraction: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(Color.white.opacity(0.08))
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(fillColor)
+                    .frame(width: max(0, geo.size.width * fraction))
+            }
+        }
+    }
+
+    private var fillColor: Color {
+        if fraction < 0.1 { return TerminalColors.red }
+        if fraction < 0.25 { return TerminalColors.amber }
         return TerminalColors.green
     }
 }
