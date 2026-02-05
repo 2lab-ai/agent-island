@@ -41,4 +41,5 @@ releases/
 
 # Xcode backup
 *.xcodeproj.backup/
+/.worktrees/
 CLAUDE.md
