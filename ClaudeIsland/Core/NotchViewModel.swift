@@ -24,12 +24,14 @@ enum NotchOpenReason {
 }
 
 enum NotchContentType: Equatable {
+    case usage
     case instances
     case menu
     case chat(SessionState)
 
     var id: String {
         switch self {
+        case .usage: return "usage"
         case .instances: return "instances"
         case .menu: return "menu"
         case .chat(let session): return "chat-\(session.sessionId)"
@@ -43,7 +45,7 @@ class NotchViewModel: ObservableObject {
 
     @Published var status: NotchStatus = .closed
     @Published var openReason: NotchOpenReason = .unknown
-    @Published var contentType: NotchContentType = .instances
+    @Published var contentType: NotchContentType = .usage
     @Published var isHovering: Bool = false
 
     // MARK: - Dependencies
@@ -70,6 +72,11 @@ class NotchViewModel: ObservableObject {
                 width: min(screenRect.width * 0.5, 600),
                 height: 580
             )
+        case .usage:
+            return CGSize(
+                width: min(screenRect.width * 0.5, 600),
+                height: 560
+            )
         case .menu:
             // Compact size for settings menu
             return CGSize(
@@ -95,6 +102,10 @@ class NotchViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private let events = EventMonitors.shared
     private var hoverTimer: DispatchWorkItem?
+
+    // MARK: - Navigation State
+
+    private var lastNonMenuContentType: NotchContentType = .usage
 
     // MARK: - Initialization
 
@@ -234,6 +245,8 @@ class NotchViewModel: ObservableObject {
         // Don't restore chat on notification - show instances list instead
         if reason == .notification {
             currentChatSession = nil
+            lastNonMenuContentType = .instances
+            contentType = .instances
             return
         }
 
@@ -253,7 +266,8 @@ class NotchViewModel: ObservableObject {
             currentChatSession = session
         }
         status = .closed
-        contentType = .instances
+        lastNonMenuContentType = .usage
+        contentType = .usage
     }
 
     func notchPop() {
@@ -267,7 +281,23 @@ class NotchViewModel: ObservableObject {
     }
 
     func toggleMenu() {
-        contentType = contentType == .menu ? .instances : .menu
+        if contentType == .menu {
+            contentType = lastNonMenuContentType == .menu ? .usage : lastNonMenuContentType
+            return
+        }
+
+        lastNonMenuContentType = contentType
+        contentType = .menu
+    }
+
+    func showUsage() {
+        lastNonMenuContentType = .usage
+        contentType = .usage
+    }
+
+    func showSessions() {
+        lastNonMenuContentType = .instances
+        contentType = .instances
     }
 
     func showChat(for session: SessionState) {

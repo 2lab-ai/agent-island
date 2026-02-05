@@ -349,6 +349,11 @@ struct NotchView: View {
     private var contentView: some View {
         Group {
             switch viewModel.contentType {
+            case .usage:
+                UsageDashboardView(
+                    sessionMonitor: sessionMonitor,
+                    viewModel: viewModel
+                )
             case .instances:
                 ClaudeInstancesView(
                     sessionMonitor: sessionMonitor,
