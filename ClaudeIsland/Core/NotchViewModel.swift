@@ -19,12 +19,14 @@ enum NotchOpenReason {
     case click
     case hover
     case notification
+    case usageAlert
     case boot
     case unknown
 }
 
 enum NotchContentType: Equatable {
     case usage
+    case usageAlerts
     case instances
     case menu
     case chat(SessionState)
@@ -32,6 +34,7 @@ enum NotchContentType: Equatable {
     var id: String {
         switch self {
         case .usage: return "usage"
+        case .usageAlerts: return "usage-alerts"
         case .instances: return "instances"
         case .menu: return "menu"
         case .chat(let session): return "chat-\(session.sessionId)"
@@ -76,6 +79,11 @@ class NotchViewModel: ObservableObject {
             return CGSize(
                 width: min(screenRect.width * 0.5, 600),
                 height: 560
+            )
+        case .usageAlerts:
+            return CGSize(
+                width: min(screenRect.width * 0.45, 520),
+                height: 320
             )
         case .menu:
             // Compact size for settings menu
@@ -247,6 +255,13 @@ class NotchViewModel: ObservableObject {
             currentChatSession = nil
             lastNonMenuContentType = .instances
             contentType = .instances
+            return
+        }
+
+        if reason == .usageAlert {
+            currentChatSession = nil
+            lastNonMenuContentType = .usageAlerts
+            contentType = .usageAlerts
             return
         }
 

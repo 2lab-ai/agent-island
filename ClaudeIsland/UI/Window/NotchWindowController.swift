@@ -72,7 +72,7 @@ class NotchWindowController: NSWindowController {
                     // Accept mouse events when opened so buttons work
                     notchWindow?.ignoresMouseEvents = false
                     // Don't steal focus when opened by notification (task finished)
-                    if viewModel?.openReason != .notification {
+                    if viewModel?.openReason != .notification && viewModel?.openReason != .usageAlert {
                         NSApp.activate(ignoringOtherApps: false)
                         notchWindow?.makeKey()
                     }

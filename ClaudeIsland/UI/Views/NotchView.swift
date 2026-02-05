@@ -355,6 +355,11 @@ struct NotchView: View {
                     viewModel: viewModel,
                     model: UsageDashboardViewModel.shared
                 )
+            case .usageAlerts:
+                UsageResetAlertsView(
+                    viewModel: viewModel,
+                    coordinator: UsageResetAlertCoordinator.shared
+                )
             case .instances:
                 ClaudeInstancesView(
                     sessionMonitor: sessionMonitor,

@@ -165,6 +165,9 @@ struct UsageDashboardView: View {
     @State private var newProfileName = ""
     @State private var pendingSwitchProfile: UsageProfile?
     @State private var selectedTab: UsageTab = .dashboard
+    @State private var now = Date()
+
+    private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(spacing: 10) {
@@ -195,6 +198,7 @@ struct UsageDashboardView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .onReceive(clock) { now = $0 }
         .onAppear {
             model.startBackgroundRefreshIfNeeded()
         }
@@ -316,6 +320,7 @@ struct UsageDashboardView: View {
                         title: model.currentSnapshot?.profileName ?? "Current",
                         badge: "UNSAVED",
                         snapshot: model.currentSnapshot,
+                        now: now,
                         showSwitch: false,
                         isSwitching: false,
                         onSwitch: {}
@@ -427,6 +432,7 @@ struct UsageDashboardView: View {
                     title: model.currentSnapshot?.profileName ?? "Current",
                     badge: "UNSAVED",
                     snapshot: model.currentSnapshot,
+                    now: now,
                     showSwitch: false,
                     isSwitching: false,
                     onSwitch: {}
@@ -437,6 +443,7 @@ struct UsageDashboardView: View {
                         title: profile.name,
                         badge: nil,
                         snapshot: model.snapshotsByProfileName[profile.name],
+                        now: now,
                         showSwitch: true,
                         isSwitching: model.switchingProfileName == profile.name,
                         onSwitch: { pendingSwitchProfile = profile }
@@ -446,6 +453,7 @@ struct UsageDashboardView: View {
                         title: model.currentSnapshot?.profileName ?? "Current",
                         badge: "UNSAVED",
                         snapshot: model.currentSnapshot,
+                        now: now,
                         showSwitch: false,
                         isSwitching: false,
                         onSwitch: {}
@@ -460,7 +468,7 @@ struct UsageDashboardView: View {
         ScrollView(.vertical, showsIndicators: false) {
             LazyVGrid(columns: dashboardColumns, spacing: 10) {
                 ForEach(dashboardTiles) { tile in
-                    UsageAccountTileCard(tile: tile)
+                    UsageAccountTileCard(tile: tile, now: now)
                 }
             }
             .padding(.bottom, 4)
@@ -620,7 +628,7 @@ struct UsageDashboardView: View {
     }
 }
 
-private enum UsageProvider {
+enum UsageProvider {
     case claude
     case codex
     case gemini
@@ -634,7 +642,7 @@ private enum UsageProvider {
     }
 }
 
-private enum UsageWindow: CaseIterable {
+enum UsageWindow: CaseIterable {
     case fiveHour
     case twentyFourHour
     case sevenDay
@@ -660,6 +668,7 @@ private struct UsageAccountTile: Identifiable {
 
 private struct UsageAccountTileCard: View {
     let tile: UsageAccountTile
+    let now: Date
 
     @State private var isHovered = false
 
@@ -669,7 +678,8 @@ private struct UsageAccountTileCard: View {
                 provider: tile.provider,
                 email: tile.email,
                 tier: tile.tier,
-                info: tile.info
+                info: tile.info,
+                now: now
             )
 
             if let message = tile.errorMessage {
@@ -694,6 +704,7 @@ private struct UsageDashboardPanel: View {
     let title: String
     let badge: String?
     let snapshot: UsageSnapshot?
+    let now: Date
     let showSwitch: Bool
     let isSwitching: Bool
     let onSwitch: () -> Void
@@ -718,21 +729,24 @@ private struct UsageDashboardPanel: View {
                     provider: .claude,
                     email: snapshot?.identities.claudeEmail,
                     tier: snapshot?.identities.claudeTier,
-                    info: snapshot?.output?.claude
+                    info: snapshot?.output?.claude,
+                    now: now
                 )
                 columnDivider
                 UsageProviderColumn(
                     provider: .codex,
                     email: snapshot?.identities.codexEmail,
                     tier: nil,
-                    info: snapshot?.output?.codex
+                    info: snapshot?.output?.codex,
+                    now: now
                 )
                 columnDivider
                 UsageProviderColumn(
                     provider: .gemini,
                     email: snapshot?.identities.geminiEmail,
                     tier: nil,
-                    info: snapshot?.output?.gemini
+                    info: snapshot?.output?.gemini,
+                    now: now
                 )
             }
 
@@ -829,6 +843,7 @@ private struct UsageProviderColumn: View {
     let email: String?
     let tier: String?
     let info: CLIUsageInfo?
+    let now: Date
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -891,13 +906,14 @@ private struct UsageProviderColumn: View {
     private var usageRows: some View {
         switch provider {
         case .gemini:
-            GeminiUsageSummaryRow(info: info)
+            GeminiUsageSummaryRow(info: info, now: now)
         case .claude, .codex:
             ForEach(providerWindows, id: \.label) { window in
                 UsageWindowRow(
                     window: window,
                     percentUsed: percentUsed(for: window),
-                    resetAt: resetAt(for: window)
+                    resetAt: resetAt(for: window),
+                    now: now
                 )
             }
         }
@@ -1001,6 +1017,7 @@ private struct TierBadge: View {
 
 private struct GeminiUsageSummaryRow: View {
     let info: CLIUsageInfo?
+    let now: Date
 
     var body: some View {
         HStack(spacing: 8) {
@@ -1056,7 +1073,7 @@ private struct GeminiUsageSummaryRow: View {
                 .foregroundColor(baseColor)
         }
 
-        let seconds = max(0, Int(resetAt.timeIntervalSince(Date())))
+        let seconds = max(0, Int(resetAt.timeIntervalSince(now)))
         return Text("(").foregroundColor(baseColor)
             + Text("Resets in ").foregroundColor(baseColor)
             + UsageDurationText.make(seconds: seconds, digitColor: baseColor)
@@ -1068,6 +1085,7 @@ private struct UsageWindowRow: View {
     let window: UsageWindow
     let percentUsed: Double?
     let resetAt: Date?
+    let now: Date
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -1144,14 +1162,14 @@ private struct UsageWindowRow: View {
 
     private var resetRemainingFraction: Double {
         guard let resetAt, let total = windowDurationSeconds else { return 0 }
-        let remaining = max(0, resetAt.timeIntervalSince(Date()))
+        let remaining = max(0, resetAt.timeIntervalSince(now))
         return max(0, min(1, remaining / total))
     }
 
     private var timeRemainingText: Text {
         let baseColor = Color.white.opacity(0.28)
         guard let resetAt else { return Text("--").foregroundColor(baseColor) }
-        let seconds = max(0, Int(resetAt.timeIntervalSince(Date())))
+        let seconds = max(0, Int(resetAt.timeIntervalSince(now)))
         return UsageDurationText.make(seconds: seconds, digitColor: baseColor)
     }
 
@@ -1164,52 +1182,6 @@ private struct UsageWindowRow: View {
         case .sevenDay:
             return 7 * 24 * 60 * 60
         }
-    }
-}
-
-private enum UsageDurationText {
-    static func make(
-        seconds: Int,
-        digitColor: Color = Color.white.opacity(0.32),
-        dayUnitColor: Color = TerminalColors.amber.opacity(0.95),
-        hourUnitColor: Color = TerminalColors.blue.opacity(0.85),
-        minuteUnitColor: Color = TerminalColors.cyan.opacity(0.55)
-    ) -> Text {
-        let clamped = max(0, seconds)
-        if clamped < 60 {
-            return Text("<1").foregroundColor(digitColor)
-                + Text("m").foregroundColor(minuteUnitColor)
-        }
-
-        var remaining = clamped
-        let days = remaining / 86_400
-        remaining %= 86_400
-        let hours = remaining / 3_600
-        remaining %= 3_600
-        let minutes = remaining / 60
-
-        func part(_ value: Int, unit: String, unitColor: Color) -> Text {
-            Text("\(value)").foregroundColor(digitColor)
-                + Text(unit).foregroundColor(unitColor)
-        }
-
-        let spacer = Text(" ").foregroundColor(digitColor)
-
-        if days > 0 {
-            return part(days, unit: "d", unitColor: dayUnitColor)
-                + spacer
-                + part(hours, unit: "h", unitColor: hourUnitColor)
-                + spacer
-                + part(minutes, unit: "m", unitColor: minuteUnitColor)
-        }
-
-        if hours > 0 {
-            return part(hours, unit: "h", unitColor: hourUnitColor)
-                + spacer
-                + part(minutes, unit: "m", unitColor: minuteUnitColor)
-        }
-
-        return part(minutes, unit: "m", unitColor: minuteUnitColor)
     }
 }
 

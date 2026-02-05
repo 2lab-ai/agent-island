@@ -70,7 +70,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.setActivationPolicy(.accessory)
 
         windowManager = WindowManager()
-        _ = windowManager?.setupNotchWindow()
+        let notchController = windowManager?.setupNotchWindow()
+
+        UsageResetAlertCoordinator.shared.attachNotchViewModel(notchController?.viewModel)
+        UsageResetAlertCoordinator.shared.startIfNeeded(model: UsageDashboardViewModel.shared)
 
         Task { @MainActor in
             UsageDashboardViewModel.shared.startBackgroundRefreshIfNeeded()
@@ -91,7 +94,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleScreenChange() {
-        _ = windowManager?.setupNotchWindow()
+        let notchController = windowManager?.setupNotchWindow()
+        UsageResetAlertCoordinator.shared.attachNotchViewModel(notchController?.viewModel)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
