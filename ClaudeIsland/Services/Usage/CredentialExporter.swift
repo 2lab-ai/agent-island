@@ -13,12 +13,16 @@ struct ExportResult {
 }
 
 final class CredentialExporter {
-    func exportCurrentCredentials(to accountRoot: URL) throws -> ExportResult {
-        let credentials = ExportCredentials(
+    func loadCurrentCredentials() -> ExportCredentials {
+        ExportCredentials(
             claude: readClaudeCredentials(),
             codex: readCodexCredentials(),
             gemini: readGeminiCredentials()
         )
+    }
+
+    func exportCurrentCredentials(to accountRoot: URL) throws -> ExportResult {
+        let credentials = loadCurrentCredentials()
         return try export(credentials, to: accountRoot)
     }
 

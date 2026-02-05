@@ -6,11 +6,15 @@ final class UsageDashboardViewModel: ObservableObject {
     @Published var profiles: [UsageProfile] = []
     @Published var snapshotsByProfileName: [String: UsageSnapshot] = [:]
     @Published var isRefreshing = false
+    @Published var isSavingProfile = false
+    @Published var switchingProfileName: String?
     @Published var loadErrorMessage: String?
+    @Published var lastActionMessage: String?
 
     private let accountStore: AccountStore
     private let profileStore: ProfileStore
     private let fetcher: UsageFetcher
+    private let switcher: ProfileSwitcher
 
     private var refreshTask: Task<Void, Never>?
 
@@ -18,6 +22,7 @@ final class UsageDashboardViewModel: ObservableObject {
         self.accountStore = accountStore
         self.profileStore = ProfileStore(accountStore: accountStore)
         self.fetcher = UsageFetcher(accountStore: accountStore, cache: UsageCache())
+        self.switcher = ProfileSwitcher(accountStore: accountStore, exporter: CredentialExporter())
     }
 
     func load() {
@@ -48,6 +53,44 @@ final class UsageDashboardViewModel: ObservableObject {
             }
         }
     }
+
+    func saveProfile(named name: String) async -> Bool {
+        isSavingProfile = true
+        defer { isSavingProfile = false }
+
+        do {
+            let result = try switcher.saveCurrentProfile(named: name)
+            lastActionMessage = result.warnings.isEmpty
+                ? "Saved profile “\(result.profile.name)”."
+                : "Saved “\(result.profile.name)” with warnings: \(result.warnings.joined(separator: " · "))"
+
+            profiles = try profileStore.loadProfiles()
+            refresh()
+            return true
+        } catch {
+            lastActionMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    func switchToProfile(_ profile: UsageProfile) async {
+        switchingProfileName = profile.name
+        defer { switchingProfileName = nil }
+
+        do {
+            let result = try switcher.switchToProfile(profile)
+            var flags: [String] = []
+            if result.claudeSwitched { flags.append("Claude") }
+            if result.codexSwitched { flags.append("Codex") }
+            if result.geminiSwitched { flags.append("Gemini") }
+
+            let switchedSummary = flags.isEmpty ? "No files copied." : "Switched: \(flags.joined(separator: ", "))."
+            let warningsSummary = result.warnings.isEmpty ? nil : "Warnings: \(result.warnings.joined(separator: " · "))"
+            lastActionMessage = [switchedSummary, warningsSummary].compactMap { $0 }.joined(separator: " ")
+        } catch {
+            lastActionMessage = error.localizedDescription
+        }
+    }
 }
 
 struct UsageDashboardView: View {
@@ -55,9 +98,27 @@ struct UsageDashboardView: View {
     @ObservedObject var viewModel: NotchViewModel
     @StateObject private var model = UsageDashboardViewModel()
 
+    @State private var isSaveSheetPresented = false
+    @State private var newProfileName = ""
+    @State private var pendingSwitchProfile: UsageProfile?
+
     var body: some View {
         VStack(spacing: 10) {
             header
+
+            if let message = model.lastActionMessage {
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.6))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color.white.opacity(0.05))
+                    )
+                    .padding(.horizontal, 6)
+            }
 
             profilesSection
 
@@ -71,6 +132,44 @@ struct UsageDashboardView: View {
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .onAppear { model.load() }
+        .confirmationDialog(
+            "Switch Profile (Experimental)",
+            isPresented: Binding(
+                get: { pendingSwitchProfile != nil },
+                set: { if !$0 { pendingSwitchProfile = nil } }
+            )
+        ) {
+            Button("Switch", role: .destructive) {
+                guard let profile = pendingSwitchProfile else { return }
+                pendingSwitchProfile = nil
+                Task { await model.switchToProfile(profile) }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingSwitchProfile = nil
+            }
+        } message: {
+            if let profile = pendingSwitchProfile {
+                Text("This will overwrite your active CLI credentials with “\(profile.name)”. Best-effort only.")
+            } else {
+                Text("This will overwrite your active CLI credentials. Best-effort only.")
+            }
+        }
+        .sheet(isPresented: $isSaveSheetPresented) {
+            SaveProfileSheet(
+                isSaving: model.isSavingProfile,
+                name: $newProfileName,
+                onCancel: { isSaveSheetPresented = false },
+                onSave: {
+                    Task {
+                        let ok = await model.saveProfile(named: newProfileName)
+                        if ok {
+                            newProfileName = ""
+                            isSaveSheetPresented = false
+                        }
+                    }
+                }
+            )
+        }
     }
 
     private var header: some View {
@@ -85,6 +184,26 @@ struct UsageDashboardView: View {
             }
 
             Spacer()
+
+            Button {
+                isSaveSheetPresented = true
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "square.and.arrow.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.7))
+                    Text("Save")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white.opacity(0.7))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.white.opacity(0.06))
+                )
+            }
+            .buttonStyle(.plain)
 
             Button {
                 model.refresh()
@@ -133,7 +252,9 @@ struct UsageDashboardView: View {
                         ForEach(model.profiles) { profile in
                             ProfileUsageRow(
                                 profile: profile,
-                                snapshot: model.snapshotsByProfileName[profile.name]
+                                snapshot: model.snapshotsByProfileName[profile.name],
+                                isSwitching: model.switchingProfileName == profile.name,
+                                onSwitch: { pendingSwitchProfile = profile }
                             )
                         }
                     }
@@ -242,6 +363,8 @@ struct UsageDashboardView: View {
 private struct ProfileUsageRow: View {
     let profile: UsageProfile
     let snapshot: UsageSnapshot?
+    let isSwitching: Bool
+    let onSwitch: () -> Void
 
     @State private var isHovered = false
 
@@ -260,6 +383,32 @@ private struct ProfileUsageRow: View {
                         .font(.system(size: 10, weight: .medium, design: .monospaced))
                         .foregroundColor(.white.opacity(snapshot.isStale ? 0.35 : 0.45))
                 }
+
+                Button {
+                    onSwitch()
+                } label: {
+                    HStack(spacing: 6) {
+                        if isSwitching {
+                            ProgressView()
+                                .scaleEffect(0.5)
+                                .frame(width: 10, height: 10)
+                        } else {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        Text("Switch")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    .foregroundColor(.white.opacity(0.6))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(Color.white.opacity(0.05))
+                    )
+                }
+                .buttonStyle(.plain)
+                .disabled(isSwitching)
             }
 
             HStack(spacing: 10) {
@@ -334,5 +483,42 @@ private struct UsageServicePill: View {
         if !info.available { return TerminalColors.dim }
         if info.error { return TerminalColors.amber }
         return TerminalColors.green
+    }
+}
+
+private struct SaveProfileSheet: View {
+    let isSaving: Bool
+    @Binding var name: String
+    let onCancel: () -> Void
+    let onSave: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Save Profile")
+                .font(.system(size: 16, weight: .semibold))
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Profile Name")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary)
+
+                TextField("e.g. Work", text: $name)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            Text("This snapshots your current Claude/Codex/Gemini CLI credentials into `~/.claude-island/accounts/` and links them to the profile.")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+
+            HStack {
+                Button("Cancel") { onCancel() }
+                Spacer()
+                Button(isSaving ? "Saving…" : "Save") { onSave() }
+                    .disabled(isSaving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 380)
     }
 }
