@@ -9,6 +9,7 @@ CONFIGURATION="${CONFIGURATION:-Release}"
 DERIVED_DATA="${DERIVED_DATA:-/tmp/ClaudeIslandDerivedData-make-up}"
 
 BUNDLE_ID="${BUNDLE_ID:-com.celestial.ClaudeIsland}"
+INSTALL_PATH="${INSTALL_PATH:-}"
 APP_NAME="${APP_NAME:-Claude Island.app}"
 
 BUILT_APP="$DERIVED_DATA/Build/Products/$CONFIGURATION/$APP_NAME"
@@ -51,17 +52,25 @@ end run
 APPLESCRIPT
 }
 
-INSTALLED_APP="$(resolve_installed_app_path | sed -e 's:/*$::')"
-if [[ -z "$INSTALLED_APP" ]]; then
+INSTALLED_APP=""
+
+if [[ -n "$INSTALL_PATH" ]]; then
+  INSTALLED_APP="$INSTALL_PATH"
+else
   for candidate in "/Applications/$APP_NAME" "$HOME/Applications/$APP_NAME"; do
     if [[ -d "$candidate" ]]; then
       INSTALLED_APP="$candidate"
       break
     fi
   done
-fi
-if [[ -z "$INSTALLED_APP" ]]; then
-  INSTALLED_APP="/Applications/$APP_NAME"
+
+  if [[ -z "$INSTALLED_APP" ]]; then
+    INSTALLED_APP="$(resolve_installed_app_path | sed -e 's:/*$::')"
+  fi
+
+  if [[ -z "$INSTALLED_APP" ]]; then
+    INSTALLED_APP="/Applications/$APP_NAME"
+  fi
 fi
 
 if [[ "$INSTALLED_APP" != *.app ]]; then
@@ -99,4 +108,3 @@ echo "==> Launching"
 open "$INSTALLED_APP"
 
 echo "==> Done"
-
