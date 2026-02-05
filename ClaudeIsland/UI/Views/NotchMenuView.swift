@@ -24,11 +24,11 @@ struct NotchMenuView: View {
     var body: some View {
         VStack(spacing: 4) {
             // Navigation
-            MenuRow(icon: "gauge.with.dots.needle.67percent", label: "구독 사용량") {
+            MenuRow(icon: "gauge.with.dots.needle.67percent", label: "Usage") {
                 viewModel.showUsage()
             }
 
-            MenuRow(icon: "list.bullet.rectangle", label: "클로드 세션 리스트") {
+            MenuRow(icon: "list.bullet.rectangle", label: "Claude Sessions") {
                 viewModel.showSessions()
             }
 

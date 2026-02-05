@@ -227,7 +227,7 @@ struct UsageDashboardView: View {
     private var header: some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("구독 사용량")
+                Text("Usage")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.white)
                 Text("Profiles")
@@ -431,7 +431,7 @@ struct UsageDashboardView: View {
                 viewModel.showSessions()
             } label: {
                 HStack(spacing: 8) {
-                    Text("클로드 세션 리스트")
+                    Text("Claude Sessions")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(.white.opacity(0.85))
                     Spacer()
@@ -509,11 +509,11 @@ private enum UsageProvider {
     case codex
     case gemini
 
-    var columnTitle: String {
+    var displayName: String {
         switch self {
-        case .claude: "클로드 계정별 사용량"
-        case .codex: "코덱스 계정별 사용량"
-        case .gemini: "젬미니 계정별 사용량"
+        case .claude: "Claude"
+        case .codex: "Codex"
+        case .gemini: "Gemini"
         }
     }
 }
@@ -560,24 +560,21 @@ private struct UsageDashboardPanel: View {
                     provider: .claude,
                     email: snapshot?.identities.claudeEmail,
                     tier: snapshot?.identities.claudeTier,
-                    info: snapshot?.output?.claude,
-                    tokenRefresh: snapshot?.tokenRefresh.claude
+                    info: snapshot?.output?.claude
                 )
                 columnDivider
                 UsageProviderColumn(
                     provider: .codex,
                     email: snapshot?.identities.codexEmail,
                     tier: nil,
-                    info: snapshot?.output?.codex,
-                    tokenRefresh: snapshot?.tokenRefresh.codex
+                    info: snapshot?.output?.codex
                 )
                 columnDivider
                 UsageProviderColumn(
                     provider: .gemini,
                     email: snapshot?.identities.geminiEmail,
                     tier: nil,
-                    info: snapshot?.output?.gemini,
-                    tokenRefresh: snapshot?.tokenRefresh.gemini
+                    info: snapshot?.output?.gemini
                 )
             }
 
@@ -674,15 +671,10 @@ private struct UsageProviderColumn: View {
     let email: String?
     let tier: String?
     let info: CLIUsageInfo?
-    let tokenRefresh: TokenRefreshInfo?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(provider.columnTitle)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.white.opacity(0.55))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
+            header
 
             if let email, !email.isEmpty {
                 Text(email)
@@ -696,8 +688,6 @@ private struct UsageProviderColumn: View {
                     .foregroundColor(.white.opacity(0.2))
             }
 
-            TierRow(tier: displayTier)
-
             if let info, !info.available {
                 Text("Not installed")
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
@@ -709,18 +699,26 @@ private struct UsageProviderColumn: View {
             } else {
                 usageRows
             }
-
-            if let tokenRefresh {
-                TokenRefreshRow(
-                    expiresAt: tokenRefresh.expiresAt,
-                    lifetimeSeconds: tokenRefresh.lifetimeSeconds
-                )
-            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var displayTier: String? {
+    private var header: some View {
+        HStack(spacing: 8) {
+            Text(provider.displayName)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.white.opacity(0.75))
+                .lineLimit(1)
+
+            Spacer(minLength: 6)
+
+            if let tier = resolvedTier {
+                TierBadge(provider: provider, tier: tier)
+            }
+        }
+    }
+
+    private var resolvedTier: String? {
         switch provider {
         case .claude:
             return tier
@@ -796,22 +794,50 @@ private struct UsageProviderColumn: View {
     }
 }
 
-private struct TierRow: View {
-    let tier: String?
+private struct TierBadge: View {
+    let provider: UsageProvider
+    let tier: String
 
     var body: some View {
-        HStack(spacing: 6) {
-            Text("tier")
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.35))
-                .frame(width: 18, alignment: .leading)
+        Text(label)
+            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            .foregroundColor(style.foreground)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(style.background)
+            )
+    }
 
-            Text(tier?.nonEmptyOrNil ?? "--")
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(tier == nil ? 0.2 : 0.35))
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
+    private var label: String {
+        let lowered = tier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if lowered.contains("max") && lowered.contains("20") { return "Max20" }
+        if lowered.contains("max") && lowered.contains("5") { return "Max5" }
+        if lowered.contains("plus") { return "Plus" }
+        if lowered.contains("pro") { return "Pro" }
+        if lowered.contains("flash") { return "Flash" }
+        if lowered.contains("ultra") { return "Ultra" }
+        if lowered.contains("nano") { return "Nano" }
+        return tier
+    }
+
+    private var style: (background: Color, foreground: Color) {
+        let key = label.lowercased()
+
+        switch provider {
+        case .claude:
+            if key == "pro" { return (Color.white.opacity(0.9), Color.black.opacity(0.85)) }
+            if key == "max5" { return (TerminalColors.amber, Color.black.opacity(0.85)) }
+            if key == "max20" { return (TerminalColors.red, Color.white.opacity(0.9)) }
+        case .codex:
+            if key == "plus" { return (Color.white.opacity(0.9), Color.black.opacity(0.85)) }
+            if key == "pro" { return (TerminalColors.red, Color.white.opacity(0.9)) }
+        case .gemini:
+            return (TerminalColors.blue.opacity(0.85), Color.white.opacity(0.9))
         }
+
+        return (Color.white.opacity(0.08), Color.white.opacity(0.55))
     }
 }
 
@@ -897,97 +923,62 @@ private struct GeminiUsageSummaryRow: View {
     }
 }
 
-private struct TokenRefreshRow: View {
-    let expiresAt: Date
-    let lifetimeSeconds: TimeInterval
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Text("tok")
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.35))
-                .frame(width: 18, alignment: .leading)
-
-            MiniUsageBar(fraction: remainingFraction)
-                .frame(height: 6)
-                .frame(width: 46)
-
-            Text(timeRemainingString)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.28))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-                .frame(maxWidth: .infinity, alignment: .trailing)
-        }
-    }
-
-    private var remainingFraction: Double {
-        let remaining = max(0, expiresAt.timeIntervalSince(Date()))
-        let total = max(1, lifetimeSeconds)
-        return max(0, min(1, remaining / total))
-    }
-
-    private var timeRemainingString: String {
-        let seconds = max(0, Int(expiresAt.timeIntervalSince(Date())))
-        return formatDuration(seconds)
-    }
-
-    private func formatDuration(_ seconds: Int) -> String {
-        if seconds < 60 { return "<1m" }
-
-        var remaining = seconds
-        let days = remaining / 86_400
-        remaining %= 86_400
-        let hours = remaining / 3_600
-        remaining %= 3_600
-        let minutes = remaining / 60
-
-        if days > 0 {
-            let hh = String(format: "%02d", hours)
-            let mm = String(format: "%02d", minutes)
-            return "\(days)d\(hh)h\(mm)m"
-        }
-
-        if hours > 0 {
-            let mm = String(format: "%02d", minutes)
-            return "\(hours)h\(mm)m"
-        }
-
-        return "\(minutes)m"
-    }
-}
-
 private struct UsageWindowRow: View {
     let window: UsageWindow
     let percentUsed: Double?
     let resetAt: Date?
 
     var body: some View {
-        HStack(spacing: 6) {
-            Text(window.label)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.35))
-                .frame(width: 18, alignment: .leading)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(window.label)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.35))
+                    .frame(width: 18, alignment: .leading)
 
-            MiniUsageBar(fraction: remainingFraction)
+                MiniSegmentBar(
+                    fraction: usageRemainingFraction,
+                    fillColor: usageFillColor,
+                    emptyColor: Color.white.opacity(0.08)
+                )
                 .frame(height: 6)
                 .frame(width: 46)
 
-            Text(remainingPercentString)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(remainingColor)
-                .frame(width: 32, alignment: .trailing)
+                MiniSegmentBar(
+                    fraction: resetRemainingFraction,
+                    fillColor: TerminalColors.blue.opacity(0.85),
+                    emptyColor: Color.white.opacity(0.08)
+                )
+                .frame(height: 6)
+                .frame(width: 46)
 
-            Text(timeRemainingString)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.28))
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-                .frame(maxWidth: .infinity, alignment: .trailing)
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 6) {
+                Color.clear
+                    .frame(width: 18, height: 1)
+
+                Text(remainingPercentString)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(usageTextColor)
+                    .frame(width: 46, alignment: .center)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+
+                Text(timeRemainingString)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.28))
+                    .frame(width: 46, alignment: .center)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+
+                Spacer(minLength: 0)
+            }
         }
     }
 
-    private var remainingFraction: Double {
+    private var usageRemainingFraction: Double {
         guard let percentUsed else { return 0 }
         let used = max(0, min(100, percentUsed))
         return max(0, min(1, (100 - used) / 100))
@@ -1000,19 +991,38 @@ private struct UsageWindowRow: View {
         return "\(Int(remaining.rounded()))%"
     }
 
-    private var remainingColor: Color {
-        guard let percentUsed else { return TerminalColors.dim }
-        let used = max(0, min(100, percentUsed))
-        let remaining = max(0, min(100, 100 - used))
-        if remaining < 10 { return TerminalColors.red }
-        if remaining < 25 { return TerminalColors.amber }
-        return TerminalColors.green
+    private var usageFillColor: Color {
+        let fraction = max(0, min(1, usageRemainingFraction))
+        let hue = 0.33 * fraction
+        return Color(hue: hue, saturation: 0.85, brightness: 0.95)
+    }
+
+    private var usageTextColor: Color {
+        guard percentUsed != nil else { return TerminalColors.dim }
+        return usageFillColor.opacity(0.9)
+    }
+
+    private var resetRemainingFraction: Double {
+        guard let resetAt, let total = windowDurationSeconds else { return 0 }
+        let remaining = max(0, resetAt.timeIntervalSince(Date()))
+        return max(0, min(1, remaining / total))
     }
 
     private var timeRemainingString: String {
         guard let resetAt else { return "--" }
         let seconds = max(0, Int(resetAt.timeIntervalSince(Date())))
         return formatDuration(seconds)
+    }
+
+    private var windowDurationSeconds: TimeInterval? {
+        switch window {
+        case .fiveHour:
+            return 5 * 60 * 60
+        case .twentyFourHour:
+            return 24 * 60 * 60
+        case .sevenDay:
+            return 7 * 24 * 60 * 60
+        }
     }
 
     private func formatDuration(_ seconds: Int) -> String {
@@ -1047,8 +1057,10 @@ private extension String {
     }
 }
 
-private struct MiniUsageBar: View {
+private struct MiniSegmentBar: View {
     let fraction: Double
+    let fillColor: Color
+    let emptyColor: Color
 
     var body: some View {
         GeometryReader { geo in
@@ -1061,17 +1073,11 @@ private struct MiniUsageBar: View {
             HStack(spacing: spacing) {
                 ForEach(0..<segmentCount, id: \.self) { index in
                     RoundedRectangle(cornerRadius: 2)
-                        .fill(index < filledSegments ? fillColor : Color.white.opacity(0.08))
+                        .fill(index < filledSegments ? fillColor : emptyColor)
                         .frame(width: segmentWidth)
                 }
             }
         }
-    }
-
-    private var fillColor: Color {
-        if fraction < 0.1 { return TerminalColors.red }
-        if fraction < 0.25 { return TerminalColors.amber }
-        return TerminalColors.green
     }
 }
 
