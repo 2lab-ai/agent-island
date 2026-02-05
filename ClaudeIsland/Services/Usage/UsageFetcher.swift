@@ -87,7 +87,32 @@ final class UsageFetcher {
         let tempHomeURL = try buildTempHome(profile: profile, accounts: accounts)
         defer { try? FileManager.default.removeItem(at: tempHomeURL) }
 
-        let json = try await runDockerCheckUsage(homeURL: tempHomeURL, scriptURL: scriptURL)
+        try stageVendoredScript(into: tempHomeURL, scriptURL: scriptURL)
+
+        let scriptPathInContainer = "/home/node/.claude-island-scripts/check-usage.js"
+
+        let json: Data
+        do {
+            json = try await runDockerCheckUsage(
+                homeURL: tempHomeURL,
+                scriptPathInContainer: scriptPathInContainer,
+                dockerContext: nil
+            )
+        } catch let error as UsageFetcherError {
+            // If the user has a remote Docker context selected, volume mounts will
+            // not point at the local filesystem. Retry against Docker Desktop.
+            if case .dockerFailed(_, let stderr) = error,
+               stderr.contains("Cannot find module") || stderr.contains("MODULE_NOT_FOUND") {
+                json = try await runDockerCheckUsage(
+                    homeURL: tempHomeURL,
+                    scriptPathInContainer: scriptPathInContainer,
+                    dockerContext: "desktop-linux"
+                )
+            } else {
+                throw error
+            }
+        }
+
         do {
             return try Self.decodeUsageOutput(json)
         } catch {
@@ -156,27 +181,59 @@ final class UsageFetcher {
         try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
     }
 
-    private func runDockerCheckUsage(homeURL: URL, scriptURL: URL) async throws -> Data {
-        let scriptDirURL = scriptURL.deletingLastPathComponent()
+    private func stageVendoredScript(into homeURL: URL, scriptURL: URL) throws {
+        let scriptsDir = homeURL.appendingPathComponent(".claude-island-scripts", isDirectory: true)
+        try FileManager.default.createDirectory(at: scriptsDir, withIntermediateDirectories: true)
+
+        let packageURL = scriptURL.deletingLastPathComponent().appendingPathComponent("package.json")
+
+        let destinationScriptURL = scriptsDir.appendingPathComponent("check-usage.js")
+        let destinationPackageURL = scriptsDir.appendingPathComponent("package.json")
+
+        try? FileManager.default.removeItem(at: destinationScriptURL)
+        try FileManager.default.copyItem(at: scriptURL, to: destinationScriptURL)
+
+        if FileManager.default.fileExists(atPath: packageURL.path) {
+            try? FileManager.default.removeItem(at: destinationPackageURL)
+            try FileManager.default.copyItem(at: packageURL, to: destinationPackageURL)
+        } else {
+            let fallback = """
+            {
+              "name": "claude-dashboard-vendored",
+              "private": true,
+              "type": "module"
+            }
+            """
+            try Data(fallback.utf8).write(to: destinationPackageURL, options: [.atomic])
+        }
+    }
+
+    private func runDockerCheckUsage(
+        homeURL: URL,
+        scriptPathInContainer: String,
+        dockerContext: String?
+    ) async throws -> Data {
 
         let process = Process()
         let outPipe = Pipe()
         let errPipe = Pipe()
 
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = [
-            "docker",
+        var arguments: [String] = ["docker"]
+        if let dockerContext {
+            arguments.append(contentsOf: ["--context", dockerContext])
+        }
+        arguments.append(contentsOf: [
             "run",
             "--rm",
             "--user", "node",
             "--env", "HOME=/home/node",
             "--volume", "\(homeURL.path):/home/node",
-            // The vendored script is ESM; mounting its directory ensures the adjacent
-            // package.json ("type": "module") is visible to Node.
-            "--volume", "\(scriptDirURL.path):/app:ro",
             dockerImage,
-            "node", "/app/check-usage.js", "--json",
-        ]
+            "node", scriptPathInContainer, "--json",
+        ])
+
+        process.arguments = arguments
         process.standardOutput = outPipe
         process.standardError = errPipe
 
