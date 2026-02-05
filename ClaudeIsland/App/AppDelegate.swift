@@ -1,6 +1,5 @@
 import AppKit
 import IOKit
-import Mixpanel
 import Sparkle
 import SwiftUI
 
@@ -41,16 +40,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        Mixpanel.initialize(token: "49814c1436104ed108f3fc4735228496")
+        Analytics.initializeIfNeeded()
 
         let distinctId = getOrCreateDistinctId()
-        Mixpanel.mainInstance().identify(distinctId: distinctId)
+        Analytics.identify(distinctId: distinctId)
 
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown"
         let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "unknown"
         let osVersion = Foundation.ProcessInfo.processInfo.operatingSystemVersionString
 
-        Mixpanel.mainInstance().registerSuperProperties([
+        Analytics.registerSuperProperties([
             "app_version": version,
             "build_number": build,
             "macos_version": osVersion
@@ -58,14 +57,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         fetchAndRegisterClaudeVersion()
 
-        Mixpanel.mainInstance().people.set(properties: [
+        Analytics.peopleSet(properties: [
             "app_version": version,
             "build_number": build,
             "macos_version": osVersion
         ])
 
-        Mixpanel.mainInstance().track(event: "App Launched")
-        Mixpanel.mainInstance().flush()
+        Analytics.track(event: "App Launched")
+        Analytics.flush()
 
         HookInstaller.installIfNeeded()
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -92,7 +91,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        Mixpanel.mainInstance().flush()
+        Analytics.flush()
         updateCheckTimer?.invalidate()
         screenObserver = nil
     }
@@ -168,8 +167,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                   let json = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                   let version = json["version"] as? String else { continue }
 
-            Mixpanel.mainInstance().registerSuperProperties(["claude_code_version": version])
-            Mixpanel.mainInstance().people.set(properties: ["claude_code_version": version])
+            Analytics.registerSuperProperties(["claude_code_version": version])
+            Analytics.peopleSet(properties: ["claude_code_version": version])
             return
         }
     }

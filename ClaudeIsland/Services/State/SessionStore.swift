@@ -8,7 +8,6 @@
 
 import Combine
 import Foundation
-import Mixpanel
 import os.log
 
 /// Central state manager for all Claude sessions
@@ -122,7 +121,7 @@ actor SessionStore {
 
         // Track new session in Mixpanel
         if isNewSession {
-            Mixpanel.mainInstance().track(event: "Session Started")
+            Analytics.track(event: "Session Started")
         }
 
         session.pid = event.pid
