@@ -1,0 +1,5 @@
+{
+  "name": "claude-dashboard-vendored",
+  "private": true,
+  "type": "module"
+}
