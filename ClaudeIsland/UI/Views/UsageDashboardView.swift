@@ -155,10 +155,16 @@ struct UsageDashboardView: View {
     @ObservedObject var viewModel: NotchViewModel
     @ObservedObject var model: UsageDashboardViewModel
 
+    private enum UsageTab: Hashable {
+        case dashboard
+        case current
+        case profile(String)
+    }
+
     @State private var isSaveSheetPresented = false
     @State private var newProfileName = ""
     @State private var pendingSwitchProfile: UsageProfile?
-    @State private var selectedProfileName: String?
+    @State private var selectedTab: UsageTab = .dashboard
 
     var body: some View {
         VStack(spacing: 10) {
@@ -266,7 +272,7 @@ struct UsageDashboardView: View {
             .buttonStyle(.plain)
 
             Button {
-                model.refresh(selectedProfileName: selectedProfileName)
+                refreshSelectedTab()
             } label: {
                 HStack(spacing: 6) {
                     if model.isRefreshing {
@@ -330,20 +336,28 @@ struct UsageDashboardView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
                 profileTabButton(
+                    title: "Dashboard",
+                    badge: "ALL",
+                    isSelected: selectedTab == .dashboard
+                ) {
+                    selectTab(.dashboard)
+                }
+
+                profileTabButton(
                     title: "Current",
                     badge: "LIVE",
-                    isSelected: selectedProfileName == nil
+                    isSelected: selectedTab == .current
                 ) {
-                    selectProfileTab(nil)
+                    selectTab(.current)
                 }
 
                 ForEach(model.profiles) { profile in
                     profileTabButton(
                         title: profile.name,
                         badge: nil,
-                        isSelected: selectedProfileName == profile.name
+                        isSelected: selectedTab == .profile(profile.name)
                     ) {
-                        selectProfileTab(profile.name)
+                        selectTab(.profile(profile.name))
                     }
                 }
             }
@@ -387,24 +401,28 @@ struct UsageDashboardView: View {
         .buttonStyle(.plain)
     }
 
-    private func selectProfileTab(_ name: String?) {
-        selectedProfileName = name
-        model.refresh(selectedProfileName: name)
+    private func selectTab(_ tab: UsageTab) {
+        selectedTab = tab
+        refreshSelectedTab()
+    }
+
+    private func refreshSelectedTab() {
+        switch selectedTab {
+        case .dashboard:
+            model.refreshAll()
+        case .current:
+            model.refresh(selectedProfileName: nil)
+        case .profile(let name):
+            model.refresh(selectedProfileName: name)
+        }
     }
 
     private var selectedProfileSection: some View {
         Group {
-            if let selectedProfileName,
-               let profile = model.profiles.first(where: { $0.name == selectedProfileName }) {
-                UsageDashboardPanel(
-                    title: profile.name,
-                    badge: nil,
-                    snapshot: model.snapshotsByProfileName[profile.name],
-                    showSwitch: true,
-                    isSwitching: model.switchingProfileName == profile.name,
-                    onSwitch: { pendingSwitchProfile = profile }
-                )
-            } else {
+            switch selectedTab {
+            case .dashboard:
+                accountsDashboardGrid
+            case .current:
                 UsageDashboardPanel(
                     title: model.currentSnapshot?.profileName ?? "Current",
                     badge: "UNSAVED",
@@ -413,9 +431,99 @@ struct UsageDashboardView: View {
                     isSwitching: false,
                     onSwitch: {}
                 )
+            case .profile(let name):
+                if let profile = model.profiles.first(where: { $0.name == name }) {
+                    UsageDashboardPanel(
+                        title: profile.name,
+                        badge: nil,
+                        snapshot: model.snapshotsByProfileName[profile.name],
+                        showSwitch: true,
+                        isSwitching: model.switchingProfileName == profile.name,
+                        onSwitch: { pendingSwitchProfile = profile }
+                    )
+                } else {
+                    UsageDashboardPanel(
+                        title: model.currentSnapshot?.profileName ?? "Current",
+                        badge: "UNSAVED",
+                        snapshot: model.currentSnapshot,
+                        showSwitch: false,
+                        isSwitching: false,
+                        onSwitch: {}
+                    )
+                }
             }
         }
         .padding(.horizontal, 6)
+    }
+
+    private var accountsDashboardGrid: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            LazyVGrid(columns: dashboardColumns, spacing: 10) {
+                ForEach(dashboardTiles) { tile in
+                    UsageAccountTileCard(tile: tile)
+                }
+            }
+            .padding(.bottom, 4)
+        }
+        .scrollBounceBehavior(.basedOnSize)
+    }
+
+    private var dashboardColumns: [GridItem] {
+        Array(repeating: GridItem(.flexible(minimum: 160), spacing: 10), count: 3)
+    }
+
+    private var dashboardTiles: [UsageAccountTile] {
+        var claudeTiles: [UsageAccountTile] = []
+        var codexTiles: [UsageAccountTile] = []
+        var geminiTiles: [UsageAccountTile] = []
+
+        for profile in model.profiles {
+            let snapshot = model.snapshotsByProfileName[profile.name]
+
+            if profile.claudeAccountId != nil {
+                claudeTiles.append(
+                    UsageAccountTile(
+                        id: "claude:\(profile.name)",
+                        provider: .claude,
+                        label: profile.name,
+                        email: snapshot?.identities.claudeEmail,
+                        tier: snapshot?.identities.claudeTier,
+                        info: snapshot?.output?.claude,
+                        errorMessage: snapshot?.errorMessage
+                    )
+                )
+            }
+
+            if profile.codexAccountId != nil {
+                codexTiles.append(
+                    UsageAccountTile(
+                        id: "codex:\(profile.name)",
+                        provider: .codex,
+                        label: profile.name,
+                        email: snapshot?.identities.codexEmail,
+                        tier: nil,
+                        info: snapshot?.output?.codex,
+                        errorMessage: snapshot?.errorMessage
+                    )
+                )
+            }
+
+            if profile.geminiAccountId != nil {
+                geminiTiles.append(
+                    UsageAccountTile(
+                        id: "gemini:\(profile.name)",
+                        provider: .gemini,
+                        label: profile.name,
+                        email: snapshot?.identities.geminiEmail,
+                        tier: nil,
+                        info: snapshot?.output?.gemini,
+                        errorMessage: snapshot?.errorMessage
+                    )
+                )
+            }
+        }
+
+        return claudeTiles + codexTiles + geminiTiles
     }
 
     private var emptyProfilesState: some View {
@@ -537,6 +645,48 @@ private enum UsageWindow: CaseIterable {
         case .twentyFourHour: "24h"
         case .sevenDay: "7d"
         }
+    }
+}
+
+private struct UsageAccountTile: Identifiable {
+    let id: String
+    let provider: UsageProvider
+    let label: String
+    let email: String?
+    let tier: String?
+    let info: CLIUsageInfo?
+    let errorMessage: String?
+}
+
+private struct UsageAccountTileCard: View {
+    let tile: UsageAccountTile
+
+    @State private var isHovered = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            UsageProviderColumn(
+                provider: tile.provider,
+                email: tile.email,
+                tier: tile.tier,
+                info: tile.info
+            )
+
+            if let message = tile.errorMessage {
+                Text(message)
+                    .font(.system(size: 10))
+                    .foregroundColor(TerminalColors.amber.opacity(0.9))
+                    .lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(isHovered ? Color.white.opacity(0.09) : Color.white.opacity(0.06))
+        )
+        .onHover { isHovered = $0 }
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
     }
 }
 
