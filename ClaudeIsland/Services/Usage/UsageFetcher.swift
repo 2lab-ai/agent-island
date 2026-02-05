@@ -2,11 +2,13 @@ import Foundation
 
 struct UsageIdentities: Sendable {
     let claudeEmail: String?
+    let claudeTier: String?
     let codexEmail: String?
     let geminiEmail: String?
 
     static let empty = UsageIdentities(
         claudeEmail: nil,
+        claudeTier: nil,
         codexEmail: nil,
         geminiEmail: nil
     )
@@ -475,15 +477,33 @@ private extension UsageFetcher {
     }
 
     func resolveIdentities(credentials: ExportCredentials) async -> UsageIdentities {
-        async let claudeEmailTask = resolveClaudeEmail(credentials: credentials.claude)
+        async let claudeProfileTask = resolveClaudeProfile(credentials: credentials.claude)
         let codexEmail = resolveJWTEmail(credentials: credentials.codex)
         let geminiEmail = resolveJWTEmail(credentials: credentials.gemini)
-        let claudeEmail = await claudeEmailTask
+        let claudeProfile = await claudeProfileTask
 
         return UsageIdentities(
-            claudeEmail: claudeEmail,
+            claudeEmail: claudeProfile.email,
+            claudeTier: claudeProfile.tier,
             codexEmail: codexEmail,
             geminiEmail: geminiEmail
+        )
+    }
+
+    struct ClaudeProfile: Sendable {
+        let email: String?
+        let tier: String?
+    }
+
+    func resolveClaudeProfile(credentials: Data?) async -> ClaudeProfile {
+        guard let token = extractClaudeAccessToken(credentials: credentials) else {
+            return ClaudeProfile(email: nil, tier: nil)
+        }
+
+        let profile = await fetchClaudeProfile(accessToken: token)
+        return ClaudeProfile(
+            email: profile.email,
+            tier: profile.tier
         )
     }
 
@@ -670,11 +690,6 @@ private extension UsageFetcher {
         return nil
     }
 
-    func resolveClaudeEmail(credentials: Data?) async -> String? {
-        guard let token = extractClaudeAccessToken(credentials: credentials) else { return nil }
-        return await fetchClaudeProfileEmail(accessToken: token)
-    }
-
     func extractClaudeAccessToken(credentials: Data?) -> String? {
         guard let credentials else { return nil }
         guard let root = try? JSONSerialization.jsonObject(with: credentials) as? [String: Any] else { return nil }
@@ -682,8 +697,10 @@ private extension UsageFetcher {
         return oauth["accessToken"] as? String
     }
 
-    func fetchClaudeProfileEmail(accessToken: String) async -> String? {
-        guard let url = URL(string: "https://api.anthropic.com/api/oauth/profile") else { return nil }
+    func fetchClaudeProfile(accessToken: String) async -> ClaudeProfile {
+        guard let url = URL(string: "https://api.anthropic.com/api/oauth/profile") else {
+            return ClaudeProfile(email: nil, tier: nil)
+        }
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
@@ -696,15 +713,98 @@ private extension UsageFetcher {
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                return ClaudeProfile(email: nil, tier: nil)
+            }
 
-            guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-            if let email = root["email"] as? String, email.contains("@") { return email }
+            guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return ClaudeProfile(email: nil, tier: nil)
+            }
 
-            return findFirstEmailString(in: root)
+            let email: String?
+            if let rawEmail = root["email"] as? String, rawEmail.contains("@") {
+                email = rawEmail
+            } else {
+                email = findFirstEmailString(in: root)
+            }
+
+            let tier = extractClaudeTier(in: root)
+            return ClaudeProfile(email: email, tier: tier)
         } catch {
-            return nil
+            return ClaudeProfile(email: nil, tier: nil)
         }
+    }
+
+    func extractClaudeTier(in root: [String: Any]) -> String? {
+        for key in ["subscriptionTier", "subscription_tier", "planType", "plan_type", "plan", "tier", "product", "sku"] {
+            if let tier = parseClaudeTier(from: root[key]) { return tier }
+        }
+
+        for key in ["subscription", "billing", "entitlements", "account"] {
+            if let tier = parseClaudeTier(from: root[key]) { return tier }
+        }
+
+        return nil
+    }
+
+    func parseClaudeTier(from value: Any?) -> String? {
+        if let value, let number = extractNumeric(value) {
+            if let tier = normalizeClaudeTier(multiplier: number) { return tier }
+        }
+
+        if let string = value as? String {
+            return normalizeClaudeTier(string: string)
+        }
+
+        if let dict = value as? [String: Any] {
+            for key in ["maxMultiplier", "max_multiplier", "maxTierMultiplier", "max_tier_multiplier", "multiplier"] {
+                if let number = extractNumeric(dict[key]) {
+                    if let tier = normalizeClaudeTier(multiplier: number) { return tier }
+                }
+            }
+
+            for key in ["tier", "plan", "plan_type", "planType", "subscriptionTier", "subscription_tier", "product", "sku", "name", "id"] {
+                if let tier = parseClaudeTier(from: dict[key]) { return tier }
+            }
+
+            for value in dict.values {
+                if let tier = parseClaudeTier(from: value) { return tier }
+            }
+        }
+
+        if let list = value as? [Any] {
+            for value in list {
+                if let tier = parseClaudeTier(from: value) { return tier }
+            }
+        }
+
+        return nil
+    }
+
+    func normalizeClaudeTier(multiplier: Double) -> String? {
+        if abs(multiplier - 20) < 0.01 { return "Max 20x" }
+        if abs(multiplier - 5) < 0.01 { return "Max 5x" }
+        return nil
+    }
+
+    func normalizeClaudeTier(string: String) -> String? {
+        let raw = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty { return nil }
+        if raw.contains("@") { return nil }
+
+        let lowered = raw.lowercased()
+        let tokens = lowered.split { !($0.isLetter || $0.isNumber) }
+        let hasToken: (String) -> Bool = { token in tokens.contains { $0 == token } }
+        let normalized = lowered
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+
+        if normalized.contains("max20") || (hasToken("max") && (hasToken("20x") || hasToken("20"))) { return "Max 20x" }
+        if normalized.contains("max5") || (hasToken("max") && (hasToken("5x") || hasToken("5"))) { return "Max 5x" }
+        if hasToken("pro") { return "Pro" }
+
+        return nil
     }
 
     func resolveJWTEmail(credentials: Data?) -> String? {

@@ -559,6 +559,7 @@ private struct UsageDashboardPanel: View {
                 UsageProviderColumn(
                     provider: .claude,
                     email: snapshot?.identities.claudeEmail,
+                    tier: snapshot?.identities.claudeTier,
                     info: snapshot?.output?.claude,
                     tokenRefresh: snapshot?.tokenRefresh.claude
                 )
@@ -566,6 +567,7 @@ private struct UsageDashboardPanel: View {
                 UsageProviderColumn(
                     provider: .codex,
                     email: snapshot?.identities.codexEmail,
+                    tier: nil,
                     info: snapshot?.output?.codex,
                     tokenRefresh: snapshot?.tokenRefresh.codex
                 )
@@ -573,6 +575,7 @@ private struct UsageDashboardPanel: View {
                 UsageProviderColumn(
                     provider: .gemini,
                     email: snapshot?.identities.geminiEmail,
+                    tier: nil,
                     info: snapshot?.output?.gemini,
                     tokenRefresh: snapshot?.tokenRefresh.gemini
                 )
@@ -669,6 +672,7 @@ private struct UsageDashboardPanel: View {
 private struct UsageProviderColumn: View {
     let provider: UsageProvider
     let email: String?
+    let tier: String?
     let info: CLIUsageInfo?
     let tokenRefresh: TokenRefreshInfo?
 
@@ -692,6 +696,8 @@ private struct UsageProviderColumn: View {
                     .foregroundColor(.white.opacity(0.2))
             }
 
+            TierRow(tier: displayTier)
+
             if let info, !info.available {
                 Text("Not installed")
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
@@ -712,6 +718,17 @@ private struct UsageProviderColumn: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var displayTier: String? {
+        switch provider {
+        case .claude:
+            return tier
+        case .codex:
+            return normalizeCodexTier(info?.plan)
+        case .gemini:
+            return inferGeminiTier(model: info?.model, plan: info?.plan)
+        }
     }
 
     @ViewBuilder
@@ -750,6 +767,50 @@ private struct UsageProviderColumn: View {
         switch window {
         case .fiveHour, .twentyFourHour: return info.fiveHourReset
         case .sevenDay: return info.sevenDayReset
+        }
+    }
+
+    private func normalizeCodexTier(_ plan: String?) -> String? {
+        guard let plan = plan?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil else { return nil }
+
+        let lowered = plan.lowercased()
+        let tokens = lowered.split { !($0.isLetter || $0.isNumber) }
+        let hasToken: (String) -> Bool = { token in tokens.contains { $0 == token } }
+
+        if hasToken("plus") || lowered.contains("plus") { return "Plus" }
+        if hasToken("pro") || lowered.contains("pro") { return "Pro" }
+        return plan
+    }
+
+    private func inferGeminiTier(model: String?, plan: String?) -> String? {
+        let candidates = [plan, model]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil }
+        guard !candidates.isEmpty else { return nil }
+
+        let lowered = candidates.joined(separator: " ").lowercased()
+        if lowered.contains("pro") { return "Pro" }
+        if lowered.contains("flash") { return "Flash" }
+        if lowered.contains("ultra") { return "Ultra" }
+        if lowered.contains("nano") { return "Nano" }
+        return nil
+    }
+}
+
+private struct TierRow: View {
+    let tier: String?
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("tier")
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.35))
+                .frame(width: 18, alignment: .leading)
+
+            Text(tier?.nonEmptyOrNil ?? "--")
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(tier == nil ? 0.2 : 0.35))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
         }
     }
 }
