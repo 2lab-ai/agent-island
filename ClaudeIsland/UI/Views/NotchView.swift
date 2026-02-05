@@ -352,7 +352,8 @@ struct NotchView: View {
             case .usage:
                 UsageDashboardView(
                     sessionMonitor: sessionMonitor,
-                    viewModel: viewModel
+                    viewModel: viewModel,
+                    model: UsageDashboardViewModel.shared
                 )
             case .instances:
                 ClaudeInstancesView(

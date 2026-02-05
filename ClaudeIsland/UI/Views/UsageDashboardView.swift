@@ -4,6 +4,8 @@ import SwiftUI
 
 @MainActor
 final class UsageDashboardViewModel: ObservableObject {
+    static let shared = UsageDashboardViewModel()
+
     @Published var profiles: [UsageProfile] = []
     @Published var currentSnapshot: UsageSnapshot?
     @Published var snapshotsByProfileName: [String: UsageSnapshot] = [:]
@@ -22,6 +24,7 @@ final class UsageDashboardViewModel: ObservableObject {
     private var refreshTask: Task<Void, Never>?
     private var autoRefreshCancellable: AnyCancellable?
     private let autoRefreshIntervalSeconds: TimeInterval = 10 * 60
+    private var backgroundRefreshStarted = false
 
     init(accountStore: AccountStore = AccountStore()) {
         self.accountStore = accountStore
@@ -30,6 +33,13 @@ final class UsageDashboardViewModel: ObservableObject {
         let exporter = CredentialExporter()
         self.exporter = exporter
         self.switcher = ProfileSwitcher(accountStore: accountStore, exporter: exporter)
+    }
+
+    func startBackgroundRefreshIfNeeded() {
+        guard !backgroundRefreshStarted else { return }
+        backgroundRefreshStarted = true
+        load()
+        startAutoRefresh()
     }
 
     func load() {
@@ -143,7 +153,7 @@ final class UsageDashboardViewModel: ObservableObject {
 struct UsageDashboardView: View {
     @ObservedObject var sessionMonitor: ClaudeSessionMonitor
     @ObservedObject var viewModel: NotchViewModel
-    @StateObject private var model = UsageDashboardViewModel()
+    @ObservedObject var model: UsageDashboardViewModel
 
     @State private var isSaveSheetPresented = false
     @State private var newProfileName = ""
@@ -180,10 +190,8 @@ struct UsageDashboardView: View {
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .onAppear {
-            model.load()
-            model.startAutoRefresh()
+            model.startBackgroundRefreshIfNeeded()
         }
-        .onDisappear { model.stopAutoRefresh() }
         .confirmationDialog(
             "Switch Profile (Experimental)",
             isPresented: Binding(

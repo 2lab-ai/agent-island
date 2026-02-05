@@ -72,6 +72,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         windowManager = WindowManager()
         _ = windowManager?.setupNotchWindow()
 
+        Task { @MainActor in
+            UsageDashboardViewModel.shared.startBackgroundRefreshIfNeeded()
+        }
+
         screenObserver = ScreenObserver { [weak self] in
             self?.handleScreenChange()
         }
