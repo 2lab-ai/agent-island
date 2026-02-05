@@ -20,6 +20,8 @@ final class UsageDashboardViewModel: ObservableObject {
     private let exporter: CredentialExporter
 
     private var refreshTask: Task<Void, Never>?
+    private var autoRefreshCancellable: AnyCancellable?
+    private let autoRefreshIntervalSeconds: TimeInterval = 10 * 60
 
     init(accountStore: AccountStore = AccountStore()) {
         self.accountStore = accountStore
@@ -39,13 +41,27 @@ final class UsageDashboardViewModel: ObservableObject {
             profiles = []
         }
 
-        refresh()
+        refreshAll()
+    }
+
+    func startAutoRefresh() {
+        autoRefreshCancellable?.cancel()
+        autoRefreshCancellable = Timer.publish(every: autoRefreshIntervalSeconds, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                self?.refreshAllIfIdle()
+            }
+    }
+
+    func stopAutoRefresh() {
+        autoRefreshCancellable?.cancel()
+        autoRefreshCancellable = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+        isRefreshing = false
     }
 
     func refresh(selectedProfileName: String? = nil) {
-        refreshTask?.cancel()
-        isRefreshing = true
-
         let profilesToRefresh: [UsageProfile]
         if let selectedProfileName,
            let profile = profiles.first(where: { $0.name == selectedProfileName }) {
@@ -53,6 +69,22 @@ final class UsageDashboardViewModel: ObservableObject {
         } else {
             profilesToRefresh = []
         }
+
+        startRefresh(profilesToRefresh: profilesToRefresh)
+    }
+
+    func refreshAll() {
+        startRefresh(profilesToRefresh: profiles)
+    }
+
+    func refreshAllIfIdle() {
+        guard !isRefreshing else { return }
+        refreshAll()
+    }
+
+    private func startRefresh(profilesToRefresh: [UsageProfile]) {
+        refreshTask?.cancel()
+        isRefreshing = true
 
         refreshTask = Task { [weak self] in
             guard let self else { return }
@@ -80,7 +112,7 @@ final class UsageDashboardViewModel: ObservableObject {
                 : "Saved “\(result.profile.name)” with warnings: \(result.warnings.joined(separator: " · "))"
 
             profiles = try profileStore.loadProfiles()
-            refresh()
+            refreshAll()
             return true
         } catch {
             lastActionMessage = error.localizedDescription
@@ -147,7 +179,11 @@ struct UsageDashboardView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .onAppear { model.load() }
+        .onAppear {
+            model.load()
+            model.startAutoRefresh()
+        }
+        .onDisappear { model.stopAutoRefresh() }
         .confirmationDialog(
             "Switch Profile (Experimental)",
             isPresented: Binding(
