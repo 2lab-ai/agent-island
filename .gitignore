@@ -43,3 +43,6 @@ releases/
 *.xcodeproj.backup/
 /.worktrees/
 CLAUDE.md
+
+# Local AI agent logs
+.claude/

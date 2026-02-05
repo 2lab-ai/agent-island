@@ -1,4 +1,5 @@
 import Combine
+import Foundation
 import SwiftUI
 
 @MainActor
@@ -676,12 +677,16 @@ private struct UsageServiceCard: View {
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .foregroundColor(TerminalColors.amber)
             } else {
-                ForEach(windows, id: \.label) { window in
-                    UsageWindowRow(
-                        window: window,
-                        percentUsed: percentUsed(for: window),
-                        resetAt: resetAt(for: window)
-                    )
+                if label == "Gemini" {
+                    GeminiUsageSummaryRow(info: info)
+                } else {
+                    ForEach(windows, id: \.label) { window in
+                        UsageWindowRow(
+                            window: window,
+                            percentUsed: percentUsed(for: window),
+                            resetAt: resetAt(for: window)
+                        )
+                    }
                 }
             }
         }
@@ -708,6 +713,88 @@ private struct UsageServiceCard: View {
         case .fiveHour, .twentyFourHour: return info.fiveHourReset
         case .sevenDay: return info.sevenDayReset
         }
+    }
+}
+
+private struct GeminiUsageSummaryRow: View {
+    let info: CLIUsageInfo?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(modelName)
+                .foregroundColor(.white.opacity(0.6))
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer(minLength: 8)
+
+            Text(bucketCountString)
+                .foregroundColor(.white.opacity(0.35))
+                .frame(width: 14, alignment: .trailing)
+
+            Text(remainingPercentString)
+                .foregroundColor(remainingPercentColor)
+                .frame(width: 54, alignment: .trailing)
+
+            Text("(Resets in \(timeRemainingString))")
+                .foregroundColor(.white.opacity(0.28))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+    }
+
+    private var modelName: String {
+        info?.model?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil ?? "gemini"
+    }
+
+    private var bucketCountString: String {
+        guard let buckets = info?.buckets else { return "--" }
+        return "\(buckets.count)"
+    }
+
+    private var remainingPercentString: String {
+        guard let used = info?.fiveHourPercent else { return "--" }
+        let remaining = max(0, min(100, 100 - used))
+        return String(format: "%.1f%%", remaining)
+    }
+
+    private var remainingPercentColor: Color {
+        guard let used = info?.fiveHourPercent else { return TerminalColors.dim }
+        let remaining = max(0, min(100, 100 - used))
+        if remaining < 10 { return TerminalColors.red }
+        if remaining < 25 { return TerminalColors.amber }
+        return TerminalColors.green
+    }
+
+    private var timeRemainingString: String {
+        guard let resetAt = info?.fiveHourReset else { return "--" }
+        let seconds = max(0, Int(resetAt.timeIntervalSince(Date())))
+        return formatDuration(seconds)
+    }
+
+    private func formatDuration(_ seconds: Int) -> String {
+        if seconds < 60 { return "<1m" }
+
+        var remaining = seconds
+        let days = remaining / 86_400
+        remaining %= 86_400
+        let hours = remaining / 3_600
+        remaining %= 3_600
+        let minutes = remaining / 60
+
+        if days > 0 {
+            let hh = String(format: "%02d", hours)
+            let mm = String(format: "%02d", minutes)
+            return "\(days)d \(hh)h \(mm)m"
+        }
+
+        if hours > 0 {
+            let mm = String(format: "%02d", minutes)
+            return "\(hours)h \(mm)m"
+        }
+
+        return "\(minutes)m"
     }
 }
 
@@ -791,6 +878,13 @@ private struct UsageWindowRow: View {
         }
 
         return "\(minutes)m"
+    }
+}
+
+private extension String {
+    var nonEmptyOrNil: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
