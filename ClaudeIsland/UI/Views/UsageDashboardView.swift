@@ -41,11 +41,18 @@ final class UsageDashboardViewModel: ObservableObject {
         refresh()
     }
 
-    func refresh() {
+    func refresh(selectedProfileName: String? = nil) {
         refreshTask?.cancel()
         isRefreshing = true
 
-        let profilesToRefresh = profiles
+        let profilesToRefresh: [UsageProfile]
+        if let selectedProfileName,
+           let profile = profiles.first(where: { $0.name == selectedProfileName }) {
+            profilesToRefresh = [profile]
+        } else {
+            profilesToRefresh = []
+        }
+
         refreshTask = Task { [weak self] in
             guard let self else { return }
             defer { self.isRefreshing = false }
@@ -108,6 +115,7 @@ struct UsageDashboardView: View {
     @State private var isSaveSheetPresented = false
     @State private var newProfileName = ""
     @State private var pendingSwitchProfile: UsageProfile?
+    @State private var selectedProfileName: String?
 
     var body: some View {
         VStack(spacing: 10) {
@@ -213,7 +221,7 @@ struct UsageDashboardView: View {
             .buttonStyle(.plain)
 
             Button {
-                model.refresh()
+                model.refresh(selectedProfileName: selectedProfileName)
             } label: {
                 HStack(spacing: 6) {
                     if model.isRefreshing {
@@ -258,24 +266,95 @@ struct UsageDashboardView: View {
                     emptyProfilesState
                 }
             } else {
-                ScrollView(.vertical, showsIndicators: false) {
-                    LazyVStack(spacing: 6) {
-                        CurrentUsageRow(snapshot: model.currentSnapshot)
-                        ForEach(model.profiles) { profile in
-                            ProfileUsageRow(
-                                profile: profile,
-                                snapshot: model.snapshotsByProfileName[profile.name],
-                                isSwitching: model.switchingProfileName == profile.name,
-                                onSwitch: { pendingSwitchProfile = profile }
-                            )
-                        }
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
+                VStack(spacing: 10) {
+                    profileTabs
+                    selectedProfileSection
                 }
-                .scrollBounceBehavior(.basedOnSize)
             }
         }
+    }
+
+    private var profileTabs: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                profileTabButton(
+                    title: "Current",
+                    badge: "LIVE",
+                    isSelected: selectedProfileName == nil
+                ) {
+                    selectProfileTab(nil)
+                }
+
+                ForEach(model.profiles) { profile in
+                    profileTabButton(
+                        title: profile.name,
+                        badge: nil,
+                        isSelected: selectedProfileName == profile.name
+                    ) {
+                        selectProfileTab(profile.name)
+                    }
+                }
+            }
+            .padding(.horizontal, 6)
+        }
+        .scrollBounceBehavior(.basedOnSize)
+    }
+
+    private func profileTabButton(
+        title: String,
+        badge: String?,
+        isSelected: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(isSelected ? 0.85 : 0.55))
+                    .lineLimit(1)
+
+                if let badge {
+                    Text(badge)
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(isSelected ? 0.55 : 0.35))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.white.opacity(isSelected ? 0.08 : 0.06))
+                        )
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.white.opacity(isSelected ? 0.12 : 0.06))
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func selectProfileTab(_ name: String?) {
+        selectedProfileName = name
+        model.refresh(selectedProfileName: name)
+    }
+
+    private var selectedProfileSection: some View {
+        Group {
+            if let selectedProfileName,
+               let profile = model.profiles.first(where: { $0.name == selectedProfileName }) {
+                ProfileUsageRow(
+                    profile: profile,
+                    snapshot: model.snapshotsByProfileName[profile.name],
+                    isSwitching: model.switchingProfileName == profile.name,
+                    onSwitch: { pendingSwitchProfile = profile }
+                )
+            } else {
+                CurrentUsageRow(snapshot: model.currentSnapshot)
+            }
+        }
+        .padding(.horizontal, 6)
     }
 
     private var emptyProfilesState: some View {
