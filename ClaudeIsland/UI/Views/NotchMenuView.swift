@@ -23,12 +23,13 @@ struct NotchMenuView: View {
 
     var body: some View {
         VStack(spacing: 4) {
-            // Back button
-            MenuRow(
-                icon: "chevron.left",
-                label: "Back"
-            ) {
-                viewModel.toggleMenu()
+            // Navigation
+            MenuRow(icon: "gauge.with.dots.needle.67percent", label: "구독 사용량") {
+                viewModel.showUsage()
+            }
+
+            MenuRow(icon: "list.bullet.rectangle", label: "클로드 세션 리스트") {
+                viewModel.showSessions()
             }
 
             Divider()
