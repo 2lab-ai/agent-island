@@ -440,7 +440,7 @@ private struct ProfileUsageRow: View {
                     label: "Gemini",
                     email: snapshot?.identities.geminiEmail,
                     info: snapshot?.output?.gemini,
-                    windows: [.fiveHour]
+                    windows: [.twentyFourHour]
                 )
             }
 
@@ -519,7 +519,7 @@ private struct CurrentUsageRow: View {
                     label: "Gemini",
                     email: snapshot?.identities.geminiEmail,
                     info: snapshot?.output?.gemini,
-                    windows: [.fiveHour]
+                    windows: [.twentyFourHour]
                 )
             }
 
@@ -552,11 +552,13 @@ private struct CurrentUsageRow: View {
 private struct UsageServiceCard: View {
     enum Window: CaseIterable {
         case fiveHour
+        case twentyFourHour
         case sevenDay
 
         var label: String {
             switch self {
             case .fiveHour: "5h"
+            case .twentyFourHour: "24h"
             case .sevenDay: "7d"
             }
         }
@@ -569,15 +571,21 @@ private struct UsageServiceCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(.white.opacity(0.6))
-
-            if let email, !email.isEmpty {
-                Text(email)
+            HStack(spacing: 8) {
+                Text(label)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.35))
+                    .foregroundColor(.white.opacity(0.6))
                     .lineLimit(1)
+
+                Spacer(minLength: 8)
+
+                if let email, !email.isEmpty {
+                    Text(email)
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(.white.opacity(0.35))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             }
 
             if let info, !info.available {
@@ -610,7 +618,7 @@ private struct UsageServiceCard: View {
     private func percentUsed(for window: Window) -> Double? {
         guard let info, info.available, !info.error else { return nil }
         switch window {
-        case .fiveHour: return info.fiveHourPercent
+        case .fiveHour, .twentyFourHour: return info.fiveHourPercent
         case .sevenDay: return info.sevenDayPercent
         }
     }
@@ -618,7 +626,7 @@ private struct UsageServiceCard: View {
     private func resetAt(for window: Window) -> Date? {
         guard let info, info.available, !info.error else { return nil }
         switch window {
-        case .fiveHour: return info.fiveHourReset
+        case .fiveHour, .twentyFourHour: return info.fiveHourReset
         case .sevenDay: return info.sevenDayReset
         }
     }
@@ -645,11 +653,12 @@ private struct UsageWindowRow: View {
                 .foregroundColor(remainingColor)
                 .frame(width: 32, alignment: .trailing)
 
-            Spacer(minLength: 6)
-
             Text(timeRemainingString)
                 .font(.system(size: 10, weight: .semibold, design: .monospaced))
                 .foregroundColor(.white.opacity(0.28))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
     }
 
@@ -691,8 +700,17 @@ private struct UsageWindowRow: View {
         remaining %= 3_600
         let minutes = remaining / 60
 
-        if days > 0 { return "\(days)d\(hours)h\(minutes)m" }
-        if hours > 0 { return "\(hours)h\(minutes)m" }
+        if days > 0 {
+            let hh = String(format: "%02d", hours)
+            let mm = String(format: "%02d", minutes)
+            return "\(days)d\(hh)h\(mm)m"
+        }
+
+        if hours > 0 {
+            let mm = String(format: "%02d", minutes)
+            return "\(hours)h\(mm)m"
+        }
+
         return "\(minutes)m"
     }
 }
@@ -702,12 +720,18 @@ private struct MiniUsageBar: View {
 
     var body: some View {
         GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(Color.white.opacity(0.08))
-                RoundedRectangle(cornerRadius: 4)
-                    .fill(fillColor)
-                    .frame(width: max(0, geo.size.width * fraction))
+            let segmentCount = 10
+            let spacing: CGFloat = 1
+            let totalSpacing = spacing * CGFloat(segmentCount - 1)
+            let segmentWidth = max(1, (geo.size.width - totalSpacing) / CGFloat(segmentCount))
+            let filledSegments = max(0, min(segmentCount, Int((fraction * Double(segmentCount)).rounded(.toNearestOrAwayFromZero))))
+
+            HStack(spacing: spacing) {
+                ForEach(0..<segmentCount, id: \.self) { index in
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(index < filledSegments ? fillColor : Color.white.opacity(0.08))
+                        .frame(width: segmentWidth)
+                }
             }
         }
     }
