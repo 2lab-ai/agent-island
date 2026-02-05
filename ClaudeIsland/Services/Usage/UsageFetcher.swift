@@ -12,10 +12,24 @@ struct UsageIdentities: Sendable {
     )
 }
 
+struct TokenRefreshInfo: Sendable {
+    let expiresAt: Date
+    let lifetimeSeconds: TimeInterval
+}
+
+struct UsageTokenRefresh: Sendable {
+    let claude: TokenRefreshInfo?
+    let codex: TokenRefreshInfo?
+    let gemini: TokenRefreshInfo?
+
+    static let empty = UsageTokenRefresh(claude: nil, codex: nil, gemini: nil)
+}
+
 struct UsageSnapshot: Sendable, Identifiable {
     let profileName: String
     let output: CheckUsageOutput?
     let identities: UsageIdentities
+    let tokenRefresh: UsageTokenRefresh
     let fetchedAt: Date?
     let isStale: Bool
     let errorMessage: String?
@@ -63,18 +77,22 @@ final class UsageFetcher {
     }
 
     func fetchSnapshot(for profile: UsageProfile) async -> UsageSnapshot {
+        var tokenRefresh = UsageTokenRefresh.empty
+        var cachedIdentities = UsageIdentities.empty
+
         do {
             let snapshot = try accountStore.loadSnapshot()
-            let identities = await resolveIdentitiesCached(
-                key: profile.name,
-                credentials: loadCredentials(profile: profile, accounts: snapshot.accounts)
-            )
+            let credentials = loadCredentials(profile: profile, accounts: snapshot.accounts)
+
+            tokenRefresh = resolveTokenRefresh(credentials: credentials)
+            cachedIdentities = await resolveIdentitiesCached(key: profile.name, credentials: credentials)
 
             if let entry = await cache.getFresh(profileName: profile.name) {
                 return UsageSnapshot(
                     profileName: profile.name,
                     output: entry.output,
-                    identities: identities,
+                    identities: cachedIdentities,
+                    tokenRefresh: tokenRefresh,
                     fetchedAt: entry.fetchedAt,
                     isStale: false,
                     errorMessage: nil
@@ -87,18 +105,20 @@ final class UsageFetcher {
             return UsageSnapshot(
                 profileName: profile.name,
                 output: entry?.output ?? output,
-                identities: identities,
+                identities: cachedIdentities,
+                tokenRefresh: tokenRefresh,
                 fetchedAt: entry?.fetchedAt,
                 isStale: false,
                 errorMessage: nil
             )
         } catch {
             let entry = await cache.getAny(profileName: profile.name)
-            let identities = await identityCache.getFresh(key: profile.name) ?? .empty
+            let identities = await identityCache.getFresh(key: profile.name) ?? cachedIdentities
             return UsageSnapshot(
                 profileName: profile.name,
                 output: entry?.output,
                 identities: identities,
+                tokenRefresh: tokenRefresh,
                 fetchedAt: entry?.fetchedAt,
                 isStale: entry != nil,
                 errorMessage: error.localizedDescription
@@ -110,6 +130,7 @@ final class UsageFetcher {
         let cacheKey = "__current__"
         let profileName = "Current"
 
+        let tokenRefresh = resolveTokenRefresh(credentials: credentials)
         let identities = await resolveIdentitiesCached(key: cacheKey, credentials: credentials)
 
         if let entry = await cache.getFresh(profileName: cacheKey) {
@@ -117,6 +138,7 @@ final class UsageFetcher {
                 profileName: profileName,
                 output: entry.output,
                 identities: identities,
+                tokenRefresh: tokenRefresh,
                 fetchedAt: entry.fetchedAt,
                 isStale: false,
                 errorMessage: nil
@@ -131,6 +153,7 @@ final class UsageFetcher {
                 profileName: profileName,
                 output: entry?.output ?? output,
                 identities: identities,
+                tokenRefresh: tokenRefresh,
                 fetchedAt: entry?.fetchedAt,
                 isStale: false,
                 errorMessage: nil
@@ -141,6 +164,7 @@ final class UsageFetcher {
                 profileName: profileName,
                 output: entry?.output,
                 identities: identities,
+                tokenRefresh: tokenRefresh,
                 fetchedAt: entry?.fetchedAt,
                 isStale: entry != nil,
                 errorMessage: error.localizedDescription
@@ -461,6 +485,189 @@ private extension UsageFetcher {
             codexEmail: codexEmail,
             geminiEmail: geminiEmail
         )
+    }
+
+    // MARK: - Token Refresh
+
+    func resolveTokenRefresh(credentials: ExportCredentials) -> UsageTokenRefresh {
+        UsageTokenRefresh(
+            claude: resolveClaudeTokenRefresh(credentials: credentials.claude),
+            codex: resolveJWTTokenRefresh(credentials: credentials.codex, defaultLifetimeSeconds: 24 * 60 * 60),
+            gemini: resolveGeminiTokenRefresh(credentials: credentials.gemini)
+        )
+    }
+
+    func resolveClaudeTokenRefresh(credentials: Data?) -> TokenRefreshInfo? {
+        guard let credentials else { return nil }
+        guard let root = try? JSONSerialization.jsonObject(with: credentials) as? [String: Any] else { return nil }
+
+        let oauth = root["claudeAiOauth"] as? [String: Any] ?? [:]
+        let expiresAt = parseDateFromAny(oauth["expiresAt"])
+            ?? parseDateFromAny(oauth["expires_at"])
+            ?? parseDateFromAny(oauth["expiresAtMs"])
+            ?? parseDateFromAny(oauth["expires_at_ms"])
+            ?? parseDateFromAny(oauth["expiresAtSeconds"])
+            ?? parseDateFromAny(oauth["expires_at_seconds"])
+            ?? parseDateFromAny(root["expiresAt"])
+            ?? parseDateFromAny(root["expires_at"])
+
+        if let expiresAt {
+            let issuedAt = parseDateFromAny(oauth["issuedAt"])
+                ?? parseDateFromAny(oauth["issued_at"])
+                ?? parseDateFromAny(root["issuedAt"])
+                ?? parseDateFromAny(root["issued_at"])
+
+            let lifetime = computeLifetimeSeconds(
+                expiresAt: expiresAt,
+                issuedAt: issuedAt,
+                defaultLifetimeSeconds: 60 * 60
+            )
+            return TokenRefreshInfo(expiresAt: expiresAt, lifetimeSeconds: lifetime)
+        }
+
+        if let token = oauth["accessToken"] as? String {
+            return decodeJWTPayloadTokenRefresh(fromToken: token, defaultLifetimeSeconds: 60 * 60)
+        }
+
+        return nil
+    }
+
+    func resolveJWTTokenRefresh(credentials: Data?, defaultLifetimeSeconds: TimeInterval) -> TokenRefreshInfo? {
+        guard let credentials else { return nil }
+        guard let root = try? JSONSerialization.jsonObject(with: credentials) else { return nil }
+        return findJWTTokenRefresh(in: root, defaultLifetimeSeconds: defaultLifetimeSeconds)
+    }
+
+    func resolveGeminiTokenRefresh(credentials: Data?) -> TokenRefreshInfo? {
+        guard let credentials else { return nil }
+        guard let root = try? JSONSerialization.jsonObject(with: credentials) else { return nil }
+
+        if let dict = root as? [String: Any] {
+            let tokenDict = dict["token"] as? [String: Any] ?? [:]
+            let expiresAt = parseDateFromAny(dict["expiry_date"])
+                ?? parseDateFromAny(dict["expiryDate"])
+                ?? parseDateFromAny(dict["expiresAt"])
+                ?? parseDateFromAny(dict["expires_at"])
+                ?? parseDateFromAny(tokenDict["expiresAt"])
+                ?? parseDateFromAny(tokenDict["expiryDate"])
+                ?? parseDateFromAny(tokenDict["expiry_date"])
+
+            if let expiresAt {
+                let issuedAt = parseDateFromAny(dict["issued_at"])
+                    ?? parseDateFromAny(dict["issuedAt"])
+                    ?? parseDateFromAny(tokenDict["issued_at"])
+                    ?? parseDateFromAny(tokenDict["issuedAt"])
+
+                let lifetime = computeLifetimeSeconds(
+                    expiresAt: expiresAt,
+                    issuedAt: issuedAt,
+                    defaultLifetimeSeconds: 60 * 60
+                )
+                return TokenRefreshInfo(expiresAt: expiresAt, lifetimeSeconds: lifetime)
+            }
+        }
+
+        // Fallback: sometimes creds contain an ID token JWT with `exp`.
+        return findJWTTokenRefresh(in: root, defaultLifetimeSeconds: 60 * 60)
+    }
+
+    func computeLifetimeSeconds(
+        expiresAt: Date,
+        issuedAt: Date?,
+        defaultLifetimeSeconds: TimeInterval
+    ) -> TimeInterval {
+        guard let issuedAt else { return defaultLifetimeSeconds }
+        let computed = expiresAt.timeIntervalSince(issuedAt)
+        if computed.isFinite, computed > 0 { return computed }
+        return defaultLifetimeSeconds
+    }
+
+    func parseDateFromAny(_ value: Any?) -> Date? {
+        guard let value else { return nil }
+
+        if let date = value as? Date { return date }
+        if let number = value as? NSNumber { return dateFromTimestamp(number.doubleValue) }
+        if let double = value as? Double { return dateFromTimestamp(double) }
+        if let int = value as? Int { return dateFromTimestamp(Double(int)) }
+
+        if let string = value as? String {
+            if let number = Double(string) {
+                return dateFromTimestamp(number)
+            }
+
+            let iso = ISO8601DateFormatter()
+            if let date = iso.date(from: string) { return date }
+        }
+
+        return nil
+    }
+
+    func dateFromTimestamp(_ timestamp: Double) -> Date? {
+        guard timestamp.isFinite, timestamp > 0 else { return nil }
+
+        if timestamp > 1_000_000_000_000 {
+            return Date(timeIntervalSince1970: timestamp / 1000)
+        }
+
+        if timestamp > 1_000_000_000 {
+            return Date(timeIntervalSince1970: timestamp)
+        }
+
+        return nil
+    }
+
+    func findJWTTokenRefresh(in object: Any, defaultLifetimeSeconds: TimeInterval) -> TokenRefreshInfo? {
+        if let value = object as? String {
+            return decodeJWTPayloadTokenRefresh(fromToken: value, defaultLifetimeSeconds: defaultLifetimeSeconds)
+        }
+
+        if let dict = object as? [String: Any] {
+            for value in dict.values {
+                if let found = findJWTTokenRefresh(in: value, defaultLifetimeSeconds: defaultLifetimeSeconds) { return found }
+            }
+        }
+
+        if let list = object as? [Any] {
+            for value in list {
+                if let found = findJWTTokenRefresh(in: value, defaultLifetimeSeconds: defaultLifetimeSeconds) { return found }
+            }
+        }
+
+        return nil
+    }
+
+    func decodeJWTPayloadTokenRefresh(fromToken token: String, defaultLifetimeSeconds: TimeInterval) -> TokenRefreshInfo? {
+        let parts = token.split(separator: ".")
+        guard parts.count == 3 else { return nil }
+
+        let payloadBase64URL = String(parts[1])
+        guard let payloadData = decodeBase64URL(payloadBase64URL) else { return nil }
+        guard let root = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else { return nil }
+
+        guard let expSeconds = extractNumeric(root["exp"]) else { return nil }
+        let expiresAt = Date(timeIntervalSince1970: expSeconds)
+
+        let issuedAt: Date?
+        if let iatSeconds = extractNumeric(root["iat"]) {
+            issuedAt = Date(timeIntervalSince1970: iatSeconds)
+        } else {
+            issuedAt = nil
+        }
+
+        let lifetime = computeLifetimeSeconds(
+            expiresAt: expiresAt,
+            issuedAt: issuedAt,
+            defaultLifetimeSeconds: defaultLifetimeSeconds
+        )
+        return TokenRefreshInfo(expiresAt: expiresAt, lifetimeSeconds: lifetime)
+    }
+
+    func extractNumeric(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let double = value as? Double { return double }
+        if let int = value as? Int { return Double(int) }
+        if let string = value as? String { return Double(string) }
+        return nil
     }
 
     func resolveClaudeEmail(credentials: Data?) async -> String? {

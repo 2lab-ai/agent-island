@@ -508,19 +508,22 @@ private struct ProfileUsageRow: View {
                     label: "Claude",
                     email: snapshot?.identities.claudeEmail,
                     info: snapshot?.output?.claude,
-                    windows: [.fiveHour, .sevenDay]
+                    windows: [.fiveHour, .sevenDay],
+                    tokenRefresh: snapshot?.tokenRefresh.claude
                 )
                 UsageServiceCard(
                     label: "Codex",
                     email: snapshot?.identities.codexEmail,
                     info: snapshot?.output?.codex,
-                    windows: [.fiveHour, .sevenDay]
+                    windows: [.fiveHour, .sevenDay],
+                    tokenRefresh: snapshot?.tokenRefresh.codex
                 )
                 UsageServiceCard(
                     label: "Gemini",
                     email: snapshot?.identities.geminiEmail,
                     info: snapshot?.output?.gemini,
-                    windows: [.twentyFourHour]
+                    windows: [.twentyFourHour],
+                    tokenRefresh: snapshot?.tokenRefresh.gemini
                 )
             }
 
@@ -587,19 +590,22 @@ private struct CurrentUsageRow: View {
                     label: "Claude",
                     email: snapshot?.identities.claudeEmail,
                     info: snapshot?.output?.claude,
-                    windows: [.fiveHour, .sevenDay]
+                    windows: [.fiveHour, .sevenDay],
+                    tokenRefresh: snapshot?.tokenRefresh.claude
                 )
                 UsageServiceCard(
                     label: "Codex",
                     email: snapshot?.identities.codexEmail,
                     info: snapshot?.output?.codex,
-                    windows: [.fiveHour, .sevenDay]
+                    windows: [.fiveHour, .sevenDay],
+                    tokenRefresh: snapshot?.tokenRefresh.codex
                 )
                 UsageServiceCard(
                     label: "Gemini",
                     email: snapshot?.identities.geminiEmail,
                     info: snapshot?.output?.gemini,
-                    windows: [.twentyFourHour]
+                    windows: [.twentyFourHour],
+                    tokenRefresh: snapshot?.tokenRefresh.gemini
                 )
             }
 
@@ -648,6 +654,7 @@ private struct UsageServiceCard: View {
     let email: String?
     let info: CLIUsageInfo?
     let windows: [Window]
+    let tokenRefresh: TokenRefreshInfo?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -688,6 +695,13 @@ private struct UsageServiceCard: View {
                         )
                     }
                 }
+            }
+
+            if let tokenRefresh {
+                TokenRefreshRow(
+                    expiresAt: tokenRefresh.expiresAt,
+                    lifetimeSeconds: tokenRefresh.lifetimeSeconds
+                )
             }
         }
         .padding(.horizontal, 10)
@@ -792,6 +806,66 @@ private struct GeminiUsageSummaryRow: View {
         if hours > 0 {
             let mm = String(format: "%02d", minutes)
             return "\(hours)h \(mm)m"
+        }
+
+        return "\(minutes)m"
+    }
+}
+
+private struct TokenRefreshRow: View {
+    let expiresAt: Date
+    let lifetimeSeconds: TimeInterval
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("tok")
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.35))
+                .frame(width: 18, alignment: .leading)
+
+            MiniUsageBar(fraction: remainingFraction)
+                .frame(height: 6)
+                .frame(width: 46)
+
+            Text(timeRemainingString)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(.white.opacity(0.28))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+    }
+
+    private var remainingFraction: Double {
+        let remaining = max(0, expiresAt.timeIntervalSince(Date()))
+        let total = max(1, lifetimeSeconds)
+        return max(0, min(1, remaining / total))
+    }
+
+    private var timeRemainingString: String {
+        let seconds = max(0, Int(expiresAt.timeIntervalSince(Date())))
+        return formatDuration(seconds)
+    }
+
+    private func formatDuration(_ seconds: Int) -> String {
+        if seconds < 60 { return "<1m" }
+
+        var remaining = seconds
+        let days = remaining / 86_400
+        remaining %= 86_400
+        let hours = remaining / 3_600
+        remaining %= 3_600
+        let minutes = remaining / 60
+
+        if days > 0 {
+            let hh = String(format: "%02d", hours)
+            let mm = String(format: "%02d", minutes)
+            return "\(days)d\(hh)h\(mm)m"
+        }
+
+        if hours > 0 {
+            let mm = String(format: "%02d", minutes)
+            return "\(hours)h\(mm)m"
         }
 
         return "\(minutes)m"
