@@ -1019,8 +1019,7 @@ private struct GeminiUsageSummaryRow: View {
                 .foregroundColor(remainingPercentColor)
                 .frame(width: 54, alignment: .trailing)
 
-            Text("(Resets in \(timeRemainingString))")
-                .foregroundColor(.white.opacity(0.28))
+            resetsInText
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
         }
@@ -1050,34 +1049,18 @@ private struct GeminiUsageSummaryRow: View {
         return TerminalColors.green
     }
 
-    private var timeRemainingString: String {
-        guard let resetAt = info?.fiveHourReset else { return "--" }
+    private var resetsInText: Text {
+        let baseColor = Color.white.opacity(0.28)
+        guard let resetAt = info?.fiveHourReset else {
+            return Text("(Resets in --)")
+                .foregroundColor(baseColor)
+        }
+
         let seconds = max(0, Int(resetAt.timeIntervalSince(Date())))
-        return formatDuration(seconds)
-    }
-
-    private func formatDuration(_ seconds: Int) -> String {
-        if seconds < 60 { return "<1m" }
-
-        var remaining = seconds
-        let days = remaining / 86_400
-        remaining %= 86_400
-        let hours = remaining / 3_600
-        remaining %= 3_600
-        let minutes = remaining / 60
-
-        if days > 0 {
-            let hh = String(format: "%02d", hours)
-            let mm = String(format: "%02d", minutes)
-            return "\(days)d \(hh)h \(mm)m"
-        }
-
-        if hours > 0 {
-            let mm = String(format: "%02d", minutes)
-            return "\(hours)h \(mm)m"
-        }
-
-        return "\(minutes)m"
+        return Text("(").foregroundColor(baseColor)
+            + Text("Resets in ").foregroundColor(baseColor)
+            + UsageDurationText.make(seconds: seconds, digitColor: baseColor)
+            + Text(")").foregroundColor(baseColor)
     }
 }
 
@@ -1124,9 +1107,8 @@ private struct UsageWindowRow: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
 
-                Text(timeRemainingString)
+                timeRemainingText
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.28))
                     .frame(width: 46, alignment: .center)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)
@@ -1166,10 +1148,11 @@ private struct UsageWindowRow: View {
         return max(0, min(1, remaining / total))
     }
 
-    private var timeRemainingString: String {
-        guard let resetAt else { return "--" }
+    private var timeRemainingText: Text {
+        let baseColor = Color.white.opacity(0.28)
+        guard let resetAt else { return Text("--").foregroundColor(baseColor) }
         let seconds = max(0, Int(resetAt.timeIntervalSince(Date())))
-        return formatDuration(seconds)
+        return UsageDurationText.make(seconds: seconds, digitColor: baseColor)
     }
 
     private var windowDurationSeconds: TimeInterval? {
@@ -1182,29 +1165,51 @@ private struct UsageWindowRow: View {
             return 7 * 24 * 60 * 60
         }
     }
+}
 
-    private func formatDuration(_ seconds: Int) -> String {
-        if seconds < 60 { return "<1m" }
+private enum UsageDurationText {
+    static func make(
+        seconds: Int,
+        digitColor: Color = Color.white.opacity(0.32),
+        dayUnitColor: Color = TerminalColors.amber.opacity(0.95),
+        hourUnitColor: Color = TerminalColors.blue.opacity(0.85),
+        minuteUnitColor: Color = TerminalColors.cyan.opacity(0.55)
+    ) -> Text {
+        let clamped = max(0, seconds)
+        if clamped < 60 {
+            return Text("<1").foregroundColor(digitColor)
+                + Text("m").foregroundColor(minuteUnitColor)
+        }
 
-        var remaining = seconds
+        var remaining = clamped
         let days = remaining / 86_400
         remaining %= 86_400
         let hours = remaining / 3_600
         remaining %= 3_600
         let minutes = remaining / 60
 
+        func part(_ value: Int, unit: String, unitColor: Color) -> Text {
+            Text("\(value)").foregroundColor(digitColor)
+                + Text(unit).foregroundColor(unitColor)
+        }
+
+        let spacer = Text(" ").foregroundColor(digitColor)
+
         if days > 0 {
-            let hh = String(format: "%02d", hours)
-            let mm = String(format: "%02d", minutes)
-            return "\(days)d\(hh)h\(mm)m"
+            return part(days, unit: "d", unitColor: dayUnitColor)
+                + spacer
+                + part(hours, unit: "h", unitColor: hourUnitColor)
+                + spacer
+                + part(minutes, unit: "m", unitColor: minuteUnitColor)
         }
 
         if hours > 0 {
-            let mm = String(format: "%02d", minutes)
-            return "\(hours)h\(mm)m"
+            return part(hours, unit: "h", unitColor: hourUnitColor)
+                + spacer
+                + part(minutes, unit: "m", unitColor: minuteUnitColor)
         }
 
-        return "\(minutes)m"
+        return part(minutes, unit: "m", unitColor: minuteUnitColor)
     }
 }
 
