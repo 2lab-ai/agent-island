@@ -14,6 +14,7 @@ enum UsageFetcherError: LocalizedError {
     case vendoredScriptNotFound
     case dockerFailed(exitCode: Int32, stderr: String)
     case invalidJSON(underlying: Error)
+    case noCredentialsFound
 
     var errorDescription: String? {
         switch self {
@@ -26,6 +27,8 @@ enum UsageFetcherError: LocalizedError {
             return "Docker run failed (exit code \(exitCode)): \(stderr)"
         case .invalidJSON:
             return "Failed to parse check-usage JSON output."
+        case .noCredentialsFound:
+            return "No CLI credentials found for Claude/Codex/Gemini. Log in and try again."
         }
     }
 }
@@ -80,31 +83,77 @@ final class UsageFetcher {
         }
     }
 
+    func fetchCurrentSnapshot(credentials: ExportCredentials) async -> UsageSnapshot {
+        let cacheKey = "__current__"
+        let profileName = "Current"
+
+        if let entry = await cache.getFresh(profileName: cacheKey) {
+            return UsageSnapshot(
+                profileName: profileName,
+                output: entry.output,
+                fetchedAt: entry.fetchedAt,
+                isStale: false,
+                errorMessage: nil
+            )
+        }
+
+        do {
+            let output = try await fetchUsageFromDocker(credentials: credentials)
+            await cache.set(profileName: cacheKey, output: output)
+            let entry = await cache.getAny(profileName: cacheKey)
+            return UsageSnapshot(
+                profileName: profileName,
+                output: entry?.output ?? output,
+                fetchedAt: entry?.fetchedAt,
+                isStale: false,
+                errorMessage: nil
+            )
+        } catch {
+            let entry = await cache.getAny(profileName: cacheKey)
+            return UsageSnapshot(
+                profileName: profileName,
+                output: entry?.output,
+                fetchedAt: entry?.fetchedAt,
+                isStale: entry != nil,
+                errorMessage: error.localizedDescription
+            )
+        }
+    }
+
     // MARK: - Internals
 
     private func fetchUsageFromDocker(profile: UsageProfile, accounts: [UsageAccount]) async throws -> CheckUsageOutput {
-        let scriptURL = try Self.vendoredScriptURL()
         let tempHomeURL = try buildTempHome(profile: profile, accounts: accounts)
         defer { try? FileManager.default.removeItem(at: tempHomeURL) }
+        return try await fetchUsageFromDocker(homeURL: tempHomeURL)
+    }
 
-        try stageVendoredScript(into: tempHomeURL, scriptURL: scriptURL)
+    private func fetchUsageFromDocker(credentials: ExportCredentials) async throws -> CheckUsageOutput {
+        let tempHomeURL = try buildTempHome(credentials: credentials)
+        defer { try? FileManager.default.removeItem(at: tempHomeURL) }
+
+        return try await fetchUsageFromDocker(homeURL: tempHomeURL)
+    }
+
+    private func fetchUsageFromDocker(homeURL: URL) async throws -> CheckUsageOutput {
+        let scriptURL = try Self.vendoredScriptURL()
+
+        try stageVendoredScript(into: homeURL, scriptURL: scriptURL)
 
         let scriptPathInContainer = "/home/node/.claude-island-scripts/check-usage.js"
 
         let json: Data
         do {
             json = try await runDockerCheckUsage(
-                homeURL: tempHomeURL,
+                homeURL: homeURL,
                 scriptPathInContainer: scriptPathInContainer,
                 dockerContext: nil
             )
         } catch let error as UsageFetcherError {
-            // If the user has a remote Docker context selected, volume mounts will
-            // not point at the local filesystem. Retry against Docker Desktop.
             if case .dockerFailed(_, let stderr) = error,
                stderr.contains("Cannot find module") || stderr.contains("MODULE_NOT_FOUND") {
                 json = try await runDockerCheckUsage(
-                    homeURL: tempHomeURL,
+                    homeURL: homeURL,
                     scriptPathInContainer: scriptPathInContainer,
                     dockerContext: "desktop-linux"
                 )
@@ -155,6 +204,48 @@ final class UsageFetcher {
         )
 
         return tempHome
+    }
+
+    private func buildTempHome(credentials: ExportCredentials) throws -> URL {
+        if credentials.claude == nil, credentials.codex == nil, credentials.gemini == nil {
+            throw UsageFetcherError.noCredentialsFound
+        }
+
+        let root = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude-island/tmp-homes", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let tempHome = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempHome, withIntermediateDirectories: true)
+
+        if let claudeData = credentials.claude {
+            let dir = tempHome.appendingPathComponent(".claude", isDirectory: true)
+            try writeFile(data: claudeData, to: dir.appendingPathComponent(".credentials.json"))
+        }
+
+        if let codexData = credentials.codex {
+            let dir = tempHome.appendingPathComponent(".codex", isDirectory: true)
+            try writeFile(data: codexData, to: dir.appendingPathComponent("auth.json"))
+        }
+
+        if let geminiData = credentials.gemini {
+            let dir = tempHome.appendingPathComponent(".gemini", isDirectory: true)
+            try writeFile(data: geminiData, to: dir.appendingPathComponent("oauth_creds.json"))
+        }
+
+        return tempHome
+    }
+
+    private func writeFile(data: Data, to fileURL: URL) throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: fileURL, options: [.atomic])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: fileURL.path
+        )
     }
 
     private func copyServiceDir(

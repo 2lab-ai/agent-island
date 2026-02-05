@@ -4,6 +4,7 @@ import SwiftUI
 @MainActor
 final class UsageDashboardViewModel: ObservableObject {
     @Published var profiles: [UsageProfile] = []
+    @Published var currentSnapshot: UsageSnapshot?
     @Published var snapshotsByProfileName: [String: UsageSnapshot] = [:]
     @Published var isRefreshing = false
     @Published var isSavingProfile = false
@@ -15,6 +16,7 @@ final class UsageDashboardViewModel: ObservableObject {
     private let profileStore: ProfileStore
     private let fetcher: UsageFetcher
     private let switcher: ProfileSwitcher
+    private let exporter: CredentialExporter
 
     private var refreshTask: Task<Void, Never>?
 
@@ -22,7 +24,9 @@ final class UsageDashboardViewModel: ObservableObject {
         self.accountStore = accountStore
         self.profileStore = ProfileStore(accountStore: accountStore)
         self.fetcher = UsageFetcher(accountStore: accountStore, cache: UsageCache())
-        self.switcher = ProfileSwitcher(accountStore: accountStore, exporter: CredentialExporter())
+        let exporter = CredentialExporter()
+        self.exporter = exporter
+        self.switcher = ProfileSwitcher(accountStore: accountStore, exporter: exporter)
     }
 
     func load() {
@@ -45,6 +49,9 @@ final class UsageDashboardViewModel: ObservableObject {
         refreshTask = Task { [weak self] in
             guard let self else { return }
             defer { self.isRefreshing = false }
+
+            let credentials = exporter.loadCurrentCredentials()
+            currentSnapshot = await fetcher.fetchCurrentSnapshot(credentials: credentials)
 
             for profile in profilesToRefresh {
                 if Task.isCancelled { break }
@@ -245,10 +252,15 @@ struct UsageDashboardView: View {
             }
 
             if model.profiles.isEmpty {
-                emptyProfilesState
+                VStack(spacing: 10) {
+                    CurrentUsageRow(snapshot: model.currentSnapshot)
+                        .padding(.horizontal, 6)
+                    emptyProfilesState
+                }
             } else {
                 ScrollView(.vertical, showsIndicators: false) {
                     LazyVStack(spacing: 6) {
+                        CurrentUsageRow(snapshot: model.currentSnapshot)
                         ForEach(model.profiles) { profile in
                             ProfileUsageRow(
                                 profile: profile,
@@ -268,16 +280,16 @@ struct UsageDashboardView: View {
 
     private var emptyProfilesState: some View {
         VStack(spacing: 8) {
-            Text("No profiles yet")
+            Text("No saved profiles yet")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(.white.opacity(0.5))
 
-            Text("Use “Save Profile” to snapshot your current CLI logins.")
+            Text("“Current” shows your active CLI logins. Use “Save Profile” to snapshot them.")
                 .font(.system(size: 11))
                 .foregroundColor(.white.opacity(0.25))
                 .multilineTextAlignment(.center)
         }
-        .frame(maxWidth: .infinity, minHeight: 180)
+        .frame(maxWidth: .infinity, minHeight: 120)
         .padding(.horizontal, 10)
     }
 
@@ -409,6 +421,70 @@ private struct ProfileUsageRow: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(isSwitching)
+            }
+
+            HStack(spacing: 10) {
+                UsageServicePill(label: "Claude", info: snapshot?.output?.claude)
+                UsageServicePill(label: "Codex", info: snapshot?.output?.codex)
+                UsageServicePill(label: "Gemini", info: snapshot?.output?.gemini)
+            }
+
+            if let message = snapshot?.errorMessage {
+                Text(message)
+                    .font(.system(size: 10))
+                    .foregroundColor(TerminalColors.amber.opacity(0.9))
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(isHovered ? Color.white.opacity(0.09) : Color.white.opacity(0.06))
+        )
+        .onHover { isHovered = $0 }
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
+    }
+
+    private func timeString(_ date: Date) -> String {
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m" }
+        return "\(minutes / 60)h"
+    }
+}
+
+private struct CurrentUsageRow: View {
+    let snapshot: UsageSnapshot?
+
+    @State private var isHovered = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Text(snapshot?.profileName ?? "Current")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+                    .lineLimit(1)
+
+                Text("UNSAVED")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.3))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.white.opacity(0.06))
+                    )
+
+                Spacer()
+
+                if let snapshot, let fetchedAt = snapshot.fetchedAt {
+                    Text(timeString(fetchedAt))
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundColor(.white.opacity(snapshot.isStale ? 0.35 : 0.45))
+                }
             }
 
             HStack(spacing: 10) {
