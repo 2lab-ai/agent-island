@@ -47,3 +47,6 @@ CLAUDE.md
 # Local AI agent logs
 .claude/raw_logs/
 .claude/chat_logs/
+
+# Local scratch assets (not part of the app bundle)
+assets/

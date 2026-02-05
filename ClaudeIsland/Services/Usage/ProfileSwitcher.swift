@@ -1,6 +1,15 @@
 import CryptoKit
 import Foundation
 
+enum UsageCredentialHasher {
+    static func fingerprint(service: UsageService, data: Data) -> (accountId: String, hashPrefix: String) {
+        let digest = SHA256.hash(data: data)
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        let hashPrefix = String(hex.prefix(16))
+        return (accountId: "acct_\(service.rawValue)_\(hashPrefix)", hashPrefix: hashPrefix)
+    }
+}
+
 struct ProfileSaveResult {
     let profile: UsageProfile
     let accountsWritten: [UsageAccount]
@@ -218,8 +227,9 @@ final class ProfileSwitcher {
         updatedAt: Date,
         snapshot: inout AccountsSnapshot
     ) throws -> (account: UsageAccount, written: Bool) {
-        let hashPrefix = hashString(data).prefix(16)
-        let accountId = "acct_\(service.rawValue)_\(hashPrefix)"
+        let fingerprint = UsageCredentialHasher.fingerprint(service: service, data: data)
+        let accountId = fingerprint.accountId
+        let hashPrefix = fingerprint.hashPrefix
         let root = accountsDir.appendingPathComponent(accountId, isDirectory: true)
 
         let exportCredentials: ExportCredentials
@@ -254,10 +264,6 @@ final class ProfileSwitcher {
         }
     }
 
-    private func hashString(_ data: Data) -> String {
-        SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
-    }
-
     private func copyCredentialFileIfPresent(from sourceURL: URL, to destinationURL: URL) -> Bool {
         guard fileManager.fileExists(atPath: sourceURL.path) else { return false }
 
@@ -275,4 +281,3 @@ final class ProfileSwitcher {
         }
     }
 }
-

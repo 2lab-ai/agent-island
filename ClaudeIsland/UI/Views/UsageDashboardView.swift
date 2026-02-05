@@ -2,12 +2,32 @@ import Combine
 import Foundation
 import SwiftUI
 
+struct UsageAccountIdSet: Sendable, Equatable {
+    let claude: String?
+    let codex: String?
+    let gemini: String?
+
+    static let empty = UsageAccountIdSet(claude: nil, codex: nil, gemini: nil)
+
+    var hasAny: Bool {
+        claude != nil || codex != nil || gemini != nil
+    }
+
+    func matches(profile: UsageProfile) -> Bool {
+        claude == profile.claudeAccountId &&
+            codex == profile.codexAccountId &&
+            gemini == profile.geminiAccountId
+    }
+}
+
 @MainActor
 final class UsageDashboardViewModel: ObservableObject {
     static let shared = UsageDashboardViewModel()
 
     @Published var profiles: [UsageProfile] = []
     @Published var currentSnapshot: UsageSnapshot?
+    @Published var currentAccountIds: UsageAccountIdSet = .empty
+    @Published var liveProfileName: String?
     @Published var snapshotsByProfileName: [String: UsageSnapshot] = [:]
     @Published var isRefreshing = false
     @Published var isSavingProfile = false
@@ -51,6 +71,7 @@ final class UsageDashboardViewModel: ObservableObject {
             profiles = []
         }
 
+        updateLiveProfileName()
         refreshAll()
     }
 
@@ -101,6 +122,8 @@ final class UsageDashboardViewModel: ObservableObject {
             defer { self.isRefreshing = false }
 
             let credentials = exporter.loadCurrentCredentials()
+            currentAccountIds = computeAccountIds(credentials: credentials)
+            updateLiveProfileName()
             currentSnapshot = await fetcher.fetchCurrentSnapshot(credentials: credentials)
 
             for profile in profilesToRefresh {
@@ -109,6 +132,23 @@ final class UsageDashboardViewModel: ObservableObject {
                 snapshotsByProfileName[profile.name] = snapshot
             }
         }
+    }
+
+    private func computeAccountIds(credentials: ExportCredentials) -> UsageAccountIdSet {
+        UsageAccountIdSet(
+            claude: credentials.claude.map { UsageCredentialHasher.fingerprint(service: .claude, data: $0).accountId },
+            codex: credentials.codex.map { UsageCredentialHasher.fingerprint(service: .codex, data: $0).accountId },
+            gemini: credentials.gemini.map { UsageCredentialHasher.fingerprint(service: .gemini, data: $0).accountId }
+        )
+    }
+
+    private func updateLiveProfileName() {
+        guard currentAccountIds.hasAny else {
+            liveProfileName = nil
+            return
+        }
+
+        liveProfileName = profiles.first(where: { currentAccountIds.matches(profile: $0) })?.name
     }
 
     func saveProfile(named name: String) async -> Bool {
@@ -122,6 +162,8 @@ final class UsageDashboardViewModel: ObservableObject {
                 : "Saved “\(result.profile.name)” with warnings: \(result.warnings.joined(separator: " · "))"
 
             profiles = try profileStore.loadProfiles()
+            currentAccountIds = computeAccountIds(credentials: exporter.loadCurrentCredentials())
+            updateLiveProfileName()
             refreshAll()
             return true
         } catch {
@@ -144,6 +186,10 @@ final class UsageDashboardViewModel: ObservableObject {
             let switchedSummary = flags.isEmpty ? "No files copied." : "Switched: \(flags.joined(separator: ", "))."
             let warningsSummary = result.warnings.isEmpty ? nil : "Warnings: \(result.warnings.joined(separator: " · "))"
             lastActionMessage = [switchedSummary, warningsSummary].compactMap { $0 }.joined(separator: " ")
+
+            currentAccountIds = computeAccountIds(credentials: exporter.loadCurrentCredentials())
+            updateLiveProfileName()
+            refreshAll()
         } catch {
             lastActionMessage = error.localizedDescription
         }
@@ -166,6 +212,7 @@ struct UsageDashboardView: View {
     @State private var pendingSwitchProfile: UsageProfile?
     @State private var selectedTab: UsageTab = .dashboard
     @State private var now = Date()
+    @State private var previousLiveProfileName: String?
 
     private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -201,6 +248,15 @@ struct UsageDashboardView: View {
         .onReceive(clock) { now = $0 }
         .onAppear {
             model.startBackgroundRefreshIfNeeded()
+            previousLiveProfileName = model.liveProfileName
+        }
+        .onChange(of: model.liveProfileName) { newValue in
+            let oldValue = previousLiveProfileName
+            previousLiveProfileName = newValue
+            reconcileSelectionForLiveProfileChange(oldLiveProfileName: oldValue, newLiveProfileName: newValue)
+        }
+        .onChange(of: model.profiles.map { $0.name }) { _ in
+            ensureSelectedTabExists()
         }
         .confirmationDialog(
             "Switch Profile (Experimental)",
@@ -348,18 +404,20 @@ struct UsageDashboardView: View {
                     selectTab(.dashboard)
                 }
 
-                profileTabButton(
-                    title: "Current",
-                    badge: "LIVE",
-                    isSelected: selectedTab == .current
-                ) {
-                    selectTab(.current)
+                if model.liveProfileName == nil {
+                    profileTabButton(
+                        title: "Current",
+                        badge: "LIVE",
+                        isSelected: selectedTab == .current
+                    ) {
+                        selectTab(.current)
+                    }
                 }
 
                 ForEach(model.profiles) { profile in
                     profileTabButton(
                         title: profile.name,
-                        badge: nil,
+                        badge: profile.name == model.liveProfileName ? "LIVE" : nil,
                         isSelected: selectedTab == .profile(profile.name)
                     ) {
                         selectTab(.profile(profile.name))
@@ -422,6 +480,44 @@ struct UsageDashboardView: View {
         }
     }
 
+    private func reconcileSelectionForLiveProfileChange(
+        oldLiveProfileName: String?,
+        newLiveProfileName: String?
+    ) {
+        switch selectedTab {
+        case .current:
+            if let newLiveProfileName {
+                selectedTab = .profile(newLiveProfileName)
+            }
+        case .profile(let name):
+            guard let oldLiveProfileName, name == oldLiveProfileName else { break }
+            if let newLiveProfileName {
+                selectedTab = .profile(newLiveProfileName)
+            } else {
+                selectedTab = .current
+            }
+        default:
+            break
+        }
+
+        ensureSelectedTabExists()
+    }
+
+    private func ensureSelectedTabExists() {
+        switch selectedTab {
+        case .profile(let name):
+            if !model.profiles.contains(where: { $0.name == name }) {
+                selectedTab = .dashboard
+            }
+        case .current:
+            if let liveProfileName = model.liveProfileName {
+                selectedTab = .profile(liveProfileName)
+            }
+        default:
+            break
+        }
+    }
+
     private var selectedProfileSection: some View {
         Group {
             switch selectedTab {
@@ -441,7 +537,7 @@ struct UsageDashboardView: View {
                 if let profile = model.profiles.first(where: { $0.name == name }) {
                     UsageDashboardPanel(
                         title: profile.name,
-                        badge: nil,
+                        badge: profile.name == model.liveProfileName ? "LIVE" : nil,
                         snapshot: model.snapshotsByProfileName[profile.name],
                         now: now,
                         showSwitch: true,
