@@ -13,13 +13,26 @@ final class UsageResetAlertCoordinator: ObservableObject {
     }
 
     struct Alert: Identifiable, Equatable {
-        let id: String
         let provider: UsageProvider
         let window: UsageWindow
         let profileName: String
         let email: String?
         let tier: String?
         let resetAt: Date
+
+        var id: String { cycleId }
+
+        var cycleId: String {
+            let emailKey: String? = {
+                guard let email else { return nil }
+                return email
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                    .nonEmptyOrNil
+            }()
+            let identity = emailKey ?? profileName
+            return "\(provider.displayName)|\(window.label)|\(identity)|\(Int(resetAt.timeIntervalSince1970))"
+        }
     }
 
     @Published private(set) var mode: Mode = .pulse
@@ -140,7 +153,6 @@ final class UsageResetAlertCoordinator: ObservableObject {
                 if let resetAt = info.fiveHourReset, resetAt > now {
                     result.append(
                         Alert(
-                            id: "\(snapshot.profileName)|\(provider.displayName)|5h|\(Int(resetAt.timeIntervalSince1970))",
                             provider: provider,
                             window: .fiveHour,
                             profileName: snapshot.profileName,
@@ -155,7 +167,6 @@ final class UsageResetAlertCoordinator: ObservableObject {
                 if let resetAt = info.sevenDayReset, resetAt > now {
                     result.append(
                         Alert(
-                            id: "\(snapshot.profileName)|\(provider.displayName)|7d|\(Int(resetAt.timeIntervalSince1970))",
                             provider: provider,
                             window: .sevenDay,
                             profileName: snapshot.profileName,
@@ -187,7 +198,37 @@ final class UsageResetAlertCoordinator: ObservableObject {
             addFromSnapshot(model.snapshotsByProfileName[profile.name])
         }
 
-        return result
+        return deduplicate(result)
+    }
+
+    private func deduplicate(_ alerts: [Alert]) -> [Alert] {
+        var byCycle: [String: Alert] = [:]
+
+        func score(_ alert: Alert) -> Int {
+            var value = 0
+            if let email = alert.email?.trimmingCharacters(in: .whitespacesAndNewlines), !email.isEmpty { value += 4 }
+            if let tier = alert.tier?.trimmingCharacters(in: .whitespacesAndNewlines), !tier.isEmpty { value += 2 }
+            if alert.profileName == "Current" { value += 1 }
+            return value
+        }
+
+        for alert in alerts {
+            let key = alert.cycleId
+            guard let existing = byCycle[key] else {
+                byCycle[key] = alert
+                continue
+            }
+
+            let a = score(existing)
+            let b = score(alert)
+            if b > a {
+                byCycle[key] = alert
+            } else if b == a, alert.resetAt < existing.resetAt {
+                byCycle[key] = alert
+            }
+        }
+
+        return byCycle.values.sorted { $0.resetAt < $1.resetAt }
     }
 
     private func dueAlerts(now: Date, candidates: [Alert]) -> [Alert] {
@@ -282,7 +323,7 @@ final class UsageResetAlertCoordinator: ObservableObject {
     }
 
     private func cycleId(for alert: Alert) -> String {
-        alert.id
+        alert.cycleId
     }
 
     private func pruneFiredKeys(candidates: [Alert]) {

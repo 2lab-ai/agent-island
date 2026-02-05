@@ -481,17 +481,43 @@ struct UsageDashboardView: View {
     }
 
     private var dashboardTiles: [UsageAccountTile] {
-        var claudeTiles: [UsageAccountTile] = []
-        var codexTiles: [UsageAccountTile] = []
-        var geminiTiles: [UsageAccountTile] = []
+        var tilesByKey: [String: UsageAccountTile] = [:]
+
+        func providerOrder(_ provider: UsageProvider) -> Int {
+            switch provider {
+            case .claude: return 0
+            case .codex: return 1
+            case .gemini: return 2
+            }
+        }
+
+        func score(_ tile: UsageAccountTile) -> Int {
+            var value = 0
+            if let email = tile.email?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil { value += 3 }
+            if let tier = tile.tier?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil { value += 1 }
+            if tile.errorMessage == nil { value += 2 }
+            if let info = tile.info, info.available, !info.error { value += 4 }
+            if tile.info != nil { value += 1 }
+            return value
+        }
+
+        func consider(_ tile: UsageAccountTile) {
+            if let existing = tilesByKey[tile.id] {
+                if score(tile) > score(existing) {
+                    tilesByKey[tile.id] = tile
+                }
+            } else {
+                tilesByKey[tile.id] = tile
+            }
+        }
 
         for profile in model.profiles {
             let snapshot = model.snapshotsByProfileName[profile.name]
 
-            if profile.claudeAccountId != nil {
-                claudeTiles.append(
+            if let accountId = profile.claudeAccountId {
+                consider(
                     UsageAccountTile(
-                        id: "claude:\(profile.name)",
+                        id: "claude:\(accountId)",
                         provider: .claude,
                         label: profile.name,
                         email: snapshot?.identities.claudeEmail,
@@ -502,10 +528,10 @@ struct UsageDashboardView: View {
                 )
             }
 
-            if profile.codexAccountId != nil {
-                codexTiles.append(
+            if let accountId = profile.codexAccountId {
+                consider(
                     UsageAccountTile(
-                        id: "codex:\(profile.name)",
+                        id: "codex:\(accountId)",
                         provider: .codex,
                         label: profile.name,
                         email: snapshot?.identities.codexEmail,
@@ -516,10 +542,10 @@ struct UsageDashboardView: View {
                 )
             }
 
-            if profile.geminiAccountId != nil {
-                geminiTiles.append(
+            if let accountId = profile.geminiAccountId {
+                consider(
                     UsageAccountTile(
-                        id: "gemini:\(profile.name)",
+                        id: "gemini:\(accountId)",
                         provider: .gemini,
                         label: profile.name,
                         email: snapshot?.identities.geminiEmail,
@@ -531,7 +557,23 @@ struct UsageDashboardView: View {
             }
         }
 
-        return claudeTiles + codexTiles + geminiTiles
+        return tilesByKey.values.sorted { a, b in
+            let pa = providerOrder(a.provider)
+            let pb = providerOrder(b.provider)
+            if pa != pb { return pa < pb }
+
+            func emailKey(_ email: String?) -> String? {
+                guard let email else { return nil }
+                return email
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased()
+                    .nonEmptyOrNil
+            }
+
+            let ea = emailKey(a.email) ?? a.id
+            let eb = emailKey(b.email) ?? b.id
+            return ea < eb
+        }
     }
 
     private var emptyProfilesState: some View {
@@ -682,12 +724,11 @@ private struct UsageAccountTileCard: View {
                 now: now
             )
 
-            if let message = tile.errorMessage {
-                Text(message)
-                    .font(.system(size: 10))
-                    .foregroundColor(TerminalColors.amber.opacity(0.9))
-                    .lineLimit(1)
-            }
+            Text((tile.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil) ?? " ")
+                .font(.system(size: 10))
+                .foregroundColor(TerminalColors.amber.opacity(0.9))
+                .lineLimit(1)
+                .opacity((tile.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil) == nil ? 0 : 1)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -849,29 +890,13 @@ private struct UsageProviderColumn: View {
         VStack(alignment: .leading, spacing: 8) {
             header
 
-            if let email, !email.isEmpty {
-                Text(email)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.35))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            } else {
-                Text("--")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.2))
-            }
+            Text(emailLineText)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(emailLineColor)
+                .lineLimit(1)
+                .truncationMode(.middle)
 
-            if let info, !info.available {
-                Text("Not installed")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(TerminalColors.dim)
-            } else if let info, info.error {
-                Text("ERR")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(TerminalColors.amber)
-            } else {
-                usageRows
-            }
+            usageRows
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -888,7 +913,46 @@ private struct UsageProviderColumn: View {
             if let tier = resolvedTier {
                 TierBadge(provider: provider, tier: tier)
             }
+
+            if let badge = statusBadge {
+                Text(badge.label)
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundColor(badge.foreground)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(badge.background)
+                    )
+            }
         }
+    }
+
+    private var normalizedEmail: String? {
+        email?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil
+    }
+
+    private var emailLineText: String {
+        if let normalizedEmail { return normalizedEmail }
+        if let info, !info.available { return "Not installed" }
+        return "--"
+    }
+
+    private var emailLineColor: Color {
+        if normalizedEmail != nil { return Color.white.opacity(0.35) }
+        if let info, !info.available { return TerminalColors.dim }
+        return Color.white.opacity(0.2)
+    }
+
+    private var statusBadge: (label: String, background: Color, foreground: Color)? {
+        guard let info else { return nil }
+        if !info.available {
+            return (label: "MISSING", background: Color.white.opacity(0.08), foreground: Color.white.opacity(0.45))
+        }
+        if info.error {
+            return (label: "ERR", background: TerminalColors.amber.opacity(0.9), foreground: Color.black.opacity(0.85))
+        }
+        return nil
     }
 
     private var resolvedTier: String? {
