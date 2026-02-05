@@ -262,7 +262,14 @@ struct UsageDashboardView: View {
 
             if model.profiles.isEmpty {
                 VStack(spacing: 10) {
-                    CurrentUsageRow(snapshot: model.currentSnapshot)
+                    UsageDashboardPanel(
+                        title: model.currentSnapshot?.profileName ?? "Current",
+                        badge: "UNSAVED",
+                        snapshot: model.currentSnapshot,
+                        showSwitch: false,
+                        isSwitching: false,
+                        onSwitch: {}
+                    )
                         .padding(.horizontal, 6)
                     emptyProfilesState
                 }
@@ -345,14 +352,23 @@ struct UsageDashboardView: View {
         Group {
             if let selectedProfileName,
                let profile = model.profiles.first(where: { $0.name == selectedProfileName }) {
-                ProfileUsageRow(
-                    profile: profile,
+                UsageDashboardPanel(
+                    title: profile.name,
+                    badge: nil,
                     snapshot: model.snapshotsByProfileName[profile.name],
+                    showSwitch: true,
                     isSwitching: model.switchingProfileName == profile.name,
                     onSwitch: { pendingSwitchProfile = profile }
                 )
             } else {
-                CurrentUsageRow(snapshot: model.currentSnapshot)
+                UsageDashboardPanel(
+                    title: model.currentSnapshot?.profileName ?? "Current",
+                    badge: "UNSAVED",
+                    snapshot: model.currentSnapshot,
+                    showSwitch: false,
+                    isSwitching: false,
+                    onSwitch: {}
+                )
             }
         }
         .padding(.horizontal, 6)
@@ -452,33 +468,126 @@ struct UsageDashboardView: View {
     }
 }
 
-private struct ProfileUsageRow: View {
-    let profile: UsageProfile
+private enum UsageProvider {
+    case claude
+    case codex
+    case gemini
+
+    var columnTitle: String {
+        switch self {
+        case .claude: "클로드 계정별 사용량"
+        case .codex: "코덱스 계정별 사용량"
+        case .gemini: "젬미니 계정별 사용량"
+        }
+    }
+}
+
+private enum UsageWindow: CaseIterable {
+    case fiveHour
+    case twentyFourHour
+    case sevenDay
+
+    var label: String {
+        switch self {
+        case .fiveHour: "5h"
+        case .twentyFourHour: "24h"
+        case .sevenDay: "7d"
+        }
+    }
+}
+
+private struct UsageDashboardPanel: View {
+    let title: String
+    let badge: String?
     let snapshot: UsageSnapshot?
+    let showSwitch: Bool
     let isSwitching: Bool
     let onSwitch: () -> Void
 
     @State private var isHovered = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Text(profile.name)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.9))
-                    .lineLimit(1)
+        VStack(alignment: .leading, spacing: 10) {
+            header
 
-                Spacer()
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Dashboard")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.55))
+                Rectangle()
+                    .fill(Color.white.opacity(0.08))
+                    .frame(height: 1)
+            }
 
-                if let snapshot, let fetchedAt = snapshot.fetchedAt {
-                    Text(timeString(fetchedAt))
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundColor(.white.opacity(snapshot.isStale ? 0.35 : 0.45))
-                }
+            HStack(alignment: .top, spacing: 0) {
+                UsageProviderColumn(
+                    provider: .claude,
+                    email: snapshot?.identities.claudeEmail,
+                    info: snapshot?.output?.claude,
+                    tokenRefresh: snapshot?.tokenRefresh.claude
+                )
+                columnDivider
+                UsageProviderColumn(
+                    provider: .codex,
+                    email: snapshot?.identities.codexEmail,
+                    info: snapshot?.output?.codex,
+                    tokenRefresh: snapshot?.tokenRefresh.codex
+                )
+                columnDivider
+                UsageProviderColumn(
+                    provider: .gemini,
+                    email: snapshot?.identities.geminiEmail,
+                    info: snapshot?.output?.gemini,
+                    tokenRefresh: snapshot?.tokenRefresh.gemini
+                )
+            }
 
-                Button {
-                    onSwitch()
-                } label: {
+            if let message = snapshot?.errorMessage {
+                Text(message)
+                    .font(.system(size: 10))
+                    .foregroundColor(TerminalColors.amber.opacity(0.9))
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(isHovered ? Color.white.opacity(0.09) : Color.white.opacity(0.06))
+        )
+        .onHover { isHovered = $0 }
+        .animation(.easeInOut(duration: 0.15), value: isHovered)
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.white.opacity(0.9))
+                .lineLimit(1)
+
+            if let badge {
+                Text(badge)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.3))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.white.opacity(0.06))
+                    )
+            }
+
+            Spacer()
+
+            if let snapshot, let fetchedAt = snapshot.fetchedAt {
+                Text(timeString(fetchedAt))
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(snapshot.isStale ? 0.35 : 0.45))
+            }
+
+            if showSwitch {
+                Button(action: onSwitch) {
                     HStack(spacing: 6) {
                         if isSwitching {
                             ProgressView()
@@ -502,46 +611,14 @@ private struct ProfileUsageRow: View {
                 .buttonStyle(.plain)
                 .disabled(isSwitching)
             }
-
-            HStack(spacing: 10) {
-                UsageServiceCard(
-                    label: "Claude",
-                    email: snapshot?.identities.claudeEmail,
-                    info: snapshot?.output?.claude,
-                    windows: [.fiveHour, .sevenDay],
-                    tokenRefresh: snapshot?.tokenRefresh.claude
-                )
-                UsageServiceCard(
-                    label: "Codex",
-                    email: snapshot?.identities.codexEmail,
-                    info: snapshot?.output?.codex,
-                    windows: [.fiveHour, .sevenDay],
-                    tokenRefresh: snapshot?.tokenRefresh.codex
-                )
-                UsageServiceCard(
-                    label: "Gemini",
-                    email: snapshot?.identities.geminiEmail,
-                    info: snapshot?.output?.gemini,
-                    windows: [.twentyFourHour],
-                    tokenRefresh: snapshot?.tokenRefresh.gemini
-                )
-            }
-
-            if let message = snapshot?.errorMessage {
-                Text(message)
-                    .font(.system(size: 10))
-                    .foregroundColor(TerminalColors.amber.opacity(0.9))
-                    .lineLimit(2)
-            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(isHovered ? Color.white.opacity(0.09) : Color.white.opacity(0.06))
-        )
-        .onHover { isHovered = $0 }
-        .animation(.easeInOut(duration: 0.15), value: isHovered)
+    }
+
+    private var columnDivider: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.08))
+            .frame(width: 1)
+            .padding(.horizontal, 10)
     }
 
     private func timeString(_ date: Date) -> String {
@@ -553,126 +630,30 @@ private struct ProfileUsageRow: View {
     }
 }
 
-private struct CurrentUsageRow: View {
-    let snapshot: UsageSnapshot?
-
-    @State private var isHovered = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Text(snapshot?.profileName ?? "Current")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.9))
-                    .lineLimit(1)
-
-                Text("UNSAVED")
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.3))
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color.white.opacity(0.06))
-                    )
-
-                Spacer()
-
-                if let snapshot, let fetchedAt = snapshot.fetchedAt {
-                    Text(timeString(fetchedAt))
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundColor(.white.opacity(snapshot.isStale ? 0.35 : 0.45))
-                }
-            }
-
-            HStack(spacing: 10) {
-                UsageServiceCard(
-                    label: "Claude",
-                    email: snapshot?.identities.claudeEmail,
-                    info: snapshot?.output?.claude,
-                    windows: [.fiveHour, .sevenDay],
-                    tokenRefresh: snapshot?.tokenRefresh.claude
-                )
-                UsageServiceCard(
-                    label: "Codex",
-                    email: snapshot?.identities.codexEmail,
-                    info: snapshot?.output?.codex,
-                    windows: [.fiveHour, .sevenDay],
-                    tokenRefresh: snapshot?.tokenRefresh.codex
-                )
-                UsageServiceCard(
-                    label: "Gemini",
-                    email: snapshot?.identities.geminiEmail,
-                    info: snapshot?.output?.gemini,
-                    windows: [.twentyFourHour],
-                    tokenRefresh: snapshot?.tokenRefresh.gemini
-                )
-            }
-
-            if let message = snapshot?.errorMessage {
-                Text(message)
-                    .font(.system(size: 10))
-                    .foregroundColor(TerminalColors.amber.opacity(0.9))
-                    .lineLimit(2)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(isHovered ? Color.white.opacity(0.09) : Color.white.opacity(0.06))
-        )
-        .onHover { isHovered = $0 }
-        .animation(.easeInOut(duration: 0.15), value: isHovered)
-    }
-
-    private func timeString(_ date: Date) -> String {
-        let seconds = max(0, Int(Date().timeIntervalSince(date)))
-        if seconds < 60 { return "\(seconds)s" }
-        let minutes = seconds / 60
-        if minutes < 60 { return "\(minutes)m" }
-        return "\(minutes / 60)h"
-    }
-}
-
-private struct UsageServiceCard: View {
-    enum Window: CaseIterable {
-        case fiveHour
-        case twentyFourHour
-        case sevenDay
-
-        var label: String {
-            switch self {
-            case .fiveHour: "5h"
-            case .twentyFourHour: "24h"
-            case .sevenDay: "7d"
-            }
-        }
-    }
-
-    let label: String
+private struct UsageProviderColumn: View {
+    let provider: UsageProvider
     let email: String?
     let info: CLIUsageInfo?
-    let windows: [Window]
     let tokenRefresh: TokenRefreshInfo?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 8) {
-                Text(label)
+        VStack(alignment: .leading, spacing: 8) {
+            Text(provider.columnTitle)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.white.opacity(0.55))
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+
+            if let email, !email.isEmpty {
+                Text(email)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.6))
+                    .foregroundColor(.white.opacity(0.35))
                     .lineLimit(1)
-
-                Spacer(minLength: 8)
-
-                if let email, !email.isEmpty {
-                    Text(email)
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.35))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
+                    .truncationMode(.middle)
+            } else {
+                Text("--")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.2))
             }
 
             if let info, !info.available {
@@ -684,17 +665,7 @@ private struct UsageServiceCard: View {
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .foregroundColor(TerminalColors.amber)
             } else {
-                if label == "Gemini" {
-                    GeminiUsageSummaryRow(info: info)
-                } else {
-                    ForEach(windows, id: \.label) { window in
-                        UsageWindowRow(
-                            window: window,
-                            percentUsed: percentUsed(for: window),
-                            resetAt: resetAt(for: window)
-                        )
-                    }
-                }
+                usageRows
             }
 
             if let tokenRefresh {
@@ -704,16 +675,33 @@ private struct UsageServiceCard: View {
                 )
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.white.opacity(0.05))
-        )
     }
 
-    private func percentUsed(for window: Window) -> Double? {
+    @ViewBuilder
+    private var usageRows: some View {
+        switch provider {
+        case .gemini:
+            GeminiUsageSummaryRow(info: info)
+        case .claude, .codex:
+            ForEach(providerWindows, id: \.label) { window in
+                UsageWindowRow(
+                    window: window,
+                    percentUsed: percentUsed(for: window),
+                    resetAt: resetAt(for: window)
+                )
+            }
+        }
+    }
+
+    private var providerWindows: [UsageWindow] {
+        switch provider {
+        case .gemini: return []
+        case .claude, .codex: return [.fiveHour, .sevenDay]
+        }
+    }
+
+    private func percentUsed(for window: UsageWindow) -> Double? {
         guard let info, info.available, !info.error else { return nil }
         switch window {
         case .fiveHour, .twentyFourHour: return info.fiveHourPercent
@@ -721,7 +709,7 @@ private struct UsageServiceCard: View {
         }
     }
 
-    private func resetAt(for window: Window) -> Date? {
+    private func resetAt(for window: UsageWindow) -> Date? {
         guard let info, info.available, !info.error else { return nil }
         switch window {
         case .fiveHour, .twentyFourHour: return info.fiveHourReset
@@ -873,7 +861,7 @@ private struct TokenRefreshRow: View {
 }
 
 private struct UsageWindowRow: View {
-    let window: UsageServiceCard.Window
+    let window: UsageWindow
     let percentUsed: Double?
     let resetAt: Date?
 
