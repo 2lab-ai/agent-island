@@ -54,6 +54,11 @@ final class UsageResetAlertCoordinator: ObservableObject {
     private var autoCloseTask: Task<Void, Never>?
 
     func startIfNeeded(model: UsageDashboardViewModel = .shared) {
+        guard AppSettings.usageResetAlertsEnabled else {
+            usageModel = model
+            stop()
+            return
+        }
         guard tickCancellable == nil else { return }
         usageModel = model
 
@@ -65,6 +70,30 @@ final class UsageResetAlertCoordinator: ObservableObject {
             .sink { [weak self] now in
                 self?.evaluate(now: now)
             }
+    }
+
+    func setEnabled(_ enabled: Bool, model: UsageDashboardViewModel = .shared) {
+        if enabled {
+            startIfNeeded(model: model)
+        } else {
+            usageModel = model
+            stop()
+        }
+    }
+
+    func stop() {
+        tickCancellable?.cancel()
+        tickCancellable = nil
+
+        autoCloseTask?.cancel()
+        autoCloseTask = nil
+
+        firedKeys.removeAll()
+        dismissedStickyCycles.removeAll()
+        activeStickyCycles.removeAll()
+
+        mode = .pulse
+        alerts = []
     }
 
     func attachNotchViewModel(_ viewModel: NotchViewModel?) {

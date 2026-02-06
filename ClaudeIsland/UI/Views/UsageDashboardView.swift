@@ -322,6 +322,23 @@ final class UsageDashboardViewModel: ObservableObject {
         }
     }
 
+    func deleteProfile(_ profile: UsageProfile) async {
+        do {
+            var stored = try profileStore.loadProfiles()
+            stored.removeAll { $0.name == profile.name }
+            try profileStore.saveProfiles(stored)
+
+            profiles = stored
+            snapshotsByProfileName.removeValue(forKey: profile.name)
+            updateCurrentAccountIds(credentials: exporter.loadCurrentCredentials())
+            updateLiveProfileName()
+            lastActionMessage = "Deleted profile “\(profile.name)”."
+            refreshAll()
+        } catch {
+            lastActionMessage = error.localizedDescription
+        }
+    }
+
     func switchToProfile(_ profile: UsageProfile) async {
         switchingProfileName = profile.name
         defer { switchingProfileName = nil }
@@ -531,6 +548,7 @@ struct UsageDashboardView: View {
     @State private var isSaveSheetPresented = false
     @State private var newProfileName = ""
     @State private var pendingSwitchProfile: UsageProfile?
+    @State private var pendingDeleteProfile: UsageProfile?
     @State private var selectedTab: UsageTab = .dashboard
     @State private var now = Date()
     @State private var previousLiveProfileName: String?
@@ -601,6 +619,28 @@ struct UsageDashboardView: View {
                 Text("This will overwrite your active CLI credentials with “\(profile.name)”. Best-effort only.")
             } else {
                 Text("This will overwrite your active CLI credentials. Best-effort only.")
+            }
+        }
+        .confirmationDialog(
+            "Delete Profile",
+            isPresented: Binding(
+                get: { pendingDeleteProfile != nil },
+                set: { if !$0 { pendingDeleteProfile = nil } }
+            )
+        ) {
+            Button("Delete", role: .destructive) {
+                guard let profile = pendingDeleteProfile else { return }
+                pendingDeleteProfile = nil
+                Task { await model.deleteProfile(profile) }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDeleteProfile = nil
+            }
+        } message: {
+            if let profile = pendingDeleteProfile {
+                Text("This will remove “\(profile.name)” from saved profiles. Credential snapshots under `~/.agent-island/accounts/` will be kept.")
+            } else {
+                Text("This will remove the selected profile from saved profiles.")
             }
         }
         .sheet(isPresented: $isSaveSheetPresented) {
@@ -734,7 +774,8 @@ struct UsageDashboardView: View {
                         onClearClaudeCodeToken: clearClaudeCodeToken,
                         claudeCodeTokenStatus: model.currentAccountIds.claude.flatMap { model.claudeCodeTokenStatusByAccountId[$0] },
                         onSetClaudeCodeTokenEnabled: setClaudeCodeTokenEnabled,
-                        onSwitch: {}
+                        onSwitch: {},
+                        onDelete: nil
                     )
                         .padding(.horizontal, 6)
                     emptyProfilesState
@@ -891,7 +932,8 @@ struct UsageDashboardView: View {
                     onClearClaudeCodeToken: clearClaudeCodeToken,
                     claudeCodeTokenStatus: model.currentAccountIds.claude.flatMap { model.claudeCodeTokenStatusByAccountId[$0] },
                     onSetClaudeCodeTokenEnabled: setClaudeCodeTokenEnabled,
-                    onSwitch: {}
+                    onSwitch: {},
+                    onDelete: nil
                 )
             case .profile(let name):
                 if let profile = model.profiles.first(where: { $0.name == name }) {
@@ -912,7 +954,8 @@ struct UsageDashboardView: View {
                         onClearClaudeCodeToken: clearClaudeCodeToken,
                         claudeCodeTokenStatus: accountIds.claude.flatMap { model.claudeCodeTokenStatusByAccountId[$0] },
                         onSetClaudeCodeTokenEnabled: setClaudeCodeTokenEnabled,
-                        onSwitch: { pendingSwitchProfile = profile }
+                        onSwitch: { pendingSwitchProfile = profile },
+                        onDelete: { pendingDeleteProfile = profile }
                     )
                 } else {
                     UsageDashboardPanel(
@@ -927,7 +970,8 @@ struct UsageDashboardView: View {
                         onClearClaudeCodeToken: clearClaudeCodeToken,
                         claudeCodeTokenStatus: model.currentAccountIds.claude.flatMap { model.claudeCodeTokenStatusByAccountId[$0] },
                         onSetClaudeCodeTokenEnabled: setClaudeCodeTokenEnabled,
-                        onSwitch: {}
+                        onSwitch: {},
+                        onDelete: nil
                     )
                 }
             }
@@ -1530,6 +1574,7 @@ private struct UsageDashboardPanel: View {
     let claudeCodeTokenStatus: ClaudeCodeTokenStatus?
     let onSetClaudeCodeTokenEnabled: ((String, Bool) -> Void)?
     let onSwitch: () -> Void
+    let onDelete: (() -> Void)?
 
     @State private var isHovered = false
 
@@ -1661,6 +1706,26 @@ private struct UsageDashboardPanel: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(isSwitching)
+
+                if let onDelete {
+                    Button(action: onDelete) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "trash")
+                                .font(.system(size: 11, weight: .semibold))
+                            Text("Delete")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .foregroundColor(TerminalColors.red.opacity(0.85))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(TerminalColors.red.opacity(0.12))
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isSwitching)
+                }
             }
         }
     }

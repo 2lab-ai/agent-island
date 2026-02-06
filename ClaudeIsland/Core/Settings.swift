@@ -38,6 +38,7 @@ enum AppSettings {
 
     private enum Keys {
         static let notificationSound = "notificationSound"
+        static let usageResetAlertsEnabled = "usageResetAlertsEnabled"
     }
 
     // MARK: - Notification Sound
@@ -53,6 +54,21 @@ enum AppSettings {
         }
         set {
             defaults.set(newValue.rawValue, forKey: Keys.notificationSound)
+        }
+    }
+
+    // MARK: - Usage Reset Alerts
+
+    /// Whether to show usage reset timer alerts (opens the island when a reset is near).
+    static var usageResetAlertsEnabled: Bool {
+        get {
+            if defaults.object(forKey: Keys.usageResetAlertsEnabled) == nil {
+                return true
+            }
+            return defaults.bool(forKey: Keys.usageResetAlertsEnabled)
+        }
+        set {
+            defaults.set(newValue, forKey: Keys.usageResetAlertsEnabled)
         }
     }
 }

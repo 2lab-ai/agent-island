@@ -22,6 +22,7 @@ struct NotchMenuView: View {
     @ObservedObject private var soundSelector = SoundSelector.shared
     @State private var hooksInstalled: Bool = false
     @State private var launchAtLogin: Bool = false
+    @State private var usageResetAlertsEnabled: Bool = false
 
     var body: some View {
         VStack(spacing: 4) {
@@ -41,6 +42,17 @@ struct NotchMenuView: View {
             // Appearance settings
             ScreenPickerRow(screenSelector: screenSelector)
             SoundPickerRow(soundSelector: soundSelector)
+
+            MenuToggleRow(
+                icon: "alarm",
+                label: "Usage Reset Alerts",
+                isOn: usageResetAlertsEnabled
+            ) {
+                let next = !usageResetAlertsEnabled
+                AppSettings.usageResetAlertsEnabled = next
+                usageResetAlertsEnabled = next
+                UsageResetAlertCoordinator.shared.setEnabled(next, model: UsageDashboardViewModel.shared)
+            }
 
             Divider()
                 .background(Color.white.opacity(0.08))
@@ -125,6 +137,7 @@ struct NotchMenuView: View {
     private func refreshStates() {
         hooksInstalled = HookInstaller.isInstalled()
         launchAtLogin = SMAppService.mainApp.status == .enabled
+        usageResetAlertsEnabled = AppSettings.usageResetAlertsEnabled
         screenSelector.refreshScreens()
     }
 }
