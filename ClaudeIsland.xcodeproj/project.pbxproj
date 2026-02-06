@@ -27,6 +27,11 @@
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		C4A87E73A2B5DC2DB8102131 /* assets */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = assets;
+			sourceTree = "<group>";
+		};
 		FD33FD5F2EDF32D7002A6548 /* ClaudeIsland */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -55,6 +60,7 @@
 			isa = PBXGroup;
 			children = (
 				FD33FD5F2EDF32D7002A6548 /* ClaudeIsland */,
+				C4A87E73A2B5DC2DB8102131 /* assets */,
 				FD33FD5E2EDF32D7002A6548 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -83,6 +89,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
+				C4A87E73A2B5DC2DB8102131 /* assets */,
 				FD33FD5F2EDF32D7002A6548 /* ClaudeIsland */,
 			);
 			name = ClaudeIsland;

@@ -83,10 +83,7 @@ struct UsageResetAlertsView: View {
 
         VStack(alignment: .leading, spacing: 5) {
             HStack(spacing: 8) {
-                Text(alert.provider.displayName)
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.75))
-                    .lineLimit(1)
+                UsageProviderIcon(provider: alert.provider, size: 14)
 
                 if let tier = alert.tier?.trimmingCharacters(in: .whitespacesAndNewlines), !tier.isEmpty {
                     Text(tier)

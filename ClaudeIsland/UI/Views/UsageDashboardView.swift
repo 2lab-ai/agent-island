@@ -766,7 +766,7 @@ struct UsageDashboardView: View {
     }
 }
 
-enum UsageProvider {
+enum UsageProvider: Hashable {
     case claude
     case codex
     case gemini
@@ -999,10 +999,7 @@ private struct UsageProviderColumn: View {
 
     private var header: some View {
         HStack(spacing: 8) {
-            Text(provider.displayName)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundColor(.white.opacity(0.75))
-                .lineLimit(1)
+            UsageProviderIcon(provider: provider, size: 14)
 
             Spacer(minLength: 6)
 
