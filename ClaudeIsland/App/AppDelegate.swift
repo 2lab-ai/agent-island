@@ -210,7 +210,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func ensureSingleInstance() -> Bool {
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.celestial.AgentIsland"
+        let bundleID = Bundle.main.bundleIdentifier ?? "ai.2lab.AgentIsalnd"
         let runningApps = NSWorkspace.shared.runningApplications.filter {
             $0.bundleIdentifier == bundleID
         }

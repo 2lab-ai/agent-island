@@ -1,7 +1,7 @@
 .PHONY: up
 
 APP_NAME ?= Agent Island.app
-BUNDLE_ID ?= com.celestial.AgentIsland
+BUNDLE_ID ?= ai.2lab.AgentIsalnd
 PROJECT ?= ClaudeIsland.xcodeproj
 SCHEME ?= ClaudeIsland
 CONFIGURATION ?= Release

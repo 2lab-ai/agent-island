@@ -27,7 +27,7 @@ Rename "Claude Island" → "Agent Island" and prepare for Mac App Store distribu
 
 | File | Change |
 |------|--------|
-| `project.pbxproj` | `com.celestial.ClaudeIsland` → `com.celestial.AgentIsland` (2 locations) |
+| `project.pbxproj` | `com.celestial.ClaudeIsland` → `ai.2lab.AgentIsalnd` (2 locations) |
 | `AppDelegate.swift:185` | Fallback bundle ID |
 
 ### 1.3 File System Paths (user-visible)
@@ -119,7 +119,7 @@ App Store handles updates natively. Sparkle must be removed for the App Store ta
 2. Create new app:
    - Platform: macOS
    - Name: "Agent Island"
-   - Bundle ID: `com.celestial.AgentIsland`
+   - Bundle ID: `ai.2lab.AgentIsalnd`
    - SKU: `agent-island`
    - Primary Language: English
 3. Set category: Developer Tools

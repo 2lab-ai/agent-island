@@ -305,7 +305,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.celestial.AgentIsland;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.2lab.AgentIsalnd;
 				PRODUCT_NAME = "Agent Island";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -340,7 +340,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.celestial.AgentIsland;
+				PRODUCT_BUNDLE_IDENTIFIER = ai.2lab.AgentIsalnd;
 				PRODUCT_NAME = "Agent Island";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
