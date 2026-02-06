@@ -1390,12 +1390,6 @@ private struct UsageProviderColumn: View {
         VStack(alignment: .leading, spacing: 8) {
             header
 
-            Text(emailLineText)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                .foregroundColor(emailLineColor)
-                .lineLimit(1)
-                .truncationMode(.middle)
-
             UsageTokenRefreshRow(tokenRefresh: tokenRefresh, now: now)
 
             usageRows
@@ -1422,14 +1416,12 @@ private struct UsageProviderColumn: View {
         HStack(spacing: 8) {
             UsageProviderIcon(provider: provider, size: 14)
 
-            if let accountId = normalizedAccountId {
-                Text(accountId)
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                    .foregroundColor(.white.opacity(0.22))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .minimumScaleFactor(0.7)
-            }
+            Text(headerTitle)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundColor(headerTitleColor)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .minimumScaleFactor(0.7)
 
             Spacer(minLength: 6)
 
@@ -1505,15 +1497,17 @@ private struct UsageProviderColumn: View {
         email?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil
     }
 
-    private var emailLineText: String {
+    private var headerTitle: String {
         if let normalizedEmail { return normalizedEmail }
         if let info, !info.available { return "Not installed" }
+        if let normalizedAccountId { return normalizedAccountId }
         return "--"
     }
 
-    private var emailLineColor: Color {
+    private var headerTitleColor: Color {
         if normalizedEmail != nil { return Color.white.opacity(0.35) }
         if let info, !info.available { return TerminalColors.dim }
+        if normalizedAccountId != nil { return Color.white.opacity(0.22) }
         return Color.white.opacity(0.2)
     }
 
