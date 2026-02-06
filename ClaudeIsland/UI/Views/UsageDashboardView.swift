@@ -47,6 +47,7 @@ final class UsageDashboardViewModel: ObservableObject {
     private var backgroundRefreshStarted = false
     private var lastKnownEmailByAccountId: [String: String] = [:]
     private var lastKnownTierByAccountId: [String: String] = [:]
+    private var lastKnownClaudeIsTeamByAccountId: [String: Bool] = [:]
 
     init(accountStore: AccountStore = AccountStore()) {
         self.accountStore = accountStore
@@ -162,6 +163,7 @@ final class UsageDashboardViewModel: ObservableObject {
     private func snapshotWithRememberedIdentities(_ snapshot: UsageSnapshot, accountIds: UsageAccountIdSet) -> UsageSnapshot {
         let rememberedClaudeEmail = accountIds.claude.flatMap { lastKnownEmailByAccountId[$0] }
         let rememberedClaudeTier = accountIds.claude.flatMap { lastKnownTierByAccountId[$0] }
+        let rememberedClaudeIsTeam = accountIds.claude.flatMap { lastKnownClaudeIsTeamByAccountId[$0] }
         let rememberedCodexEmail = accountIds.codex.flatMap { lastKnownEmailByAccountId[$0] }
         let rememberedGeminiEmail = accountIds.gemini.flatMap { lastKnownEmailByAccountId[$0] }
 
@@ -172,6 +174,7 @@ final class UsageDashboardViewModel: ObservableObject {
         let mergedIdentities = UsageIdentities(
             claudeEmail: normalize(snapshot.identities.claudeEmail) ?? rememberedClaudeEmail,
             claudeTier: normalize(snapshot.identities.claudeTier) ?? rememberedClaudeTier,
+            claudeIsTeam: snapshot.identities.claudeIsTeam ?? rememberedClaudeIsTeam,
             codexEmail: normalize(snapshot.identities.codexEmail) ?? rememberedCodexEmail,
             geminiEmail: normalize(snapshot.identities.geminiEmail) ?? rememberedGeminiEmail
         )
@@ -200,8 +203,15 @@ final class UsageDashboardViewModel: ObservableObject {
             lastKnownTierByAccountId[accountId] = tier
         }
 
+        func rememberClaudeIsTeam(accountId: String?, isTeam: Bool?) {
+            guard let accountId else { return }
+            guard let isTeam else { return }
+            lastKnownClaudeIsTeamByAccountId[accountId] = isTeam
+        }
+
         rememberEmail(accountId: accountIds.claude, email: snapshot.identities.claudeEmail)
         rememberTier(accountId: accountIds.claude, tier: snapshot.identities.claudeTier)
+        rememberClaudeIsTeam(accountId: accountIds.claude, isTeam: snapshot.identities.claudeIsTeam)
         rememberEmail(accountId: accountIds.codex, email: snapshot.identities.codexEmail)
         rememberEmail(accountId: accountIds.gemini, email: snapshot.identities.geminiEmail)
     }
@@ -682,6 +692,7 @@ struct UsageDashboardView: View {
                         label: profile.name,
                         email: snapshot?.identities.claudeEmail,
                         tier: snapshot?.identities.claudeTier,
+                        claudeIsTeam: snapshot?.identities.claudeIsTeam,
                         info: snapshot?.output?.claude,
                         errorMessage: snapshot?.errorMessage
                     )
@@ -696,6 +707,7 @@ struct UsageDashboardView: View {
                         label: profile.name,
                         email: snapshot?.identities.codexEmail,
                         tier: nil,
+                        claudeIsTeam: nil,
                         info: snapshot?.output?.codex,
                         errorMessage: snapshot?.errorMessage
                     )
@@ -710,6 +722,7 @@ struct UsageDashboardView: View {
                         label: profile.name,
                         email: snapshot?.identities.geminiEmail,
                         tier: nil,
+                        claudeIsTeam: nil,
                         info: snapshot?.output?.gemini,
                         errorMessage: snapshot?.errorMessage
                     )
@@ -864,6 +877,7 @@ private struct UsageAccountTile: Identifiable {
     let label: String
     let email: String?
     let tier: String?
+    let claudeIsTeam: Bool?
     let info: CLIUsageInfo?
     let errorMessage: String?
 }
@@ -880,6 +894,7 @@ private struct UsageAccountTileCard: View {
                 provider: tile.provider,
                 email: tile.email,
                 tier: tile.tier,
+                claudeIsTeam: tile.claudeIsTeam,
                 info: tile.info,
                 now: now
             )
@@ -930,6 +945,7 @@ private struct UsageDashboardPanel: View {
                     provider: .claude,
                     email: snapshot?.identities.claudeEmail,
                     tier: snapshot?.identities.claudeTier,
+                    claudeIsTeam: snapshot?.identities.claudeIsTeam,
                     info: snapshot?.output?.claude,
                     now: now
                 )
@@ -938,6 +954,7 @@ private struct UsageDashboardPanel: View {
                     provider: .codex,
                     email: snapshot?.identities.codexEmail,
                     tier: nil,
+                    claudeIsTeam: nil,
                     info: snapshot?.output?.codex,
                     now: now
                 )
@@ -946,6 +963,7 @@ private struct UsageDashboardPanel: View {
                     provider: .gemini,
                     email: snapshot?.identities.geminiEmail,
                     tier: nil,
+                    claudeIsTeam: nil,
                     info: snapshot?.output?.gemini,
                     now: now
                 )
@@ -1043,6 +1061,7 @@ private struct UsageProviderColumn: View {
     let provider: UsageProvider
     let email: String?
     let tier: String?
+    let claudeIsTeam: Bool?
     let info: CLIUsageInfo?
     let now: Date
 
@@ -1071,6 +1090,18 @@ private struct UsageProviderColumn: View {
                 TierBadge(provider: provider, tier: tier)
             }
 
+            if showsClaudeTeamBadge {
+                Text("(Team)")
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundColor(Color.white.opacity(0.7))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule(style: .continuous)
+                            .fill(Color.white.opacity(0.08))
+                    )
+            }
+
             if let badge = statusBadge {
                 Text(badge.label)
                     .font(.system(size: 9, weight: .semibold, design: .monospaced))
@@ -1083,6 +1114,10 @@ private struct UsageProviderColumn: View {
                     )
             }
         }
+    }
+
+    private var showsClaudeTeamBadge: Bool {
+        provider == .claude && claudeIsTeam == true
     }
 
     private var normalizedEmail: String? {

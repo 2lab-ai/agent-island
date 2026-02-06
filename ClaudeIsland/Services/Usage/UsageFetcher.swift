@@ -3,12 +3,14 @@ import Foundation
 struct UsageIdentities: Sendable {
     let claudeEmail: String?
     let claudeTier: String?
+    let claudeIsTeam: Bool?
     let codexEmail: String?
     let geminiEmail: String?
 
     static let empty = UsageIdentities(
         claudeEmail: nil,
         claudeTier: nil,
+        claudeIsTeam: nil,
         codexEmail: nil,
         geminiEmail: nil
     )
@@ -485,6 +487,7 @@ private extension UsageFetcher {
         return UsageIdentities(
             claudeEmail: claudeProfile.email,
             claudeTier: claudeProfile.tier,
+            claudeIsTeam: claudeProfile.isTeam,
             codexEmail: codexEmail,
             geminiEmail: geminiEmail
         )
@@ -493,17 +496,19 @@ private extension UsageFetcher {
     struct ClaudeProfile: Sendable {
         let email: String?
         let tier: String?
+        let isTeam: Bool?
     }
 
     func resolveClaudeProfile(credentials: Data?) async -> ClaudeProfile {
         guard let token = extractClaudeAccessToken(credentials: credentials) else {
-            return ClaudeProfile(email: nil, tier: nil)
+            return ClaudeProfile(email: nil, tier: nil, isTeam: nil)
         }
 
         let profile = await fetchClaudeProfile(accessToken: token)
         return ClaudeProfile(
             email: profile.email,
-            tier: profile.tier
+            tier: profile.tier,
+            isTeam: profile.isTeam
         )
     }
 
@@ -699,7 +704,7 @@ private extension UsageFetcher {
 
     func fetchClaudeProfile(accessToken: String) async -> ClaudeProfile {
         guard let url = URL(string: "https://api.anthropic.com/api/oauth/profile") else {
-            return ClaudeProfile(email: nil, tier: nil)
+            return ClaudeProfile(email: nil, tier: nil, isTeam: nil)
         }
 
         var request = URLRequest(url: url)
@@ -714,24 +719,37 @@ private extension UsageFetcher {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                return ClaudeProfile(email: nil, tier: nil)
+                return ClaudeProfile(email: nil, tier: nil, isTeam: nil)
             }
 
             guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                return ClaudeProfile(email: nil, tier: nil)
+                return ClaudeProfile(email: nil, tier: nil, isTeam: nil)
             }
 
-            let email: String?
-            if let rawEmail = root["email"] as? String, rawEmail.contains("@") {
-                email = rawEmail
-            } else {
-                email = findFirstEmailString(in: root)
-            }
+            let email: String? = {
+                if let account = root["account"] as? [String: Any] {
+                    if let raw = account["email"] as? String, let extracted = extractEmailAddress(from: raw) {
+                        return extracted
+                    }
+                }
+
+                if let raw = root["email"] as? String, let extracted = extractEmailAddress(from: raw) {
+                    return extracted
+                }
+
+                return findFirstEmailString(in: root)
+            }()
+
+            let isTeam: Bool? = {
+                guard let org = root["organization"] as? [String: Any] else { return nil }
+                guard let orgType = org["organization_type"] as? String else { return nil }
+                return orgType.lowercased().contains("team")
+            }()
 
             let tier = extractClaudeTier(in: root)
-            return ClaudeProfile(email: email, tier: tier)
+            return ClaudeProfile(email: email, tier: tier, isTeam: isTeam)
         } catch {
-            return ClaudeProfile(email: nil, tier: nil)
+            return ClaudeProfile(email: nil, tier: nil, isTeam: nil)
         }
     }
 
@@ -841,14 +859,24 @@ private extension UsageFetcher {
         guard let payloadData = decodeBase64URL(payloadBase64URL) else { return nil }
         guard let root = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any] else { return nil }
 
-        if let email = root["email"] as? String, email.contains("@") { return email }
-        if let email = root["preferred_username"] as? String, email.contains("@") { return email }
+        if let email = root["email"] as? String, let extracted = extractEmailAddress(from: email) { return extracted }
+        if let email = root["preferred_username"] as? String, let extracted = extractEmailAddress(from: email) { return extracted }
         return findFirstEmailString(in: root)
+    }
+
+    func extractEmailAddress(from string: String) -> String? {
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let nsRange = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+        guard let match = Self.emailRegex.firstMatch(in: trimmed, options: [], range: nsRange) else { return nil }
+        guard let range = Range(match.range, in: trimmed) else { return nil }
+        return String(trimmed[range])
     }
 
     func findFirstEmailString(in object: Any) -> String? {
         if let value = object as? String, value.contains("@"), value.count < 200 {
-            return value
+            return extractEmailAddress(from: value)
         }
 
         if let dict = object as? [String: Any] {
@@ -865,6 +893,13 @@ private extension UsageFetcher {
 
         return nil
     }
+
+    private static let emailRegex: NSRegularExpression = {
+        // Pragmatic: good-enough email substring matcher for provider identity extraction.
+        let pattern = "[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}"
+        // Force unwrap: pattern is static and validated in development.
+        return try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+    }()
 
     func decodeBase64URL(_ string: String) -> Data? {
         var base64 = string.replacingOccurrences(of: "-", with: "+")
