@@ -1,4 +1,5 @@
 import Combine
+import Darwin
 import Foundation
 import SwiftUI
 
@@ -40,6 +41,7 @@ final class UsageDashboardViewModel: ObservableObject {
     private let fetcher: UsageFetcher
     private let switcher: ProfileSwitcher
     private let exporter: CredentialExporter
+    private let claudeCodeTokenStore = ClaudeCodeTokenStore()
 
     private var refreshTask: Task<Void, Never>?
     private var autoRefreshCancellable: AnyCancellable?
@@ -267,13 +269,132 @@ final class UsageDashboardViewModel: ObservableObject {
 
             let switchedSummary = flags.isEmpty ? "No files copied." : "Switched: \(flags.joined(separator: ", "))."
             let warningsSummary = result.warnings.isEmpty ? nil : "Warnings: \(result.warnings.joined(separator: " · "))"
-            lastActionMessage = [switchedSummary, warningsSummary].compactMap { $0 }.joined(separator: " ")
-
-            updateCurrentAccountIds(credentials: exporter.loadCurrentCredentials())
+            let credentials = exporter.loadCurrentCredentials()
+            updateCurrentAccountIds(credentials: credentials)
             updateLiveProfileName()
+
+            let claudeCodeEnvMessage = await applyClaudeCodeTokenForAccount(accountId: currentAccountIds.claude)
+            lastActionMessage = [switchedSummary, warningsSummary, claudeCodeEnvMessage]
+                .compactMap { $0 }
+                .joined(separator: " ")
+
             refreshAll()
         } catch {
             lastActionMessage = error.localizedDescription
+        }
+    }
+
+    func saveClaudeCodeToken(accountId: String, token: String) async {
+        do {
+            try await claudeCodeTokenStore.saveToken(accountId: accountId, token: token)
+            var message = "Saved Claude Code token for \(accountId)."
+
+            if currentAccountIds.claude == accountId,
+               let envMessage = await applyClaudeCodeTokenForAccount(accountId: accountId) {
+                message += " \(envMessage)"
+            }
+
+            lastActionMessage = message
+        } catch {
+            lastActionMessage = error.localizedDescription
+        }
+    }
+
+    func clearClaudeCodeToken(accountId: String) async {
+        do {
+            try await claudeCodeTokenStore.deleteToken(accountId: accountId)
+            var message = "Cleared Claude Code token for \(accountId)."
+
+            if currentAccountIds.claude == accountId,
+               let envMessage = await applyClaudeCodeTokenForAccount(accountId: accountId) {
+                message += " \(envMessage)"
+            }
+
+            lastActionMessage = message
+        } catch {
+            lastActionMessage = error.localizedDescription
+        }
+    }
+
+    // MARK: - Claude Code Token Integration
+
+    private func applyClaudeCodeTokenForAccount(accountId: String?) async -> String? {
+        let envVarName = "CLAUDE_CODE_OAUTH_TOKEN"
+
+        var messages: [String] = []
+        let token: String?
+        if let accountId {
+            do {
+                token = try await claudeCodeTokenStore.loadToken(accountId: accountId)
+            } catch {
+                messages.append(error.localizedDescription)
+                token = nil
+            }
+        } else {
+            token = nil
+        }
+
+        // Always update the current app process too; child processes inherit this.
+        if let token {
+            if setenv(envVarName, token, 1) != 0 {
+                messages.append("setenv failed: \(String(cString: strerror(errno)))")
+            }
+        } else {
+            if unsetenv(envVarName) != 0 {
+                messages.append("unsetenv failed: \(String(cString: strerror(errno)))")
+            }
+        }
+
+        let launchctlArgs: [String]
+        if let token {
+            launchctlArgs = ["setenv", envVarName, token]
+        } else {
+            launchctlArgs = ["unsetenv", envVarName]
+        }
+
+        if let message = await runLaunchctl(arguments: launchctlArgs) {
+            messages.append("launchctl \(message)")
+        }
+
+        guard !messages.isEmpty else { return nil }
+        return "Claude Code env update: \(messages.joined(separator: " · "))"
+    }
+
+    private func runLaunchctl(arguments: [String]) async -> String? {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let process = Process()
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+
+                process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                process.arguments = arguments
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+
+                    guard process.terminationStatus == 0 else {
+                        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                        let stderr = String(data: stderrData, encoding: .utf8)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .nonEmptyOrNil
+
+                        if let stderr {
+                            continuation.resume(returning: "exit \(process.terminationStatus): \(stderr)")
+                        } else {
+                            continuation.resume(returning: "exit \(process.terminationStatus)")
+                        }
+                        return
+                    }
+
+                    continuation.resume(returning: nil)
+                } catch {
+                    continuation.resume(returning: error.localizedDescription)
+                }
+            }
         }
     }
 }
@@ -295,6 +416,8 @@ struct UsageDashboardView: View {
     @State private var selectedTab: UsageTab = .dashboard
     @State private var now = Date()
     @State private var previousLiveProfileName: String?
+    @State private var claudeCodeTokenEditor: ClaudeCodeTokenEditorState?
+    @State private var claudeCodeTokenDraft = ""
 
     private let clock = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -374,6 +497,32 @@ struct UsageDashboardView: View {
                             newProfileName = ""
                             isSaveSheetPresented = false
                         }
+                    }
+                }
+            )
+        }
+        .sheet(item: $claudeCodeTokenEditor) { state in
+            ClaudeCodeTokenSheet(
+                accountId: state.accountId,
+                email: state.email,
+                token: $claudeCodeTokenDraft,
+                onCancel: {
+                    claudeCodeTokenDraft = ""
+                    claudeCodeTokenEditor = nil
+                },
+                onClear: {
+                    Task {
+                        await model.clearClaudeCodeToken(accountId: state.accountId)
+                        claudeCodeTokenDraft = ""
+                        claudeCodeTokenEditor = nil
+                    }
+                },
+                onSave: {
+                    let token = claudeCodeTokenDraft
+                    Task {
+                        await model.saveClaudeCodeToken(accountId: state.accountId, token: token)
+                        claudeCodeTokenDraft = ""
+                        claudeCodeTokenEditor = nil
                     }
                 }
             )
@@ -462,6 +611,8 @@ struct UsageDashboardView: View {
                         now: now,
                         showSwitch: false,
                         isSwitching: false,
+                        onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
+                        onClearClaudeCodeToken: clearClaudeCodeToken,
                         onSwitch: {}
                     )
                         .padding(.horizontal, 6)
@@ -615,6 +766,8 @@ struct UsageDashboardView: View {
                     now: now,
                     showSwitch: false,
                     isSwitching: false,
+                    onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
+                    onClearClaudeCodeToken: clearClaudeCodeToken,
                     onSwitch: {}
                 )
             case .profile(let name):
@@ -632,6 +785,8 @@ struct UsageDashboardView: View {
                         now: now,
                         showSwitch: true,
                         isSwitching: model.switchingProfileName == profile.name,
+                        onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
+                        onClearClaudeCodeToken: clearClaudeCodeToken,
                         onSwitch: { pendingSwitchProfile = profile }
                     )
                 } else {
@@ -643,6 +798,8 @@ struct UsageDashboardView: View {
                         now: now,
                         showSwitch: false,
                         isSwitching: false,
+                        onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
+                        onClearClaudeCodeToken: clearClaudeCodeToken,
                         onSwitch: {}
                     )
                 }
@@ -658,7 +815,12 @@ struct UsageDashboardView: View {
         return ScrollView(.vertical, showsIndicators: false) {
             LazyVGrid(columns: dashboardColumns, spacing: 10) {
                 ForEach(normalTiles) { tile in
-                    UsageAccountTileCard(tile: tile, now: now)
+                    UsageAccountTileCard(
+                        tile: tile,
+                        now: now,
+                        onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
+                        onClearClaudeCodeToken: clearClaudeCodeToken
+                    )
                 }
 
                 if !normalTiles.isEmpty, !expiredTiles.isEmpty {
@@ -670,7 +832,12 @@ struct UsageDashboardView: View {
                 }
 
                 ForEach(expiredTiles) { tile in
-                    UsageAccountTileCard(tile: tile, now: now)
+                    UsageAccountTileCard(
+                        tile: tile,
+                        now: now,
+                        onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
+                        onClearClaudeCodeToken: clearClaudeCodeToken
+                    )
                 }
             }
             .padding(.bottom, 4)
@@ -944,6 +1111,30 @@ struct UsageDashboardView: View {
             return TerminalColors.dim
         }
     }
+
+    private struct ClaudeCodeTokenEditorState: Identifiable {
+        let id = UUID()
+        let accountId: String
+        let email: String?
+    }
+
+    private func presentClaudeCodeTokenEditor(accountId: String) {
+        claudeCodeTokenDraft = ""
+        claudeCodeTokenEditor = ClaudeCodeTokenEditorState(
+            accountId: accountId,
+            email: claudeEmail(for: accountId)
+        )
+    }
+
+    private func clearClaudeCodeToken(accountId: String) {
+        Task { await model.clearClaudeCodeToken(accountId: accountId) }
+    }
+
+    private func claudeEmail(for accountId: String) -> String? {
+        dashboardTiles
+            .first(where: { $0.provider == .claude && $0.accountId == accountId })?
+            .email
+    }
 }
 
 enum UsageProvider: Hashable {
@@ -990,6 +1181,8 @@ private struct UsageAccountTile: Identifiable {
 private struct UsageAccountTileCard: View {
     let tile: UsageAccountTile
     let now: Date
+    let onEditClaudeCodeToken: ((String) -> Void)?
+    let onClearClaudeCodeToken: ((String) -> Void)?
 
     @State private var isHovered = false
 
@@ -1003,7 +1196,9 @@ private struct UsageAccountTileCard: View {
                 claudeIsTeam: tile.claudeIsTeam,
                 tokenRefresh: tile.tokenRefresh,
                 info: tile.info,
-                now: now
+                now: now,
+                onEditClaudeCodeToken: onEditClaudeCodeToken,
+                onClearClaudeCodeToken: onClearClaudeCodeToken
             )
 
             Text((tile.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil) ?? " ")
@@ -1031,6 +1226,8 @@ private struct UsageDashboardPanel: View {
     let now: Date
     let showSwitch: Bool
     let isSwitching: Bool
+    let onEditClaudeCodeToken: ((String) -> Void)?
+    let onClearClaudeCodeToken: ((String) -> Void)?
     let onSwitch: () -> Void
 
     @State private var isHovered = false
@@ -1057,7 +1254,9 @@ private struct UsageDashboardPanel: View {
                     claudeIsTeam: snapshot?.identities.claudeIsTeam,
                     tokenRefresh: snapshot?.tokenRefresh.claude,
                     info: snapshot?.output?.claude,
-                    now: now
+                    now: now,
+                    onEditClaudeCodeToken: onEditClaudeCodeToken,
+                    onClearClaudeCodeToken: onClearClaudeCodeToken
                 )
                 columnDivider
                 UsageProviderColumn(
@@ -1068,7 +1267,9 @@ private struct UsageDashboardPanel: View {
                     claudeIsTeam: nil,
                     tokenRefresh: snapshot?.tokenRefresh.codex,
                     info: snapshot?.output?.codex,
-                    now: now
+                    now: now,
+                    onEditClaudeCodeToken: nil,
+                    onClearClaudeCodeToken: nil
                 )
                 columnDivider
                 UsageProviderColumn(
@@ -1079,7 +1280,9 @@ private struct UsageDashboardPanel: View {
                     claudeIsTeam: nil,
                     tokenRefresh: snapshot?.tokenRefresh.gemini,
                     info: snapshot?.output?.gemini,
-                    now: now
+                    now: now,
+                    onEditClaudeCodeToken: nil,
+                    onClearClaudeCodeToken: nil
                 )
             }
 
@@ -1180,6 +1383,8 @@ private struct UsageProviderColumn: View {
     let tokenRefresh: TokenRefreshInfo?
     let info: CLIUsageInfo?
     let now: Date
+    let onEditClaudeCodeToken: ((String) -> Void)?
+    let onClearClaudeCodeToken: ((String) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1194,6 +1399,21 @@ private struct UsageProviderColumn: View {
             UsageTokenRefreshRow(tokenRefresh: tokenRefresh, now: now)
 
             usageRows
+        }
+        .contextMenu {
+            if provider == .claude, let accountId = normalizedAccountId {
+                if let onEditClaudeCodeToken {
+                    Button("Set Claude Code Token…") {
+                        onEditClaudeCodeToken(accountId)
+                    }
+                }
+
+                if let onClearClaudeCodeToken {
+                    Button("Clear Claude Code Token") {
+                        onClearClaudeCodeToken(accountId)
+                    }
+                }
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -1687,6 +1907,63 @@ private struct MiniSegmentBar: View {
                 }
             }
         }
+    }
+}
+
+private struct ClaudeCodeTokenSheet: View {
+    let accountId: String
+    let email: String?
+    @Binding var token: String
+    let onCancel: () -> Void
+    let onClear: () -> Void
+    let onSave: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                UsageProviderIcon(provider: .claude, size: 16)
+                Text("Claude Code Token")
+                    .font(.system(size: 16, weight: .semibold))
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(emailLine)
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                Text(accountId)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.secondary.opacity(0.85))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Text("Paste `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`. Stored locally and applied on profile switch. Not used for usage fetching.")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+
+            SecureField("CLAUDE_CODE_OAUTH_TOKEN", text: $token)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+
+            HStack(spacing: 10) {
+                Button("Cancel") { onCancel() }
+                Spacer()
+                Button("Clear", role: .destructive) { onClear() }
+                Button("Save") { onSave() }
+                    .disabled(token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 520)
+    }
+
+    private var emailLine: String {
+        email?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil ?? "--"
     }
 }
 
