@@ -1738,15 +1738,15 @@ private struct UsageProviderColumn: View {
 
     private var statusBadge: (label: String, background: Color, foreground: Color)? {
         if let info, !info.available {
-            return (label: "MISSING", background: Color.white.opacity(0.08), foreground: Color.white.opacity(0.45))
+            return (label: "MISS", background: Color.white.opacity(0.08), foreground: Color.white.opacity(0.45))
         }
 
         if isTokenExpired {
-            return (label: "EXPIRED", background: TerminalColors.amber.opacity(0.9), foreground: Color.black.opacity(0.85))
+            return (label: "EXP", background: TerminalColors.amber.opacity(0.9), foreground: Color.black.opacity(0.85))
         }
 
         if info?.error == true {
-            return (label: "ERROR", background: TerminalColors.red.opacity(0.9), foreground: Color.white.opacity(0.9))
+            return (label: "ERR", background: TerminalColors.red.opacity(0.9), foreground: Color.white.opacity(0.9))
         }
         return nil
     }
@@ -1932,6 +1932,10 @@ private struct UsageTokenRefreshRow: View {
     private var timeRemainingText: Text {
         let baseColor = Color.white.opacity(0.28)
         guard let tokenRefresh else { return Text("--").foregroundColor(baseColor) }
+        if tokenRefresh.expiresAt <= now {
+            return Text("Expired!")
+                .foregroundColor(TerminalColors.amber.opacity(0.9))
+        }
         let seconds = max(0, Int(tokenRefresh.expiresAt.timeIntervalSince(now)))
         return UsageDurationText.make(seconds: seconds, digitColor: baseColor)
     }
