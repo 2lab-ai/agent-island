@@ -1150,7 +1150,7 @@ private struct UsageProviderColumn: View {
 
             Spacer(minLength: 6)
 
-            if let tier = resolvedTier {
+            if let tier = tierBadgeTier {
                 TierBadge(provider: provider, tier: tier)
             }
 
@@ -1178,6 +1178,36 @@ private struct UsageProviderColumn: View {
                     )
             }
         }
+    }
+
+    private var tierBadgeTier: String? {
+        guard let tier = resolvedTier else { return nil }
+
+        // Only show Claude tier when we can confidently classify it.
+        if provider == .claude, normalizedClaudeTierLabel(from: tier) == nil {
+            return nil
+        }
+
+        return tier
+    }
+
+    private func normalizedClaudeTierLabel(from tier: String) -> String? {
+        let raw = tier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+
+        let lowered = raw.lowercased()
+        let tokens = lowered.split { !($0.isLetter || $0.isNumber) }
+        let hasToken: (String) -> Bool = { token in tokens.contains { $0 == token } }
+        let normalized = lowered
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+
+        if normalized.contains("max20") || (hasToken("max") && (hasToken("20x") || hasToken("20"))) { return "Max20" }
+        if normalized.contains("max5") || (hasToken("max") && (hasToken("5x") || hasToken("5"))) { return "Max5" }
+        if hasToken("pro") { return "Pro" }
+
+        return nil
     }
 
     private var showsClaudeTeamBadge: Bool {
