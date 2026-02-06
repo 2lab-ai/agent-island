@@ -45,6 +45,8 @@ final class UsageDashboardViewModel: ObservableObject {
     private var autoRefreshCancellable: AnyCancellable?
     private let autoRefreshIntervalSeconds: TimeInterval = 10 * 60
     private var backgroundRefreshStarted = false
+    private var lastKnownEmailByAccountId: [String: String] = [:]
+    private var lastKnownTierByAccountId: [String: String] = [:]
 
     init(accountStore: AccountStore = AccountStore()) {
         self.accountStore = accountStore
@@ -122,16 +124,31 @@ final class UsageDashboardViewModel: ObservableObject {
             defer { self.isRefreshing = false }
 
             let credentials = exporter.loadCurrentCredentials()
-            currentAccountIds = computeAccountIds(credentials: credentials)
+            updateCurrentAccountIds(credentials: credentials)
             updateLiveProfileName()
-            currentSnapshot = await fetcher.fetchCurrentSnapshot(credentials: credentials)
+            let fetchedCurrent = await fetcher.fetchCurrentSnapshot(credentials: credentials)
+            let mergedCurrent = snapshotWithRememberedIdentities(fetchedCurrent, accountIds: currentAccountIds)
+            rememberIdentities(from: mergedCurrent, accountIds: currentAccountIds)
+            currentSnapshot = mergedCurrent
 
             for profile in profilesToRefresh {
                 if Task.isCancelled { break }
-                let snapshot = await fetcher.fetchSnapshot(for: profile)
-                snapshotsByProfileName[profile.name] = snapshot
+                let fetchedSnapshot = await fetcher.fetchSnapshot(for: profile)
+                let accountIds = UsageAccountIdSet(
+                    claude: profile.claudeAccountId,
+                    codex: profile.codexAccountId,
+                    gemini: profile.geminiAccountId
+                )
+                let mergedSnapshot = snapshotWithRememberedIdentities(fetchedSnapshot, accountIds: accountIds)
+                rememberIdentities(from: mergedSnapshot, accountIds: accountIds)
+                snapshotsByProfileName[profile.name] = mergedSnapshot
             }
         }
+    }
+
+    private func updateCurrentAccountIds(credentials: ExportCredentials) {
+        let computed = computeAccountIds(credentials: credentials)
+        currentAccountIds = computed
     }
 
     private func computeAccountIds(credentials: ExportCredentials) -> UsageAccountIdSet {
@@ -140,6 +157,53 @@ final class UsageDashboardViewModel: ObservableObject {
             codex: credentials.codex.map { UsageCredentialHasher.fingerprint(service: .codex, data: $0).accountId },
             gemini: credentials.gemini.map { UsageCredentialHasher.fingerprint(service: .gemini, data: $0).accountId }
         )
+    }
+
+    private func snapshotWithRememberedIdentities(_ snapshot: UsageSnapshot, accountIds: UsageAccountIdSet) -> UsageSnapshot {
+        let rememberedClaudeEmail = accountIds.claude.flatMap { lastKnownEmailByAccountId[$0] }
+        let rememberedClaudeTier = accountIds.claude.flatMap { lastKnownTierByAccountId[$0] }
+        let rememberedCodexEmail = accountIds.codex.flatMap { lastKnownEmailByAccountId[$0] }
+        let rememberedGeminiEmail = accountIds.gemini.flatMap { lastKnownEmailByAccountId[$0] }
+
+        func normalize(_ value: String?) -> String? {
+            value?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil
+        }
+
+        let mergedIdentities = UsageIdentities(
+            claudeEmail: normalize(snapshot.identities.claudeEmail) ?? rememberedClaudeEmail,
+            claudeTier: normalize(snapshot.identities.claudeTier) ?? rememberedClaudeTier,
+            codexEmail: normalize(snapshot.identities.codexEmail) ?? rememberedCodexEmail,
+            geminiEmail: normalize(snapshot.identities.geminiEmail) ?? rememberedGeminiEmail
+        )
+
+        return UsageSnapshot(
+            profileName: snapshot.profileName,
+            output: snapshot.output,
+            identities: mergedIdentities,
+            tokenRefresh: snapshot.tokenRefresh,
+            fetchedAt: snapshot.fetchedAt,
+            isStale: snapshot.isStale,
+            errorMessage: snapshot.errorMessage
+        )
+    }
+
+    private func rememberIdentities(from snapshot: UsageSnapshot, accountIds: UsageAccountIdSet) {
+        func rememberEmail(accountId: String?, email: String?) {
+            guard let accountId else { return }
+            guard let email = email?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil else { return }
+            lastKnownEmailByAccountId[accountId] = email
+        }
+
+        func rememberTier(accountId: String?, tier: String?) {
+            guard let accountId else { return }
+            guard let tier = tier?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil else { return }
+            lastKnownTierByAccountId[accountId] = tier
+        }
+
+        rememberEmail(accountId: accountIds.claude, email: snapshot.identities.claudeEmail)
+        rememberTier(accountId: accountIds.claude, tier: snapshot.identities.claudeTier)
+        rememberEmail(accountId: accountIds.codex, email: snapshot.identities.codexEmail)
+        rememberEmail(accountId: accountIds.gemini, email: snapshot.identities.geminiEmail)
     }
 
     private func updateLiveProfileName() {
@@ -162,7 +226,7 @@ final class UsageDashboardViewModel: ObservableObject {
                 : "Saved “\(result.profile.name)” with warnings: \(result.warnings.joined(separator: " · "))"
 
             profiles = try profileStore.loadProfiles()
-            currentAccountIds = computeAccountIds(credentials: exporter.loadCurrentCredentials())
+            updateCurrentAccountIds(credentials: exporter.loadCurrentCredentials())
             updateLiveProfileName()
             refreshAll()
             return true
@@ -187,7 +251,7 @@ final class UsageDashboardViewModel: ObservableObject {
             let warningsSummary = result.warnings.isEmpty ? nil : "Warnings: \(result.warnings.joined(separator: " · "))"
             lastActionMessage = [switchedSummary, warningsSummary].compactMap { $0 }.joined(separator: " ")
 
-            currentAccountIds = computeAccountIds(credentials: exporter.loadCurrentCredentials())
+            updateCurrentAccountIds(credentials: exporter.loadCurrentCredentials())
             updateLiveProfileName()
             refreshAll()
         } catch {
