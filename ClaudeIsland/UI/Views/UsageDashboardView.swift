@@ -48,6 +48,7 @@ final class UsageDashboardViewModel: ObservableObject {
     private var lastKnownEmailByAccountId: [String: String] = [:]
     private var lastKnownTierByAccountId: [String: String] = [:]
     private var lastKnownClaudeIsTeamByAccountId: [String: Bool] = [:]
+    private var lastKnownCurrentAccountIds: UsageAccountIdSet = .empty
 
     init(accountStore: AccountStore = AccountStore()) {
         self.accountStore = accountStore
@@ -149,7 +150,14 @@ final class UsageDashboardViewModel: ObservableObject {
 
     private func updateCurrentAccountIds(credentials: ExportCredentials) {
         let computed = computeAccountIds(credentials: credentials)
-        currentAccountIds = computed
+        if computed.hasAny {
+            lastKnownCurrentAccountIds = computed
+            currentAccountIds = computed
+        } else if lastKnownCurrentAccountIds.hasAny {
+            currentAccountIds = lastKnownCurrentAccountIds
+        } else {
+            currentAccountIds = computed
+        }
     }
 
     private func computeAccountIds(credentials: ExportCredentials) -> UsageAccountIdSet {
@@ -450,6 +458,7 @@ struct UsageDashboardView: View {
                         title: model.currentSnapshot?.profileName ?? "Current",
                         badge: "UNSAVED",
                         snapshot: model.currentSnapshot,
+                        accountIds: model.currentAccountIds,
                         now: now,
                         showSwitch: false,
                         isSwitching: false,
@@ -602,6 +611,7 @@ struct UsageDashboardView: View {
                     title: model.currentSnapshot?.profileName ?? "Current",
                     badge: "UNSAVED",
                     snapshot: model.currentSnapshot,
+                    accountIds: model.currentAccountIds,
                     now: now,
                     showSwitch: false,
                     isSwitching: false,
@@ -609,10 +619,16 @@ struct UsageDashboardView: View {
                 )
             case .profile(let name):
                 if let profile = model.profiles.first(where: { $0.name == name }) {
+                    let accountIds = UsageAccountIdSet(
+                        claude: profile.claudeAccountId,
+                        codex: profile.codexAccountId,
+                        gemini: profile.geminiAccountId
+                    )
                     UsageDashboardPanel(
                         title: profile.name,
                         badge: profile.name == model.liveProfileName ? "LIVE" : nil,
                         snapshot: model.snapshotsByProfileName[profile.name],
+                        accountIds: accountIds,
                         now: now,
                         showSwitch: true,
                         isSwitching: model.switchingProfileName == profile.name,
@@ -623,6 +639,7 @@ struct UsageDashboardView: View {
                         title: model.currentSnapshot?.profileName ?? "Current",
                         badge: "UNSAVED",
                         snapshot: model.currentSnapshot,
+                        accountIds: model.currentAccountIds,
                         now: now,
                         showSwitch: false,
                         isSwitching: false,
@@ -635,15 +652,39 @@ struct UsageDashboardView: View {
     }
 
     private var accountsDashboardGrid: some View {
-        ScrollView(.vertical, showsIndicators: false) {
+        let normalTiles = dashboardTiles.filter { !isAuthExpiredError($0, now: now) }
+        let expiredTiles = dashboardTiles.filter { isAuthExpiredError($0, now: now) }
+
+        return ScrollView(.vertical, showsIndicators: false) {
             LazyVGrid(columns: dashboardColumns, spacing: 10) {
-                ForEach(dashboardTiles) { tile in
+                ForEach(normalTiles) { tile in
+                    UsageAccountTileCard(tile: tile, now: now)
+                }
+
+                if !normalTiles.isEmpty, !expiredTiles.isEmpty {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.08))
+                        .frame(height: 1)
+                        .gridCellColumns(3)
+                        .padding(.vertical, 2)
+                }
+
+                ForEach(expiredTiles) { tile in
                     UsageAccountTileCard(tile: tile, now: now)
                 }
             }
             .padding(.bottom, 4)
         }
         .scrollBounceBehavior(.basedOnSize)
+    }
+
+    private func isAuthExpiredError(_ tile: UsageAccountTile, now: Date) -> Bool {
+        guard let refresh = tile.tokenRefresh else { return false }
+        guard refresh.expiresAt <= now else { return false }
+
+        if tile.info?.error == true { return true }
+        if tile.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil != nil { return true }
+        return false
     }
 
     private var dashboardColumns: [GridItem] {
@@ -689,6 +730,7 @@ struct UsageDashboardView: View {
                     UsageAccountTile(
                         id: "claude:\(accountId)",
                         provider: .claude,
+                        accountId: accountId,
                         label: profile.name,
                         email: snapshot?.identities.claudeEmail,
                         tier: snapshot?.identities.claudeTier,
@@ -705,6 +747,7 @@ struct UsageDashboardView: View {
                     UsageAccountTile(
                         id: "codex:\(accountId)",
                         provider: .codex,
+                        accountId: accountId,
                         label: profile.name,
                         email: snapshot?.identities.codexEmail,
                         tier: nil,
@@ -721,6 +764,7 @@ struct UsageDashboardView: View {
                     UsageAccountTile(
                         id: "gemini:\(accountId)",
                         provider: .gemini,
+                        accountId: accountId,
                         label: profile.name,
                         email: snapshot?.identities.geminiEmail,
                         tier: nil,
@@ -742,6 +786,7 @@ struct UsageDashboardView: View {
                     UsageAccountTile(
                         id: "claude:\(accountId)",
                         provider: .claude,
+                        accountId: accountId,
                         label: "Current",
                         email: snapshot?.identities.claudeEmail,
                         tier: snapshot?.identities.claudeTier,
@@ -758,6 +803,7 @@ struct UsageDashboardView: View {
                     UsageAccountTile(
                         id: "codex:\(accountId)",
                         provider: .codex,
+                        accountId: accountId,
                         label: "Current",
                         email: snapshot?.identities.codexEmail,
                         tier: nil,
@@ -774,6 +820,7 @@ struct UsageDashboardView: View {
                     UsageAccountTile(
                         id: "gemini:\(accountId)",
                         provider: .gemini,
+                        accountId: accountId,
                         label: "Current",
                         email: snapshot?.identities.geminiEmail,
                         tier: nil,
@@ -930,6 +977,7 @@ enum UsageWindow: CaseIterable {
 private struct UsageAccountTile: Identifiable {
     let id: String
     let provider: UsageProvider
+    let accountId: String
     let label: String
     let email: String?
     let tier: String?
@@ -949,6 +997,7 @@ private struct UsageAccountTileCard: View {
         VStack(alignment: .leading, spacing: 8) {
             UsageProviderColumn(
                 provider: tile.provider,
+                accountId: tile.accountId,
                 email: tile.email,
                 tier: tile.tier,
                 claudeIsTeam: tile.claudeIsTeam,
@@ -978,6 +1027,7 @@ private struct UsageDashboardPanel: View {
     let title: String
     let badge: String?
     let snapshot: UsageSnapshot?
+    let accountIds: UsageAccountIdSet
     let now: Date
     let showSwitch: Bool
     let isSwitching: Bool
@@ -1001,6 +1051,7 @@ private struct UsageDashboardPanel: View {
             HStack(alignment: .top, spacing: 0) {
                 UsageProviderColumn(
                     provider: .claude,
+                    accountId: accountIds.claude,
                     email: snapshot?.identities.claudeEmail,
                     tier: snapshot?.identities.claudeTier,
                     claudeIsTeam: snapshot?.identities.claudeIsTeam,
@@ -1011,6 +1062,7 @@ private struct UsageDashboardPanel: View {
                 columnDivider
                 UsageProviderColumn(
                     provider: .codex,
+                    accountId: accountIds.codex,
                     email: snapshot?.identities.codexEmail,
                     tier: nil,
                     claudeIsTeam: nil,
@@ -1021,6 +1073,7 @@ private struct UsageDashboardPanel: View {
                 columnDivider
                 UsageProviderColumn(
                     provider: .gemini,
+                    accountId: accountIds.gemini,
                     email: snapshot?.identities.geminiEmail,
                     tier: nil,
                     claudeIsTeam: nil,
@@ -1120,6 +1173,7 @@ private struct UsageDashboardPanel: View {
 
 private struct UsageProviderColumn: View {
     let provider: UsageProvider
+    let accountId: String?
     let email: String?
     let tier: String?
     let claudeIsTeam: Bool?
@@ -1147,6 +1201,15 @@ private struct UsageProviderColumn: View {
     private var header: some View {
         HStack(spacing: 8) {
             UsageProviderIcon(provider: provider, size: 14)
+
+            if let accountId = normalizedAccountId {
+                Text(accountId)
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.22))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .minimumScaleFactor(0.7)
+            }
 
             Spacer(minLength: 6)
 
@@ -1212,6 +1275,10 @@ private struct UsageProviderColumn: View {
 
     private var showsClaudeTeamBadge: Bool {
         provider == .claude && claudeIsTeam == true
+    }
+
+    private var normalizedAccountId: String? {
+        accountId?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil
     }
 
     private var normalizedEmail: String? {
