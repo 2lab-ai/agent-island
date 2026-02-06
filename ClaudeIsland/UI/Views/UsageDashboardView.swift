@@ -813,31 +813,35 @@ struct UsageDashboardView: View {
         let expiredTiles = dashboardTiles.filter { isAuthExpiredError($0, now: now) }
 
         return ScrollView(.vertical, showsIndicators: false) {
-            LazyVGrid(columns: dashboardColumns, spacing: 10) {
-                ForEach(normalTiles) { tile in
-                    UsageAccountTileCard(
-                        tile: tile,
-                        now: now,
-                        onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
-                        onClearClaudeCodeToken: clearClaudeCodeToken
-                    )
+            VStack(spacing: 10) {
+                LazyVGrid(columns: dashboardColumns, spacing: 10) {
+                    ForEach(normalTiles) { tile in
+                        UsageAccountTileCard(
+                            tile: tile,
+                            now: now,
+                            onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
+                            onClearClaudeCodeToken: clearClaudeCodeToken
+                        )
+                    }
                 }
 
                 if !normalTiles.isEmpty, !expiredTiles.isEmpty {
                     Rectangle()
-                        .fill(Color.white.opacity(0.08))
+                        .fill(Color.white.opacity(0.12))
                         .frame(height: 1)
-                        .gridCellColumns(3)
                         .padding(.vertical, 2)
+                        .padding(.horizontal, 6)
                 }
 
-                ForEach(expiredTiles) { tile in
-                    UsageAccountTileCard(
-                        tile: tile,
-                        now: now,
-                        onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
-                        onClearClaudeCodeToken: clearClaudeCodeToken
-                    )
+                LazyVGrid(columns: dashboardColumns, spacing: 10) {
+                    ForEach(expiredTiles) { tile in
+                        UsageAccountTileCard(
+                            tile: tile,
+                            now: now,
+                            onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
+                            onClearClaudeCodeToken: clearClaudeCodeToken
+                        )
+                    }
                 }
             }
             .padding(.bottom, 4)
