@@ -1493,7 +1493,7 @@ private struct UsageProviderColumn: View {
             }
 
             if showsClaudeTeamBadge {
-                Text("(Team)")
+                Text("TEAM")
                     .font(.system(size: 9, weight: .semibold, design: .monospaced))
                     .foregroundColor(Color.white.opacity(0.7))
                     .padding(.horizontal, 8)
