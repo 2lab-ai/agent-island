@@ -51,6 +51,8 @@ final class UsageDashboardViewModel: ObservableObject {
     private var lastKnownTierByAccountId: [String: String] = [:]
     private var lastKnownClaudeIsTeamByAccountId: [String: Bool] = [:]
     private var lastKnownCurrentAccountIds: UsageAccountIdSet = .empty
+    private let identityStore = UsageIdentityStore()
+    private var loadedPersistedIdentities = false
 
     init(accountStore: AccountStore = AccountStore()) {
         self.accountStore = accountStore
@@ -61,11 +63,39 @@ final class UsageDashboardViewModel: ObservableObject {
         self.switcher = ProfileSwitcher(accountStore: accountStore, exporter: exporter)
     }
 
+    private func loadPersistedIdentitiesIfNeeded() async {
+        guard !loadedPersistedIdentities else { return }
+        loadedPersistedIdentities = true
+
+        do {
+            let snapshot = try await identityStore.snapshot()
+
+            for (accountId, identity) in snapshot {
+                if let email = identity.email?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil {
+                    lastKnownEmailByAccountId[accountId] = email
+                }
+                if let tier = identity.tier?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil {
+                    lastKnownTierByAccountId[accountId] = tier
+                }
+                if let isTeam = identity.claudeIsTeam {
+                    lastKnownClaudeIsTeamByAccountId[accountId] = isTeam
+                }
+            }
+        } catch {
+            // Best-effort: identity cache should never block the dashboard.
+            lastActionMessage = error.localizedDescription
+        }
+    }
+
     func startBackgroundRefreshIfNeeded() {
         guard !backgroundRefreshStarted else { return }
         backgroundRefreshStarted = true
-        load()
-        startAutoRefresh()
+        Task { [weak self] in
+            guard let self else { return }
+            await self.loadPersistedIdentitiesIfNeeded()
+            self.load()
+            self.startAutoRefresh()
+        }
     }
 
     func load() {
@@ -201,29 +231,58 @@ final class UsageDashboardViewModel: ObservableObject {
     }
 
     private func rememberIdentities(from snapshot: UsageSnapshot, accountIds: UsageAccountIdSet) {
-        func rememberEmail(accountId: String?, email: String?) {
-            guard let accountId else { return }
-            guard let email = email?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil else { return }
-            lastKnownEmailByAccountId[accountId] = email
+        func normalize(_ value: String?) -> String? {
+            value?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil
         }
 
-        func rememberTier(accountId: String?, tier: String?) {
-            guard let accountId else { return }
-            guard let tier = tier?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil else { return }
-            lastKnownTierByAccountId[accountId] = tier
+        var updates: [(accountId: String, email: String?, tier: String?, claudeIsTeam: Bool?)] = []
+
+        if let accountId = accountIds.claude {
+            let email = normalize(snapshot.identities.claudeEmail)
+            let tier = normalize(snapshot.identities.claudeTier)
+            let isTeam = snapshot.identities.claudeIsTeam
+
+            if let email { lastKnownEmailByAccountId[accountId] = email }
+            if let tier { lastKnownTierByAccountId[accountId] = tier }
+            if let isTeam { lastKnownClaudeIsTeamByAccountId[accountId] = isTeam }
+
+            if email != nil || tier != nil || isTeam != nil {
+                updates.append((accountId: accountId, email: email, tier: tier, claudeIsTeam: isTeam))
+            }
         }
 
-        func rememberClaudeIsTeam(accountId: String?, isTeam: Bool?) {
-            guard let accountId else { return }
-            guard let isTeam else { return }
-            lastKnownClaudeIsTeamByAccountId[accountId] = isTeam
+        if let accountId = accountIds.codex {
+            let email = normalize(snapshot.identities.codexEmail)
+            if let email {
+                lastKnownEmailByAccountId[accountId] = email
+                updates.append((accountId: accountId, email: email, tier: nil, claudeIsTeam: nil))
+            }
         }
 
-        rememberEmail(accountId: accountIds.claude, email: snapshot.identities.claudeEmail)
-        rememberTier(accountId: accountIds.claude, tier: snapshot.identities.claudeTier)
-        rememberClaudeIsTeam(accountId: accountIds.claude, isTeam: snapshot.identities.claudeIsTeam)
-        rememberEmail(accountId: accountIds.codex, email: snapshot.identities.codexEmail)
-        rememberEmail(accountId: accountIds.gemini, email: snapshot.identities.geminiEmail)
+        if let accountId = accountIds.gemini {
+            let email = normalize(snapshot.identities.geminiEmail)
+            if let email {
+                lastKnownEmailByAccountId[accountId] = email
+                updates.append((accountId: accountId, email: email, tier: nil, claudeIsTeam: nil))
+            }
+        }
+
+        guard !updates.isEmpty else { return }
+
+        Task { [updates, identityStore] in
+            for update in updates {
+                do {
+                    try await identityStore.update(
+                        accountId: update.accountId,
+                        email: update.email,
+                        tier: update.tier,
+                        claudeIsTeam: update.claudeIsTeam
+                    )
+                } catch {
+                    // Best-effort: identity persistence should never block the dashboard.
+                }
+            }
+        }
     }
 
     private func updateLiveProfileName() {
@@ -1516,14 +1575,23 @@ private struct UsageProviderColumn: View {
     }
 
     private var statusBadge: (label: String, background: Color, foreground: Color)? {
-        guard let info else { return nil }
-        if !info.available {
+        if let info, !info.available {
             return (label: "MISSING", background: Color.white.opacity(0.08), foreground: Color.white.opacity(0.45))
         }
-        if info.error {
-            return (label: "ERR", background: TerminalColors.amber.opacity(0.9), foreground: Color.black.opacity(0.85))
+
+        if isTokenExpired {
+            return (label: "EXPIRED", background: TerminalColors.amber.opacity(0.9), foreground: Color.black.opacity(0.85))
+        }
+
+        if info?.error == true {
+            return (label: "ERROR", background: TerminalColors.red.opacity(0.9), foreground: Color.white.opacity(0.9))
         }
         return nil
+    }
+
+    private var isTokenExpired: Bool {
+        guard let tokenRefresh else { return false }
+        return tokenRefresh.expiresAt <= now
     }
 
     private var resolvedTier: String? {
