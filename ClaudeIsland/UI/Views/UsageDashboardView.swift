@@ -873,16 +873,13 @@ struct UsageDashboardView: View {
 
         return ScrollView(.vertical, showsIndicators: false) {
             VStack(spacing: 10) {
-                LazyVGrid(columns: dashboardColumns, spacing: 10) {
-                    ForEach(normalTiles) { tile in
-                        UsageAccountTileCard(
-                            tile: tile,
-                            now: now,
-                            onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
-                            onClearClaudeCodeToken: clearClaudeCodeToken
-                        )
-                    }
-                }
+                UsageAccountTileGrid(
+                    tiles: normalTiles,
+                    columns: dashboardColumns,
+                    now: now,
+                    onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
+                    onClearClaudeCodeToken: clearClaudeCodeToken
+                )
 
                 if !normalTiles.isEmpty, !expiredTiles.isEmpty {
                     Rectangle()
@@ -892,16 +889,13 @@ struct UsageDashboardView: View {
                         .padding(.horizontal, 6)
                 }
 
-                LazyVGrid(columns: dashboardColumns, spacing: 10) {
-                    ForEach(expiredTiles) { tile in
-                        UsageAccountTileCard(
-                            tile: tile,
-                            now: now,
-                            onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
-                            onClearClaudeCodeToken: clearClaudeCodeToken
-                        )
-                    }
-                }
+                UsageAccountTileGrid(
+                    tiles: expiredTiles,
+                    columns: dashboardColumns,
+                    now: now,
+                    onEditClaudeCodeToken: presentClaudeCodeTokenEditor,
+                    onClearClaudeCodeToken: clearClaudeCodeToken
+                )
             }
             .padding(.bottom, 4)
         }
@@ -1241,15 +1235,102 @@ private struct UsageAccountTile: Identifiable {
     let errorMessage: String?
 }
 
+private struct UsageAccountTileRowHeightsPreferenceKey: PreferenceKey {
+    static var defaultValue: [Int: CGFloat] = [:]
+
+    static func reduce(value: inout [Int: CGFloat], nextValue: () -> [Int: CGFloat]) {
+        for (rowIndex, rowHeight) in nextValue() {
+            value[rowIndex] = max(value[rowIndex] ?? 0, rowHeight)
+        }
+    }
+}
+
+private struct UsageAccountTileGrid: View {
+    let tiles: [UsageAccountTile]
+    let columns: [GridItem]
+    let now: Date
+    let onEditClaudeCodeToken: ((String) -> Void)?
+    let onClearClaudeCodeToken: ((String) -> Void)?
+
+    @State private var rowHeights: [Int: CGFloat] = [:]
+
+    private struct IndexedTile: Identifiable {
+        let index: Int
+        let tile: UsageAccountTile
+
+        var id: String { tile.id }
+    }
+
+    var body: some View {
+        let indexedTiles = tiles.enumerated().map { IndexedTile(index: $0.offset, tile: $0.element) }
+        LazyVGrid(columns: columns, spacing: 10) {
+            ForEach(indexedTiles, id: \.id) { indexed in
+                let rowIndex = rowIndex(for: indexed.index)
+                UsageAccountTileCard(
+                    tile: indexed.tile,
+                    now: now,
+                    forcedHeight: rowHeights[rowIndex],
+                    rowIndex: rowIndex,
+                    onEditClaudeCodeToken: onEditClaudeCodeToken,
+                    onClearClaudeCodeToken: onClearClaudeCodeToken
+                )
+            }
+        }
+        .onPreferenceChange(UsageAccountTileRowHeightsPreferenceKey.self) { newHeights in
+            if rowHeights != newHeights {
+                rowHeights = newHeights
+            }
+        }
+    }
+
+    private func rowIndex(for tileIndex: Int) -> Int {
+        guard !columns.isEmpty else { return 0 }
+        return tileIndex / columns.count
+    }
+}
+
 private struct UsageAccountTileCard: View {
     let tile: UsageAccountTile
     let now: Date
+    let forcedHeight: CGFloat?
+    let rowIndex: Int?
     let onEditClaudeCodeToken: ((String) -> Void)?
     let onClearClaudeCodeToken: ((String) -> Void)?
 
     @State private var isHovered = false
 
+    init(
+        tile: UsageAccountTile,
+        now: Date,
+        forcedHeight: CGFloat? = nil,
+        rowIndex: Int? = nil,
+        onEditClaudeCodeToken: ((String) -> Void)?,
+        onClearClaudeCodeToken: ((String) -> Void)?
+    ) {
+        self.tile = tile
+        self.now = now
+        self.forcedHeight = forcedHeight
+        self.rowIndex = rowIndex
+        self.onEditClaudeCodeToken = onEditClaudeCodeToken
+        self.onClearClaudeCodeToken = onClearClaudeCodeToken
+    }
+
     var body: some View {
+        content
+            // Keep the measured content at its natural height even when we wrap it with a fixed row height.
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(heightReporter)
+            .frame(height: forcedHeight, alignment: .topLeading)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(isHovered ? Color.white.opacity(0.09) : Color.white.opacity(0.06))
+            )
+            .onHover { isHovered = $0 }
+            .animation(.easeInOut(duration: 0.15), value: isHovered)
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: 8) {
             UsageProviderColumn(
                 provider: tile.provider,
@@ -1272,12 +1353,18 @@ private struct UsageAccountTileCard: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(isHovered ? Color.white.opacity(0.09) : Color.white.opacity(0.06))
-        )
-        .onHover { isHovered = $0 }
-        .animation(.easeInOut(duration: 0.15), value: isHovered)
+    }
+
+    @ViewBuilder
+    private var heightReporter: some View {
+        if let rowIndex {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: UsageAccountTileRowHeightsPreferenceKey.self,
+                    value: [rowIndex: proxy.size.height]
+                )
+            }
+        }
     }
 }
 
