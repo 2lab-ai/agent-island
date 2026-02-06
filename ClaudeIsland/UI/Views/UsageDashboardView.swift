@@ -1509,7 +1509,7 @@ private struct UsageProviderColumn: View {
     }
 
     private var headerTitleColor: Color {
-        if normalizedEmail != nil { return Color.white.opacity(0.35) }
+        if normalizedEmail != nil { return Color.white.opacity(0.9) }
         if let info, !info.available { return TerminalColors.dim }
         if normalizedAccountId != nil { return Color.white.opacity(0.22) }
         return Color.white.opacity(0.2)
