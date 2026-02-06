@@ -693,6 +693,7 @@ struct UsageDashboardView: View {
                         email: snapshot?.identities.claudeEmail,
                         tier: snapshot?.identities.claudeTier,
                         claudeIsTeam: snapshot?.identities.claudeIsTeam,
+                        tokenRefresh: snapshot?.tokenRefresh.claude,
                         info: snapshot?.output?.claude,
                         errorMessage: snapshot?.errorMessage
                     )
@@ -708,6 +709,7 @@ struct UsageDashboardView: View {
                         email: snapshot?.identities.codexEmail,
                         tier: nil,
                         claudeIsTeam: nil,
+                        tokenRefresh: snapshot?.tokenRefresh.codex,
                         info: snapshot?.output?.codex,
                         errorMessage: snapshot?.errorMessage
                     )
@@ -723,6 +725,7 @@ struct UsageDashboardView: View {
                         email: snapshot?.identities.geminiEmail,
                         tier: nil,
                         claudeIsTeam: nil,
+                        tokenRefresh: snapshot?.tokenRefresh.gemini,
                         info: snapshot?.output?.gemini,
                         errorMessage: snapshot?.errorMessage
                     )
@@ -878,6 +881,7 @@ private struct UsageAccountTile: Identifiable {
     let email: String?
     let tier: String?
     let claudeIsTeam: Bool?
+    let tokenRefresh: TokenRefreshInfo?
     let info: CLIUsageInfo?
     let errorMessage: String?
 }
@@ -895,6 +899,7 @@ private struct UsageAccountTileCard: View {
                 email: tile.email,
                 tier: tile.tier,
                 claudeIsTeam: tile.claudeIsTeam,
+                tokenRefresh: tile.tokenRefresh,
                 info: tile.info,
                 now: now
             )
@@ -946,6 +951,7 @@ private struct UsageDashboardPanel: View {
                     email: snapshot?.identities.claudeEmail,
                     tier: snapshot?.identities.claudeTier,
                     claudeIsTeam: snapshot?.identities.claudeIsTeam,
+                    tokenRefresh: snapshot?.tokenRefresh.claude,
                     info: snapshot?.output?.claude,
                     now: now
                 )
@@ -955,6 +961,7 @@ private struct UsageDashboardPanel: View {
                     email: snapshot?.identities.codexEmail,
                     tier: nil,
                     claudeIsTeam: nil,
+                    tokenRefresh: snapshot?.tokenRefresh.codex,
                     info: snapshot?.output?.codex,
                     now: now
                 )
@@ -964,6 +971,7 @@ private struct UsageDashboardPanel: View {
                     email: snapshot?.identities.geminiEmail,
                     tier: nil,
                     claudeIsTeam: nil,
+                    tokenRefresh: snapshot?.tokenRefresh.gemini,
                     info: snapshot?.output?.gemini,
                     now: now
                 )
@@ -1062,6 +1070,7 @@ private struct UsageProviderColumn: View {
     let email: String?
     let tier: String?
     let claudeIsTeam: Bool?
+    let tokenRefresh: TokenRefreshInfo?
     let info: CLIUsageInfo?
     let now: Date
 
@@ -1074,6 +1083,8 @@ private struct UsageProviderColumn: View {
                 .foregroundColor(emailLineColor)
                 .lineLimit(1)
                 .truncationMode(.middle)
+
+            UsageTokenRefreshRow(tokenRefresh: tokenRefresh, now: now)
 
             usageRows
         }
@@ -1268,6 +1279,63 @@ private struct TierBadge: View {
         }
 
         return (Color.white.opacity(0.08), Color.white.opacity(0.55))
+    }
+}
+
+private struct UsageTokenRefreshRow: View {
+    let tokenRefresh: TokenRefreshInfo?
+    let now: Date
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "key.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundColor(iconColor)
+                .frame(width: 18, alignment: .leading)
+
+            MiniSegmentBar(
+                fraction: remainingFraction,
+                fillColor: barFillColor,
+                emptyColor: Color.white.opacity(0.08)
+            )
+            .frame(height: 6)
+            .frame(width: 46)
+
+            timeRemainingText
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .frame(width: 46, alignment: .center)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+
+            Spacer(minLength: 0)
+        }
+        .opacity(tokenRefresh == nil ? 0.65 : 1)
+    }
+
+    private var remainingFraction: Double {
+        guard let tokenRefresh else { return 0 }
+        let remaining = max(0, tokenRefresh.expiresAt.timeIntervalSince(now))
+        let total = max(1, tokenRefresh.lifetimeSeconds)
+        return max(0, min(1, remaining / total))
+    }
+
+    private var barFillColor: Color {
+        tokenRefresh == nil
+            ? Color.white.opacity(0.12)
+            : TerminalColors.magenta.opacity(0.85)
+    }
+
+    private var iconColor: Color {
+        tokenRefresh == nil
+            ? Color.white.opacity(0.25)
+            : TerminalColors.magenta.opacity(0.85)
+    }
+
+    private var timeRemainingText: Text {
+        let baseColor = Color.white.opacity(0.28)
+        guard let tokenRefresh else { return Text("--").foregroundColor(baseColor) }
+        let seconds = max(0, Int(tokenRefresh.expiresAt.timeIntervalSince(now)))
+        return UsageDurationText.make(seconds: seconds, digitColor: baseColor)
     }
 }
 
