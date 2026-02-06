@@ -1,6 +1,8 @@
 import AppKit
 import IOKit
+#if !APPSTORE
 import Sparkle
+#endif
 import SwiftUI
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -9,14 +11,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var updateCheckTimer: Timer?
 
     static var shared: AppDelegate?
+    #if !APPSTORE
     let updater: SPUUpdater
     private let userDriver: NotchUserDriver
+    #endif
 
     var windowController: NotchWindowController? {
         windowManager?.windowController
     }
 
     override init() {
+        #if !APPSTORE
         userDriver = NotchUserDriver()
         updater = SPUUpdater(
             hostBundle: Bundle.main,
@@ -24,14 +29,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             userDriver: userDriver,
             delegate: nil
         )
+        #endif
         super.init()
         AppDelegate.shared = self
 
+        #if !APPSTORE
         do {
             try updater.start()
         } catch {
             print("Failed to start Sparkle updater: \(error)")
         }
+        #endif
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -39,6 +47,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApplication.shared.terminate(nil)
             return
         }
+
+        migrateFromClaudeIslandIfNeeded()
 
         Analytics.initializeIfNeeded()
 
@@ -83,6 +93,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self?.handleScreenChange()
         }
 
+        #if !APPSTORE
         if updater.canCheckForUpdates {
             updater.checkForUpdates()
         }
@@ -91,6 +102,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let updater = self?.updater, updater.canCheckForUpdates else { return }
             updater.checkForUpdates()
         }
+        #endif
     }
 
     private func handleScreenChange() {
@@ -181,8 +193,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func migrateFromClaudeIslandIfNeeded() {
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let oldDir = home.appendingPathComponent(".claude-island")
+        let newDir = home.appendingPathComponent(".agent-island")
+
+        guard fm.fileExists(atPath: oldDir.path),
+              !fm.fileExists(atPath: newDir.path) else { return }
+
+        do {
+            try fm.copyItem(at: oldDir, to: newDir)
+        } catch {
+            print("Migration from .claude-island failed: \(error)")
+        }
+    }
+
     private func ensureSingleInstance() -> Bool {
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.farouqaldori.ClaudeIsland"
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.celestial.AgentIsland"
         let runningApps = NSWorkspace.shared.runningApplications.filter {
             $0.bundleIdentifier == bundleID
         }

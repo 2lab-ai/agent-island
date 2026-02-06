@@ -9,7 +9,7 @@ enum ClaudeCodeTokenStoreError: LocalizedError {
         case .readFailed(let underlying):
             return "Failed to read Claude Code token store: \(underlying.localizedDescription)"
         case .invalidFormat:
-            return "Claude Code token store is corrupted (invalid JSON). Delete `~/.claude-island/claude-code-tokens.json` to reset."
+            return "Claude Code token store is corrupted (invalid JSON). Delete `~/.agent-island/claude-code-tokens.json` to reset."
         }
     }
 }
@@ -21,7 +21,7 @@ enum ClaudeCodeTokenStoreError: LocalizedError {
 actor ClaudeCodeTokenStore {
     private let rootDir: URL
 
-    init(rootDir: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude-island")) {
+    init(rootDir: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".agent-island")) {
         self.rootDir = rootDir
     }
 

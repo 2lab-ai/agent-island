@@ -13,7 +13,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		FD33FD5D2EDF32D7002A6548 /* Claude Island.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Claude Island.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		FD33FD5D2EDF32D7002A6548 /* Agent Island.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Agent Island.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -68,7 +68,7 @@
 		FD33FD5E2EDF32D7002A6548 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				FD33FD5D2EDF32D7002A6548 /* Claude Island.app */,
+				FD33FD5D2EDF32D7002A6548 /* Agent Island.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -99,7 +99,7 @@
 				FD0F42E62EE7ABA400980302 /* Mixpanel */,
 			);
 			productName = ClaudeIsland;
-			productReference = FD33FD5D2EDF32D7002A6548 /* Claude Island.app */;
+			productReference = FD33FD5D2EDF32D7002A6548 /* Agent Island.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -305,8 +305,8 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.celestial.ClaudeIsland;
-				PRODUCT_NAME = "Claude Island";
+				PRODUCT_BUNDLE_IDENTIFIER = com.celestial.AgentIsland;
+				PRODUCT_NAME = "Agent Island";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -340,8 +340,8 @@
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.2;
-				PRODUCT_BUNDLE_IDENTIFIER = com.celestial.ClaudeIsland;
-				PRODUCT_NAME = "Claude Island";
+				PRODUCT_BUNDLE_IDENTIFIER = com.celestial.AgentIsland;
+				PRODUCT_NAME = "Agent Island";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;

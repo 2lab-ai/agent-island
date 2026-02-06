@@ -23,7 +23,7 @@ final class AccountStore {
     private let rootDir: URL
 
     init(rootDir: URL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".claude-island")) {
+        .appendingPathComponent(".agent-island")) {
         self.rootDir = rootDir
     }
 

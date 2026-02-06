@@ -9,7 +9,9 @@ import ApplicationServices
 import Combine
 import SwiftUI
 import ServiceManagement
+#if !APPSTORE
 import Sparkle
+#endif
 
 // MARK: - NotchMenuView
 
@@ -90,7 +92,7 @@ struct NotchMenuView: View {
                 icon: "star",
                 label: "Star on GitHub"
             ) {
-                if let url = URL(string: "https://github.com/farouqaldori/claude-island") {
+                if let url = URL(string: "https://github.com/icedac/agent-island") {
                     NSWorkspace.shared.open(url)
                 }
             }

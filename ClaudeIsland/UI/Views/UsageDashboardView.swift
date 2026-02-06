@@ -49,6 +49,7 @@ final class UsageDashboardViewModel: ObservableObject {
     private var backgroundRefreshStarted = false
     private var lastKnownEmailByAccountId: [String: String] = [:]
     private var lastKnownTierByAccountId: [String: String] = [:]
+    private var lastKnownPlanByAccountId: [String: String] = [:]
     private var lastKnownClaudeIsTeamByAccountId: [String: Bool] = [:]
     private var lastKnownCurrentAccountIds: UsageAccountIdSet = .empty
     private let identityStore = UsageIdentityStore()
@@ -76,6 +77,9 @@ final class UsageDashboardViewModel: ObservableObject {
                 }
                 if let tier = identity.tier?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil {
                     lastKnownTierByAccountId[accountId] = tier
+                }
+                if let plan = identity.plan?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil {
+                    lastKnownPlanByAccountId[accountId] = plan
                 }
                 if let isTeam = identity.claudeIsTeam {
                     lastKnownClaudeIsTeamByAccountId[accountId] = isTeam
@@ -203,6 +207,7 @@ final class UsageDashboardViewModel: ObservableObject {
     private func snapshotWithRememberedIdentities(_ snapshot: UsageSnapshot, accountIds: UsageAccountIdSet) -> UsageSnapshot {
         let rememberedClaudeEmail = accountIds.claude.flatMap { lastKnownEmailByAccountId[$0] }
         let rememberedClaudeTier = accountIds.claude.flatMap { lastKnownTierByAccountId[$0] }
+        let rememberedClaudePlan = accountIds.claude.flatMap { lastKnownPlanByAccountId[$0] }
         let rememberedClaudeIsTeam = accountIds.claude.flatMap { lastKnownClaudeIsTeamByAccountId[$0] }
         let rememberedCodexEmail = accountIds.codex.flatMap { lastKnownEmailByAccountId[$0] }
         let rememberedGeminiEmail = accountIds.gemini.flatMap { lastKnownEmailByAccountId[$0] }
@@ -213,7 +218,7 @@ final class UsageDashboardViewModel: ObservableObject {
 
         let mergedIdentities = UsageIdentities(
             claudeEmail: normalize(snapshot.identities.claudeEmail) ?? rememberedClaudeEmail,
-            claudeTier: normalize(snapshot.identities.claudeTier) ?? rememberedClaudeTier,
+            claudeTier: rememberedClaudePlan ?? normalize(snapshot.identities.claudeTier) ?? rememberedClaudeTier,
             claudeIsTeam: snapshot.identities.claudeIsTeam ?? rememberedClaudeIsTeam,
             codexEmail: normalize(snapshot.identities.codexEmail) ?? rememberedCodexEmail,
             geminiEmail: normalize(snapshot.identities.geminiEmail) ?? rememberedGeminiEmail
@@ -346,7 +351,12 @@ final class UsageDashboardViewModel: ObservableObject {
     func saveClaudeCodeToken(accountId: String, token: String) async {
         do {
             try await claudeCodeTokenStore.saveToken(accountId: accountId, token: token)
-            var message = "Saved Claude Code token for \(accountId)."
+            let displayAccountId = UsageAccountIdFormatter.displayAccountId(
+                provider: .claude,
+                email: lastKnownEmailByAccountId[accountId],
+                claudeIsTeam: lastKnownClaudeIsTeamByAccountId[accountId]
+            ) ?? accountId
+            var message = "Saved Claude Code token for \(displayAccountId)."
 
             if currentAccountIds.claude == accountId,
                let envMessage = await applyClaudeCodeTokenForAccount(accountId: accountId) {
@@ -362,7 +372,12 @@ final class UsageDashboardViewModel: ObservableObject {
     func clearClaudeCodeToken(accountId: String) async {
         do {
             try await claudeCodeTokenStore.deleteToken(accountId: accountId)
-            var message = "Cleared Claude Code token for \(accountId)."
+            let displayAccountId = UsageAccountIdFormatter.displayAccountId(
+                provider: .claude,
+                email: lastKnownEmailByAccountId[accountId],
+                claudeIsTeam: lastKnownClaudeIsTeamByAccountId[accountId]
+            ) ?? accountId
+            var message = "Cleared Claude Code token for \(displayAccountId)."
 
             if currentAccountIds.claude == accountId,
                let envMessage = await applyClaudeCodeTokenForAccount(accountId: accountId) {
@@ -563,6 +578,7 @@ struct UsageDashboardView: View {
         .sheet(item: $claudeCodeTokenEditor) { state in
             ClaudeCodeTokenSheet(
                 accountId: state.accountId,
+                displayAccountId: state.displayAccountId,
                 email: state.email,
                 token: $claudeCodeTokenDraft,
                 onCancel: {
@@ -1172,14 +1188,23 @@ struct UsageDashboardView: View {
     private struct ClaudeCodeTokenEditorState: Identifiable {
         let id = UUID()
         let accountId: String
+        let displayAccountId: String
         let email: String?
     }
 
     private func presentClaudeCodeTokenEditor(accountId: String) {
         claudeCodeTokenDraft = ""
+        let email = claudeEmail(for: accountId)
+        let isTeam = claudeIsTeam(for: accountId)
+        let displayAccountId = UsageAccountIdFormatter.displayAccountId(
+            provider: .claude,
+            email: email,
+            claudeIsTeam: isTeam
+        ) ?? accountId
         claudeCodeTokenEditor = ClaudeCodeTokenEditorState(
             accountId: accountId,
-            email: claudeEmail(for: accountId)
+            displayAccountId: displayAccountId,
+            email: email
         )
     }
 
@@ -1191,6 +1216,12 @@ struct UsageDashboardView: View {
         dashboardTiles
             .first(where: { $0.provider == .claude && $0.accountId == accountId })?
             .email
+    }
+
+    private func claudeIsTeam(for accountId: String) -> Bool? {
+        dashboardTiles
+            .first(where: { $0.provider == .claude && $0.accountId == accountId })?
+            .claudeIsTeam
     }
 }
 
@@ -1219,6 +1250,50 @@ enum UsageWindow: CaseIterable {
         case .twentyFourHour: "24h"
         case .sevenDay: "7d"
         }
+    }
+}
+
+private enum UsageAccountIdFormatter {
+    static func displayAccountId(provider: UsageProvider, email: String?, claudeIsTeam: Bool?) -> String? {
+        guard let emailSlug = emailSlug(email) else { return nil }
+
+        switch provider {
+        case .claude:
+            if claudeIsTeam == true {
+                return "acct_claude_team_\(emailSlug)"
+            }
+            return "acct_claude_\(emailSlug)"
+        case .codex:
+            return "acct_codex_\(emailSlug)"
+        case .gemini:
+            return "acct_gemini_\(emailSlug)"
+        }
+    }
+
+    private static func emailSlug(_ email: String?) -> String? {
+        guard let email = email?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil else { return nil }
+
+        let lowered = email.lowercased()
+        var output: [UInt8] = []
+        output.reserveCapacity(lowered.utf8.count)
+
+        var lastWasUnderscore = false
+        for byte in lowered.utf8 {
+            let isDigit = byte >= 48 && byte <= 57
+            let isLower = byte >= 97 && byte <= 122
+            if isDigit || isLower {
+                output.append(byte)
+                lastWasUnderscore = false
+            } else {
+                guard !lastWasUnderscore else { continue }
+                output.append(95) // "_"
+                lastWasUnderscore = true
+            }
+        }
+
+        let raw = String(decoding: output, as: UTF8.self)
+        let trimmed = raw.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
+        return trimmed.nonEmptyOrNil
     }
 }
 
@@ -2065,6 +2140,7 @@ private struct MiniSegmentBar: View {
 
 private struct ClaudeCodeTokenSheet: View {
     let accountId: String
+    let displayAccountId: String
     let email: String?
     @Binding var token: String
     let onCancel: () -> Void
@@ -2087,7 +2163,7 @@ private struct ClaudeCodeTokenSheet: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
 
-                Text(accountId)
+                Text(displayAccountId)
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .foregroundColor(.secondary.opacity(0.85))
                     .lineLimit(1)
@@ -2140,7 +2216,7 @@ private struct SaveProfileSheet: View {
                     .textFieldStyle(.roundedBorder)
             }
 
-            Text("This snapshots your current Claude/Codex/Gemini CLI credentials into `~/.claude-island/accounts/` and links them to the profile.")
+            Text("This snapshots your current Claude/Codex/Gemini CLI credentials into `~/.agent-island/accounts/` and links them to the profile.")
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
 

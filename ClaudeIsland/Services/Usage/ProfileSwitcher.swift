@@ -55,7 +55,7 @@ final class ProfileSwitcher {
         self.exporter = exporter
         self.fileManager = fileManager
         self.activeHomeDir = activeHomeDir
-        self.accountsDir = activeHomeDir.appendingPathComponent(".claude-island/accounts", isDirectory: true)
+        self.accountsDir = activeHomeDir.appendingPathComponent(".agent-island/accounts", isDirectory: true)
     }
 
     func saveCurrentProfile(named name: String) throws -> ProfileSaveResult {

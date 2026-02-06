@@ -1,7 +1,7 @@
 .PHONY: up
 
-APP_NAME ?= Claude Island.app
-BUNDLE_ID ?= com.celestial.ClaudeIsland
+APP_NAME ?= Agent Island.app
+BUNDLE_ID ?= com.celestial.AgentIsland
 PROJECT ?= ClaudeIsland.xcodeproj
 SCHEME ?= ClaudeIsland
 CONFIGURATION ?= Release
@@ -14,7 +14,7 @@ up:
 	xcodebuild -project "$(PROJECT)" -scheme "$(SCHEME)" -configuration "$(CONFIGURATION)" -derivedDataPath "$(DERIVED_DATA)" build
 	@if [ ! -d "$(BUILT_APP)" ]; then echo "ERROR: built app not found: $(BUILT_APP)" >&2; exit 1; fi
 	@osascript -e 'tell application id "$(BUNDLE_ID)" to quit' >/dev/null 2>&1 || true
-	@killall "Claude Island" >/dev/null 2>&1 || true
+	@killall "Agent Island" >/dev/null 2>&1 || true
 	@sleep 1
 	rm -rf "$(INSTALL_PATH).tmp"
 	ditto "$(BUILT_APP)" "$(INSTALL_PATH).tmp"

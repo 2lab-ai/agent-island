@@ -196,7 +196,7 @@ final class UsageFetcher {
 
         try stageVendoredScript(into: homeURL, scriptURL: scriptURL)
 
-        let scriptPathInContainer = "/home/node/.claude-island-scripts/check-usage.js"
+        let scriptPathInContainer = "/home/node/.agent-island-scripts/check-usage.js"
 
         let json: Data
         do {
@@ -234,7 +234,7 @@ final class UsageFetcher {
 
     private func buildTempHome(profile: UsageProfile, accounts: [UsageAccount]) throws -> URL {
         let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-island/tmp-homes", isDirectory: true)
+            .appendingPathComponent(".agent-island/tmp-homes", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         let tempHome = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -268,7 +268,7 @@ final class UsageFetcher {
         }
 
         let root = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-island/tmp-homes", isDirectory: true)
+            .appendingPathComponent(".agent-island/tmp-homes", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         let tempHome = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -329,7 +329,7 @@ final class UsageFetcher {
     }
 
     private func stageVendoredScript(into homeURL: URL, scriptURL: URL) throws {
-        let scriptsDir = homeURL.appendingPathComponent(".claude-island-scripts", isDirectory: true)
+        let scriptsDir = homeURL.appendingPathComponent(".agent-island-scripts", isDirectory: true)
         try FileManager.default.createDirectory(at: scriptsDir, withIntermediateDirectories: true)
 
         let packageURL = scriptURL.deletingLastPathComponent().appendingPathComponent("package.json")
@@ -712,7 +712,7 @@ private extension UsageFetcher {
         request.timeoutInterval = 5
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("claude-island", forHTTPHeaderField: "User-Agent")
+        request.setValue("agent-island", forHTTPHeaderField: "User-Agent")
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
 

@@ -107,13 +107,13 @@ typealias PermissionFailureHandler = @Sendable (_ sessionId: String, _ toolUseId
 /// Uses GCD DispatchSource for non-blocking I/O
 class HookSocketServer {
     static let shared = HookSocketServer()
-    static let socketPath = "/tmp/claude-island.sock"
+    static let socketPath = "/tmp/agent-island.sock"
 
     private var serverSocket: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private var eventHandler: HookEventHandler?
     private var permissionFailureHandler: PermissionFailureHandler?
-    private let queue = DispatchQueue(label: "com.claudeisland.socket", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "com.agentisland.socket", qos: .userInitiated)
 
     /// Pending permission requests indexed by toolUseId
     private var pendingPermissions: [String: PendingPermission] = [:]

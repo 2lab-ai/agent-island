@@ -9,7 +9,7 @@ enum UsageIdentityStoreError: LocalizedError {
         case .readFailed(let underlying):
             return "Failed to read identity cache: \(underlying.localizedDescription)"
         case .invalidFormat:
-            return "Identity cache is corrupted (invalid JSON). Delete `~/.claude-island/usage-identities.json` to reset."
+            return "Identity cache is corrupted (invalid JSON). Delete `~/.agent-island/usage-identities.json` to reset."
         }
     }
 }
@@ -22,7 +22,41 @@ actor UsageIdentityStore {
     struct Identity: Codable, Sendable, Equatable {
         var email: String?
         var tier: String?
+        /// User-maintained plan override (e.g. pro/max5/max20). If nil, we fall back to inferred tier.
+        ///
+        /// We intentionally encode this field even when nil so the JSON stays easy to edit by hand.
+        var plan: String?
         var claudeIsTeam: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case email
+            case tier
+            case plan
+            case claudeIsTeam
+        }
+
+        init(email: String?, tier: String?, plan: String?, claudeIsTeam: Bool?) {
+            self.email = email
+            self.tier = tier
+            self.plan = plan
+            self.claudeIsTeam = claudeIsTeam
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            email = try container.decodeIfPresent(String.self, forKey: .email)
+            tier = try container.decodeIfPresent(String.self, forKey: .tier)
+            plan = try container.decodeIfPresent(String.self, forKey: .plan)
+            claudeIsTeam = try container.decodeIfPresent(Bool.self, forKey: .claudeIsTeam)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(email, forKey: .email)
+            try container.encodeIfPresent(tier, forKey: .tier)
+            try container.encode(plan, forKey: .plan)
+            try container.encodeIfPresent(claudeIsTeam, forKey: .claudeIsTeam)
+        }
     }
 
     private let rootDir: URL
@@ -32,7 +66,7 @@ actor UsageIdentityStore {
     private var identities: [String: Identity] = [:]
 
     init(
-        rootDir: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude-island"),
+        rootDir: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".agent-island"),
         fileManager: FileManager = .default
     ) {
         self.rootDir = rootDir
@@ -63,7 +97,7 @@ actor UsageIdentityStore {
             return trimmed.isEmpty ? nil : trimmed
         }()
 
-        var next = identities[accountId] ?? Identity(email: nil, tier: nil, claudeIsTeam: nil)
+        var next = identities[accountId] ?? Identity(email: nil, tier: nil, plan: nil, claudeIsTeam: nil)
         var changed = false
 
         if let normalizedEmail, normalizedEmail != next.email {
@@ -104,10 +138,18 @@ actor UsageIdentityStore {
             throw UsageIdentityStoreError.readFailed(underlying: error)
         }
 
+        let hadPlanKey = String(decoding: data, as: UTF8.self).contains("\"plan\"")
+
         do {
             identities = try JSONDecoder().decode([String: Identity].self, from: data)
         } catch {
             throw UsageIdentityStoreError.invalidFormat(underlying: error)
+        }
+
+        // Schema upgrade: older files won't include `plan`. Re-write once so the field is present (as null) for
+        // easy manual editing.
+        if !hadPlanKey {
+            try save()
         }
     }
 

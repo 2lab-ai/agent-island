@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Claude Island</string>
+    <string>Agent Island</string>
     <key>CFBundleDisplayName</key>
-    <string>Claude Island</string>
+    <string>Agent Island</string>
     <key>CFBundleIdentifier</key>
     <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundleVersion</key>
@@ -17,9 +17,9 @@
     <key>NSHumanReadableCopyright</key>
     <string>Copyright 2025. All rights reserved.</string>
 
-    <!-- Sparkle Update Configuration -->
+    <!-- Sparkle Update Configuration (Direct distribution only; disabled for App Store) -->
     <key>SUFeedURL</key>
-    <string>https://claudeisland.com/appcast.xml</string>
+    <string>https://agentisland.app/appcast.xml</string>
     <key>SUPublicEDKey</key>
     <string>w5NwH5KRfE7LfeZ09J8lWx3UQrWTqUbfH4HHBa1OPRk=</string>
     <key>SUEnableAutomaticChecks</key>

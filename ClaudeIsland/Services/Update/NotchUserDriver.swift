@@ -7,7 +7,9 @@
 
 import Combine
 import Foundation
+#if !APPSTORE
 import Sparkle
+#endif
 
 /// Update state published to UI
 enum UpdateState: Equatable {
@@ -44,8 +46,9 @@ class UpdateManager: NSObject, ObservableObject {
     private var expectedBytes: Int64 = 0
     private var currentVersion: String = ""
 
-    // Callbacks from Sparkle
+    #if !APPSTORE
     private var installHandler: ((SPUUserUpdateChoice) -> Void)?
+    #endif
     private var cancellationHandler: (() -> Void)?
 
     override init() {
@@ -55,29 +58,41 @@ class UpdateManager: NSObject, ObservableObject {
     // MARK: - Public API
 
     func checkForUpdates() {
+        #if APPSTORE
+        state = .upToDate
+        #else
         state = .checking
         if let updater = AppDelegate.shared?.updater {
             updater.checkForUpdates()
         } else {
             state = .error(message: "Updater not initialized")
         }
+        #endif
     }
 
     func downloadAndInstall() {
+        #if !APPSTORE
         installHandler?(.install)
+        #endif
     }
 
     func installAndRelaunch() {
+        #if !APPSTORE
         installHandler?(.install)
+        #endif
     }
 
     func skipUpdate() {
+        #if !APPSTORE
         installHandler?(.skip)
+        #endif
         state = .idle
     }
 
     func dismissUpdate() {
+        #if !APPSTORE
         installHandler?(.dismiss)
+        #endif
         state = .idle
     }
 
@@ -88,15 +103,16 @@ class UpdateManager: NSObject, ObservableObject {
 
     // MARK: - Internal state updates (called by NotchUserDriver)
 
+    #if !APPSTORE
     func updateFound(version: String, releaseNotes: String?, installHandler: @escaping (SPUUserUpdateChoice) -> Void) {
         self.currentVersion = version
         self.installHandler = installHandler
         self.state = .found(version: version, releaseNotes: releaseNotes)
-        // Only show the dot if user hasn't seen it this session
         if !hasSeenUpdateThisSession {
             self.hasUnseenUpdate = true
         }
     }
+    #endif
 
     func markUpdateSeen() {
         self.hasUnseenUpdate = false
@@ -128,10 +144,12 @@ class UpdateManager: NSObject, ObservableObject {
         self.state = .extracting(progress: progress)
     }
 
+    #if !APPSTORE
     func readyToInstall(installHandler: @escaping (SPUUserUpdateChoice) -> Void) {
         self.installHandler = installHandler
         self.state = .readyToInstall(version: currentVersion)
     }
+    #endif
 
     func installing() {
         self.state = .installing
@@ -157,16 +175,18 @@ class UpdateManager: NSObject, ObservableObject {
     }
 
     func dismiss() {
-        // Don't dismiss if we're showing "up to date" - let it display
         if case .upToDate = state {
             return
         }
         self.state = .idle
+        #if !APPSTORE
         self.installHandler = nil
+        #endif
         self.cancellationHandler = nil
     }
 }
 
+#if !APPSTORE
 /// Custom Sparkle user driver that routes all UI to NotchUpdateManager
 class NotchUserDriver: NSObject, SPUUserDriver {
 
@@ -289,3 +309,4 @@ class NotchUserDriver: NSObject, SPUUserDriver {
         reply(.dismiss)
     }
 }
+#endif
