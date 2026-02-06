@@ -199,13 +199,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let oldDir = home.appendingPathComponent(".claude-island")
         let newDir = home.appendingPathComponent(".agent-island")
 
-        guard fm.fileExists(atPath: oldDir.path),
-              !fm.fileExists(atPath: newDir.path) else { return }
+        guard fm.fileExists(atPath: oldDir.path) else { return }
 
         do {
-            try fm.copyItem(at: oldDir, to: newDir)
+            try fm.createDirectory(at: newDir, withIntermediateDirectories: true)
+        } catch {
+            print("Migration: failed to create .agent-island directory: \(error)")
+            return
+        }
+
+        do {
+            try mergeCopyMissingItems(from: oldDir, to: newDir, fileManager: fm)
         } catch {
             print("Migration from .claude-island failed: \(error)")
+        }
+    }
+
+    private func mergeCopyMissingItems(from source: URL, to destination: URL, fileManager: FileManager) throws {
+        let sourcePath = source.path
+        guard let enumerator = fileManager.enumerator(
+            at: source,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: []
+        ) else { return }
+
+        for case let itemURL as URL in enumerator {
+            let itemPath = itemURL.path
+            guard itemPath.hasPrefix(sourcePath) else { continue }
+            var relativePath = String(itemPath.dropFirst(sourcePath.count))
+            if relativePath.hasPrefix("/") { relativePath.removeFirst() }
+            guard !relativePath.isEmpty else { continue }
+
+            let targetURL = destination.appendingPathComponent(relativePath)
+            guard !fileManager.fileExists(atPath: targetURL.path) else { continue }
+
+            let values = try itemURL.resourceValues(forKeys: [.isDirectoryKey])
+            if values.isDirectory == true {
+                try fileManager.createDirectory(at: targetURL, withIntermediateDirectories: true)
+                continue
+            }
+
+            let parent = targetURL.deletingLastPathComponent()
+            try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
+            try fileManager.copyItem(at: itemURL, to: targetURL)
         }
     }
 
