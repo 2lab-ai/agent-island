@@ -47,3 +47,5 @@ CLAUDE.md
 # Local AI agent logs
 .claude/raw_logs/
 .claude/chat_logs/
+**/.claude/raw_logs/
+**/.claude/chat_logs/
