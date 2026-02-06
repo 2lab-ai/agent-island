@@ -733,6 +733,59 @@ struct UsageDashboardView: View {
             }
         }
 
+        // Include the live "Current" credentials in the global dashboard as well, since they may not be saved as a profile.
+        if model.currentAccountIds.hasAny {
+            let snapshot = model.currentSnapshot
+
+            if let accountId = model.currentAccountIds.claude {
+                consider(
+                    UsageAccountTile(
+                        id: "claude:\(accountId)",
+                        provider: .claude,
+                        label: "Current",
+                        email: snapshot?.identities.claudeEmail,
+                        tier: snapshot?.identities.claudeTier,
+                        claudeIsTeam: snapshot?.identities.claudeIsTeam,
+                        tokenRefresh: snapshot?.tokenRefresh.claude,
+                        info: snapshot?.output?.claude,
+                        errorMessage: snapshot?.errorMessage
+                    )
+                )
+            }
+
+            if let accountId = model.currentAccountIds.codex {
+                consider(
+                    UsageAccountTile(
+                        id: "codex:\(accountId)",
+                        provider: .codex,
+                        label: "Current",
+                        email: snapshot?.identities.codexEmail,
+                        tier: nil,
+                        claudeIsTeam: nil,
+                        tokenRefresh: snapshot?.tokenRefresh.codex,
+                        info: snapshot?.output?.codex,
+                        errorMessage: snapshot?.errorMessage
+                    )
+                )
+            }
+
+            if let accountId = model.currentAccountIds.gemini {
+                consider(
+                    UsageAccountTile(
+                        id: "gemini:\(accountId)",
+                        provider: .gemini,
+                        label: "Current",
+                        email: snapshot?.identities.geminiEmail,
+                        tier: nil,
+                        claudeIsTeam: nil,
+                        tokenRefresh: snapshot?.tokenRefresh.gemini,
+                        info: snapshot?.output?.gemini,
+                        errorMessage: snapshot?.errorMessage
+                    )
+                )
+            }
+        }
+
         return tilesByKey.values.sorted { a, b in
             let pa = providerOrder(a.provider)
             let pb = providerOrder(b.provider)
