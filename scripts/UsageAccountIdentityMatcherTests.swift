@@ -5,7 +5,9 @@ enum UsageAccountIdentityMatcherTests {
     static func main() {
         testMatchesWhenProviderEmailsAreEqual()
         testDoesNotMatchWhenProviderEmailsDiffer()
+        testRequiresAllProvidersToMatch()
         testIdentityKeyUsesProviderAndNormalizedEmail()
+        testIdentityKeyDoesNotCollideAcrossProviders()
         testIdentityKeyFallsBackToAccountIdWithoutEmail()
         print("OK")
     }
@@ -56,6 +58,31 @@ enum UsageAccountIdentityMatcherTests {
         assert(!matches, "Expected profile not to match when provider emails differ.")
     }
 
+    private static func testRequiresAllProvidersToMatch() {
+        let profile = UsageProfile(
+            name: "A",
+            claudeAccountId: "acct_claude_profile",
+            codexAccountId: "acct_codex_profile",
+            geminiAccountId: nil
+        )
+        let knownEmails = [
+            "acct_claude_profile": "foo@example.com",
+            "acct_claude_current": "foo@example.com",
+            "acct_codex_profile": "foo@example.com",
+            "acct_codex_current": "bar@example.com"
+        ]
+
+        let matches = UsageAccountIdentityMatcher.matchesProfile(
+            currentClaudeAccountId: "acct_claude_current",
+            currentCodexAccountId: "acct_codex_current",
+            currentGeminiAccountId: nil,
+            profile: profile,
+            emailByAccountId: knownEmails
+        )
+
+        assert(!matches, "Expected profile not to match when any provider identity mismatches.")
+    }
+
     private static func testIdentityKeyUsesProviderAndNormalizedEmail() {
         let a = UsageAccountIdentityMatcher.identityKey(
             service: .claude,
@@ -68,6 +95,20 @@ enum UsageAccountIdentityMatcherTests {
             email: "foo@example.com"
         )
         assert(a == b, "Expected identity keys to match when provider+email are equal.")
+    }
+
+    private static func testIdentityKeyDoesNotCollideAcrossProviders() {
+        let claude = UsageAccountIdentityMatcher.identityKey(
+            service: .claude,
+            accountId: "acct_claude_aaa",
+            email: "foo@example.com"
+        )
+        let codex = UsageAccountIdentityMatcher.identityKey(
+            service: .codex,
+            accountId: "acct_codex_bbb",
+            email: "foo@example.com"
+        )
+        assert(claude != codex, "Expected identity keys to remain distinct across providers.")
     }
 
     private static func testIdentityKeyFallsBackToAccountIdWithoutEmail() {
