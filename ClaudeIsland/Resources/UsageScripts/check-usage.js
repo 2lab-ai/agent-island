@@ -115,15 +115,26 @@ function normalizeClaudeScopes(scopes) {
 }
 function tokenNeedsRefreshClaude(credentials) {
   if (!credentials?.expiresAt) {
+    debugLog("claude", "tokenNeedsRefreshClaude: missing expiresAt");
     return false;
   }
-  return credentials.expiresAt < Date.now() + CLAUDE_TOKEN_REFRESH_BUFFER_MS;
+  const needsRefresh = credentials.expiresAt < Date.now() + CLAUDE_TOKEN_REFRESH_BUFFER_MS;
+  if (needsRefresh) {
+    debugLog(
+      "claude",
+      "tokenNeedsRefreshClaude: token is within refresh buffer",
+      new Date(credentials.expiresAt).toISOString()
+    );
+  }
+  return needsRefresh;
 }
 async function refreshClaudeTokenInternal(credentials) {
   if (!credentials?.refreshToken) {
+    debugLog("claude", "refreshClaudeTokenInternal: no refresh token");
     return null;
   }
   try {
+    debugLog("claude", "refreshClaudeTokenInternal: attempting refresh");
     const scope = credentials.scopes.length > 0 ? credentials.scopes.join(" ") : CLAUDE_DEFAULT_SCOPE;
     const response = await fetch(CLAUDE_TOKEN_ENDPOINT, {
       method: "POST",
@@ -138,11 +149,23 @@ async function refreshClaudeTokenInternal(credentials) {
       }),
       signal: AbortSignal.timeout(API_TIMEOUT_MS)
     });
+    debugLog("claude", "refreshClaudeTokenInternal: response status", response.status);
     if (!response.ok) {
+      let errorBody = "";
+      try {
+        errorBody = await response.text();
+      } catch {
+      }
+      debugLog(
+        "claude",
+        "refreshClaudeTokenInternal: refresh failed",
+        `${response.status} ${errorBody}`.trim().slice(0, 200)
+      );
       return null;
     }
     const json = await response.json();
     if (!json?.access_token) {
+      debugLog("claude", "refreshClaudeTokenInternal: missing access_token in refresh response");
       return null;
     }
     const next = {
@@ -152,19 +175,27 @@ async function refreshClaudeTokenInternal(credentials) {
       scopes: normalizeClaudeScopes(json.scope || credentials.scopes)
     };
     await saveClaudeCredentialsToFile(next, json);
+    if (next.expiresAt) {
+      debugLog("claude", "refreshClaudeTokenInternal: refresh success", new Date(next.expiresAt).toISOString());
+    } else {
+      debugLog("claude", "refreshClaudeTokenInternal: refresh success (no expiresAt)");
+    }
     credentialsCache = null;
     return next;
-  } catch {
+  } catch (err) {
+    debugLog("claude", "refreshClaudeTokenInternal: error", err);
     return null;
   }
 }
 async function refreshClaudeToken(credentials) {
   if (!credentials?.refreshToken) {
+    debugLog("claude", "refreshClaudeToken: no refresh token");
     return null;
   }
   const dedupeKey = hashToken(credentials.refreshToken);
   const pending = pendingClaudeRefreshRequests.get(dedupeKey);
   if (pending) {
+    debugLog("claude", "refreshClaudeToken: using pending refresh request");
     return pending;
   }
   const refreshPromise = refreshClaudeTokenInternal(credentials).finally(() => {
@@ -198,19 +229,24 @@ async function saveClaudeCredentialsToFile(credentials, rawResponse) {
       nextRoot.claudeAiOauth.scopes = normalizeClaudeScopes(rawResponse.scope);
     }
     await writeFile(credPath, JSON.stringify(nextRoot, null, 2), { mode: 384 });
-  } catch {
+    debugLog("claude", "saveClaudeCredentialsToFile: saved");
+  } catch (err) {
+    debugLog("claude", "saveClaudeCredentialsToFile: error", err);
   }
 }
 async function getValidClaudeCredentials() {
   let credentials = await getCredentials();
   if (!credentials) {
+    debugLog("claude", "getValidClaudeCredentials: no credentials");
     return null;
   }
   if (tokenNeedsRefreshClaude(credentials)) {
+    debugLog("claude", "getValidClaudeCredentials: token expiring, refreshing");
     const refreshed = await refreshClaudeToken(credentials);
     if (refreshed?.accessToken) {
       return refreshed;
     }
+    debugLog("claude", "getValidClaudeCredentials: refresh failed, using existing token");
   }
   return credentials;
 }
@@ -291,13 +327,20 @@ async function fetchFromApi(credentials, tokenHash, allowRefreshRetry = true) {
   try {
     const response = await fetchClaudeUsageWithToken(credentials.accessToken);
     if (response.statusCode === 401 && allowRefreshRetry) {
+      debugLog("claude", "fetchFromApi: usage 401, trying refresh");
       const refreshed = await refreshClaudeToken(credentials);
       if (refreshed?.accessToken) {
         const refreshedHash = hashToken(refreshed.accessToken);
         return fetchFromApi(refreshed, refreshedHash, false);
       }
+      debugLog("claude", "fetchFromApi: refresh after 401 failed");
     }
     if (!response.ok || !response.data) {
+      debugLog(
+        "claude",
+        "fetchFromApi: usage fetch failed",
+        `status=${response.statusCode} ${(response.errorMessage || "").slice(0, 120)}`.trim()
+      );
       return null;
     }
     const limits = {
@@ -329,12 +372,17 @@ async function fetchClaudeUsageWithToken(accessToken) {
       signal: controller.signal
     });
     if (!response.ok) {
-      return { ok: false, statusCode: response.status, data: null };
+      let errorMessage = "";
+      try {
+        errorMessage = await response.text();
+      } catch {
+      }
+      return { ok: false, statusCode: response.status, data: null, errorMessage };
     }
     const data = await response.json();
-    return { ok: true, statusCode: response.status, data };
-  } catch {
-    return { ok: false, statusCode: 0, data: null };
+    return { ok: true, statusCode: response.status, data, errorMessage: "" };
+  } catch (err) {
+    return { ok: false, statusCode: 0, data: null, errorMessage: String(err) };
   } finally {
     clearTimeout(timeout);
   }

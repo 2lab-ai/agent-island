@@ -1078,7 +1078,7 @@ struct UsageDashboardView: View {
     }
 
     private var dashboardTiles: [UsageAccountTile] {
-        var tilesByKey: [String: UsageAccountTile] = [:]
+        var tilesById: [String: UsageAccountTile] = [:]
 
         func providerOrder(_ provider: UsageProvider) -> Int {
             switch provider {
@@ -1116,13 +1116,12 @@ struct UsageDashboardView: View {
         }
 
         func consider(_ tile: UsageAccountTile) {
-            let key = dedupeKey(for: tile)
-            if let existing = tilesByKey[key] {
+            if let existing = tilesById[tile.id] {
                 if score(tile) > score(existing) {
-                    tilesByKey[key] = tile
+                    tilesById[tile.id] = tile
                 }
             } else {
-                tilesByKey[key] = tile
+                tilesById[tile.id] = tile
             }
         }
 
@@ -1234,6 +1233,21 @@ struct UsageDashboardView: View {
                         errorMessage: snapshot?.errorMessage
                     )
                 )
+            }
+        }
+
+        // First-pass by tile.id avoids duplicate SwiftUI IDs when a single account appears with mixed
+        // identity states (e.g. one source has email, another does not). Second-pass still merges
+        // cross-account duplicates using provider/email/team identity.
+        var tilesByKey: [String: UsageAccountTile] = [:]
+        for tile in tilesById.values {
+            let key = dedupeKey(for: tile)
+            if let existing = tilesByKey[key] {
+                if score(tile) > score(existing) {
+                    tilesByKey[key] = tile
+                }
+            } else {
+                tilesByKey[key] = tile
             }
         }
 
