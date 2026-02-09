@@ -1939,6 +1939,8 @@ private struct UsageProviderColumn: View {
                 Text("TEAM")
                     .font(.system(size: 9, weight: .semibold, design: .monospaced))
                     .foregroundColor(Color.white.opacity(0.7))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(
@@ -1951,6 +1953,8 @@ private struct UsageProviderColumn: View {
                 Text(badge.label)
                     .font(.system(size: 9, weight: .semibold, design: .monospaced))
                     .foregroundColor(badge.foreground)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(
@@ -2123,6 +2127,9 @@ private struct TierBadge: View {
         Text(label)
             .font(.system(size: 9, weight: .semibold, design: .monospaced))
             .foregroundColor(style.foreground)
+            .lineLimit(1)
+            .minimumScaleFactor(0.75)
+            .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .background(
