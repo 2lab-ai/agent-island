@@ -78,7 +78,7 @@ class NotchViewModel: ObservableObject {
         case .usage:
             return CGSize(
                 width: min(screenRect.width * 0.5, 600),
-                height: 560
+                height: usageOpenedHeight
             )
         case .usageAlerts:
             return CGSize(
@@ -97,6 +97,13 @@ class NotchViewModel: ObservableObject {
                 height: 320
             )
         }
+    }
+
+    private var usageOpenedHeight: CGFloat {
+        let minHeightForTwoDashboardRows: CGFloat = 640
+        let adaptiveHeight = screenRect.height * 0.72
+        let screenLimitedHeight = max(420, screenRect.height - 72)
+        return min(max(adaptiveHeight, minHeightForTwoDashboardRows), screenLimitedHeight)
     }
 
     // MARK: - Animation
