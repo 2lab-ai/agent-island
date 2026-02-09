@@ -1852,13 +1852,6 @@ private struct UsageProviderColumn: View {
         VStack(alignment: .leading, spacing: 8) {
             header
 
-            if let claudeSubscriptionSummary {
-                Text(claudeSubscriptionSummary)
-                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                    .foregroundColor(Color.white.opacity(0.42))
-                    .lineLimit(1)
-            }
-
             UsageTokenRefreshRow(tokenRefresh: tokenRefresh, now: now)
 
             usageRows
@@ -2054,12 +2047,6 @@ private struct UsageProviderColumn: View {
         case .gemini:
             return inferGeminiTier(model: info?.model, plan: info?.plan)
         }
-    }
-
-    private var claudeSubscriptionSummary: String? {
-        guard provider == .claude else { return nil }
-        guard let tier = resolvedTier?.trimmingCharacters(in: .whitespacesAndNewlines), !tier.isEmpty else { return nil }
-        return "Plan \(tier)"
     }
 
     @ViewBuilder
