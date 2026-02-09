@@ -65,35 +65,42 @@ enum UsageFetcherError: LocalizedError {
 }
 
 final class UsageFetcher {
+    typealias DockerCheckUsageRunner = (URL, String, String?) async throws -> Data
+
     private let accountStore: AccountStore
     private let cache: UsageCache
     private let dockerImage: String
+    private let dockerRunner: DockerCheckUsageRunner?
     private let identityCache = IdentityCache()
 
     init(
         accountStore: AccountStore = AccountStore(),
         cache: UsageCache = UsageCache(),
-        dockerImage: String = "node:20-alpine"
+        dockerImage: String = "node:20-alpine",
+        dockerRunner: DockerCheckUsageRunner? = nil
     ) {
         self.accountStore = accountStore
         self.cache = cache
         self.dockerImage = dockerImage
+        self.dockerRunner = dockerRunner
     }
 
-    func fetchSnapshot(for profile: UsageProfile) async -> UsageSnapshot {
+    func fetchSnapshot(for profile: UsageProfile, forceRefresh: Bool = false) async -> UsageSnapshot {
         var tokenRefresh = UsageTokenRefresh.empty
         var cachedIdentities = UsageIdentities.empty
         var identityKey = "profile:\(profile.name)"
+        var accounts: [UsageAccount] = []
 
         do {
             let snapshot = try accountStore.loadSnapshot()
+            accounts = snapshot.accounts
             let credentials = loadCredentials(profile: profile, accounts: snapshot.accounts)
             identityKey = identityCacheKey(namespace: "profile:\(profile.name)", credentials: credentials)
 
             tokenRefresh = resolveTokenRefresh(credentials: credentials)
             cachedIdentities = await resolveIdentitiesCached(key: identityKey, credentials: credentials)
 
-            if let entry = await cache.getFresh(profileName: profile.name) {
+            if !forceRefresh, let entry = await cache.getFresh(profileName: profile.name) {
                 return UsageSnapshot(
                     profileName: profile.name,
                     output: entry.output,
@@ -106,6 +113,9 @@ final class UsageFetcher {
             }
 
             let output = try await fetchUsageFromDocker(profile: profile, accounts: snapshot.accounts)
+            let refreshedCredentials = loadCredentials(profile: profile, accounts: snapshot.accounts)
+            tokenRefresh = resolveTokenRefresh(credentials: refreshedCredentials)
+
             await cache.set(profileName: profile.name, output: output)
             let entry = await cache.getAny(profileName: profile.name)
             return UsageSnapshot(
@@ -118,6 +128,11 @@ final class UsageFetcher {
                 errorMessage: nil
             )
         } catch {
+            if !accounts.isEmpty {
+                let latestCredentials = loadCredentials(profile: profile, accounts: accounts)
+                tokenRefresh = resolveTokenRefresh(credentials: latestCredentials)
+            }
+
             let entry = await cache.getAny(profileName: profile.name)
             let identities = await identityCache.getFresh(key: identityKey) ?? cachedIdentities
             return UsageSnapshot(
@@ -132,15 +147,15 @@ final class UsageFetcher {
         }
     }
 
-    func fetchCurrentSnapshot(credentials: ExportCredentials) async -> UsageSnapshot {
+    func fetchCurrentSnapshot(credentials: ExportCredentials, forceRefresh: Bool = false) async -> UsageSnapshot {
         let cacheKey = "__current__"
         let profileName = "Current"
         let identityKey = identityCacheKey(namespace: cacheKey, credentials: credentials)
 
-        let tokenRefresh = resolveTokenRefresh(credentials: credentials)
+        var tokenRefresh = resolveTokenRefresh(credentials: credentials)
         let identities = await resolveIdentitiesCached(key: identityKey, credentials: credentials)
 
-        if let entry = await cache.getFresh(profileName: cacheKey) {
+        if !forceRefresh, let entry = await cache.getFresh(profileName: cacheKey) {
             return UsageSnapshot(
                 profileName: profileName,
                 output: entry.output,
@@ -154,6 +169,8 @@ final class UsageFetcher {
 
         do {
             let output = try await fetchUsageFromDocker(credentials: credentials)
+            tokenRefresh = resolveTokenRefresh(credentials: loadCurrentCredentialsFromHome())
+
             await cache.set(profileName: cacheKey, output: output)
             let entry = await cache.getAny(profileName: cacheKey)
             return UsageSnapshot(
@@ -166,6 +183,8 @@ final class UsageFetcher {
                 errorMessage: nil
             )
         } catch {
+            tokenRefresh = resolveTokenRefresh(credentials: loadCurrentCredentialsFromHome())
+
             let entry = await cache.getAny(profileName: cacheKey)
             return UsageSnapshot(
                 profileName: profileName,
@@ -220,27 +239,27 @@ final class UsageFetcher {
     }
 
     private func fetchUsageFromDocker(homeURL: URL) async throws -> CheckUsageOutput {
-        let scriptURL = try Self.vendoredScriptURL()
-
-        try stageVendoredScript(into: homeURL, scriptURL: scriptURL)
-
         let scriptPathInContainer = "/home/node/.agent-island-scripts/check-usage.js"
+        if dockerRunner == nil {
+            let scriptURL = try Self.vendoredScriptURL()
+            try stageVendoredScript(into: homeURL, scriptURL: scriptURL)
+        }
+
+        let runner: DockerCheckUsageRunner = dockerRunner ?? { [self] homeURL, scriptPathInContainer, dockerContext in
+            try await runDockerCheckUsage(
+                homeURL: homeURL,
+                scriptPathInContainer: scriptPathInContainer,
+                dockerContext: dockerContext
+            )
+        }
 
         let json: Data
         do {
-            json = try await runDockerCheckUsage(
-                homeURL: homeURL,
-                scriptPathInContainer: scriptPathInContainer,
-                dockerContext: nil
-            )
+            json = try await runner(homeURL, scriptPathInContainer, nil)
         } catch let error as UsageFetcherError {
             if case .dockerFailed(_, let stderr) = error,
                stderr.contains("Cannot find module") || stderr.contains("MODULE_NOT_FOUND") {
-                json = try await runDockerCheckUsage(
-                    homeURL: homeURL,
-                    scriptPathInContainer: scriptPathInContainer,
-                    dockerContext: "desktop-linux"
-                )
+                json = try await runner(homeURL, scriptPathInContainer, "desktop-linux")
             } else {
                 throw error
             }
@@ -595,6 +614,21 @@ private extension UsageFetcher {
         let root = URL(fileURLWithPath: account.rootPath, isDirectory: true)
         let url = root.appendingPathComponent(relativePath)
         return try? Data(contentsOf: url)
+    }
+
+    func loadCurrentCredentialsFromHome() -> ExportCredentials {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+
+        func read(_ relativePath: String) -> Data? {
+            let path = home.appendingPathComponent(relativePath)
+            return try? Data(contentsOf: path)
+        }
+
+        return ExportCredentials(
+            claude: read(".claude/.credentials.json"),
+            codex: read(".codex/auth.json"),
+            gemini: read(".gemini/oauth_creds.json")
+        )
     }
 
     func resolveIdentities(credentials: ExportCredentials) async -> UsageIdentities {

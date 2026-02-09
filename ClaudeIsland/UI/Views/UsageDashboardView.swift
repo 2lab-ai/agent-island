@@ -134,7 +134,7 @@ final class UsageDashboardViewModel: ObservableObject {
         isRefreshing = false
     }
 
-    func refresh(selectedProfileName: String? = nil) {
+    func refresh(selectedProfileName: String? = nil, forceRefresh: Bool = false) {
         let profilesToRefresh: [UsageProfile]
         if let selectedProfileName,
            let profile = profiles.first(where: { $0.name == selectedProfileName }) {
@@ -143,19 +143,19 @@ final class UsageDashboardViewModel: ObservableObject {
             profilesToRefresh = []
         }
 
-        startRefresh(profilesToRefresh: profilesToRefresh)
+        startRefresh(profilesToRefresh: profilesToRefresh, forceRefresh: forceRefresh)
     }
 
-    func refreshAll() {
-        startRefresh(profilesToRefresh: profiles)
+    func refreshAll(forceRefresh: Bool = false) {
+        startRefresh(profilesToRefresh: profiles, forceRefresh: forceRefresh)
     }
 
     func refreshAllIfIdle() {
         guard !isRefreshing else { return }
-        refreshAll()
+        refreshAll(forceRefresh: false)
     }
 
-    private func startRefresh(profilesToRefresh: [UsageProfile]) {
+    private func startRefresh(profilesToRefresh: [UsageProfile], forceRefresh: Bool = false) {
         refreshTask?.cancel()
         isRefreshing = true
 
@@ -166,14 +166,14 @@ final class UsageDashboardViewModel: ObservableObject {
             let credentials = exporter.loadCurrentCredentials()
             updateCurrentAccountIds(credentials: credentials)
             updateLiveProfileName()
-            let fetchedCurrent = await fetcher.fetchCurrentSnapshot(credentials: credentials)
+            let fetchedCurrent = await fetcher.fetchCurrentSnapshot(credentials: credentials, forceRefresh: forceRefresh)
             let mergedCurrent = snapshotWithRememberedIdentities(fetchedCurrent, accountIds: currentAccountIds)
             rememberIdentities(from: mergedCurrent, accountIds: currentAccountIds)
             currentSnapshot = mergedCurrent
 
             for profile in profilesToRefresh {
                 if Task.isCancelled { break }
-                let fetchedSnapshot = await fetcher.fetchSnapshot(for: profile)
+                let fetchedSnapshot = await fetcher.fetchSnapshot(for: profile, forceRefresh: forceRefresh)
                 let accountIds = UsageAccountIdSet(
                     claude: profile.claudeAccountId,
                     codex: profile.codexAccountId,
@@ -768,7 +768,7 @@ struct UsageDashboardView: View {
             .buttonStyle(.plain)
 
             Button {
-                refreshSelectedTab()
+                refreshSelectedTab(forceRefresh: true)
             } label: {
                 HStack(spacing: 6) {
                     if model.isRefreshing {
@@ -911,14 +911,14 @@ struct UsageDashboardView: View {
         refreshSelectedTab()
     }
 
-    private func refreshSelectedTab() {
+    private func refreshSelectedTab(forceRefresh: Bool = false) {
         switch selectedTab {
         case .dashboard:
-            model.refreshAll()
+            model.refreshAll(forceRefresh: forceRefresh)
         case .current:
-            model.refresh(selectedProfileName: nil)
+            model.refresh(selectedProfileName: nil, forceRefresh: forceRefresh)
         case .profile(let name):
-            model.refresh(selectedProfileName: name)
+            model.refresh(selectedProfileName: name, forceRefresh: forceRefresh)
         }
     }
 
