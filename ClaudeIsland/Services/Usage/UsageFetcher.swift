@@ -534,6 +534,22 @@ final class UsageFetcher {
         }
     }
 
+    func shouldReuseCachedIdentities(_ identities: UsageIdentities, credentials: ExportCredentials) -> Bool {
+        if credentials.claude != nil, identities.claudeEmail == nil {
+            return false
+        }
+
+        if credentials.codex != nil, identities.codexEmail == nil {
+            return false
+        }
+
+        if credentials.gemini != nil, identities.geminiEmail == nil {
+            return false
+        }
+
+        return true
+    }
+
     static func decodeUsageOutput(_ data: Data) throws -> CheckUsageOutput {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -584,7 +600,10 @@ private extension UsageFetcher {
     }
 
     func resolveIdentitiesCached(key: String, credentials: ExportCredentials) async -> UsageIdentities {
-        if let cached = await identityCache.getFresh(key: key) { return cached }
+        if let cached = await identityCache.getFresh(key: key),
+           shouldReuseCachedIdentities(cached, credentials: credentials) {
+            return cached
+        }
         let identities = await resolveIdentities(credentials: credentials)
         await identityCache.set(key: key, identities: identities)
         return identities
@@ -865,7 +884,7 @@ private extension UsageFetcher {
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.timeoutInterval = 5
+        request.timeoutInterval = 10
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("agent-island", forHTTPHeaderField: "User-Agent")

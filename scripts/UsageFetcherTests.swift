@@ -5,6 +5,7 @@ enum UsageFetcherTests {
     static func main() async throws {
         try testDecodeUsageOutput()
         try await testCacheTTL()
+        try testIncompleteIdentityCacheEntryIsNotReused()
         try await testCurrentIdentityCacheInvalidatesWhenCredentialsChange()
         try await testCurrentSnapshotForceRefreshBypassesFreshCache()
         try await testProfileTokenRefreshReflectsCredentialUpdateAfterDockerRun()
@@ -72,6 +73,50 @@ enum UsageFetcherTests {
 
         let anyAtT1 = await cache.getAny(profileName: "A")
         assert(anyAtT1 != nil)
+    }
+
+    private static func testIncompleteIdentityCacheEntryIsNotReused() throws {
+        let fetcher = UsageFetcher(
+            accountStore: AccountStore(rootDir: FileManager.default.temporaryDirectory),
+            cache: UsageCache(ttl: 0)
+        )
+
+        let claudeCredentials = ExportCredentials(
+            claude: Data("{\"claudeAiOauth\":{\"accessToken\":\"tok\"}}".utf8),
+            codex: nil,
+            gemini: nil
+        )
+        let missingClaudeIdentity = UsageIdentities(
+            claudeEmail: nil,
+            claudeTier: nil,
+            claudeIsTeam: nil,
+            codexEmail: nil,
+            geminiEmail: nil
+        )
+        assert(fetcher.shouldReuseCachedIdentities(missingClaudeIdentity, credentials: claudeCredentials) == false)
+
+        let completeClaudeIdentity = UsageIdentities(
+            claudeEmail: "ai@insightquest.io",
+            claudeTier: nil,
+            claudeIsTeam: nil,
+            codexEmail: nil,
+            geminiEmail: nil
+        )
+        assert(fetcher.shouldReuseCachedIdentities(completeClaudeIdentity, credentials: claudeCredentials) == true)
+
+        let codexCredentials = ExportCredentials(
+            claude: nil,
+            codex: Data("{\"tokens\":{\"access_token\":\"tok\",\"account_id\":\"acct\"}}".utf8),
+            gemini: nil
+        )
+        let missingCodexIdentity = UsageIdentities(
+            claudeEmail: nil,
+            claudeTier: nil,
+            claudeIsTeam: nil,
+            codexEmail: nil,
+            geminiEmail: nil
+        )
+        assert(fetcher.shouldReuseCachedIdentities(missingCodexIdentity, credentials: codexCredentials) == false)
     }
 
     private static func testCurrentIdentityCacheInvalidatesWhenCredentialsChange() async throws {
