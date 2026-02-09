@@ -75,9 +75,13 @@ enum UsageFetcherTests {
     }
 
     private static func testCurrentIdentityCacheInvalidatesWhenCredentialsChange() async throws {
+        let testHome = try makeIsolatedHome(name: "identity-cache")
+        defer { try? FileManager.default.removeItem(at: testHome) }
+
         let fetcher = UsageFetcher(
             accountStore: AccountStore(rootDir: FileManager.default.temporaryDirectory),
-            cache: UsageCache(ttl: 0)
+            cache: UsageCache(ttl: 0),
+            homeDirectory: testHome
         )
 
         let firstCredentials = ExportCredentials(
@@ -100,10 +104,14 @@ enum UsageFetcherTests {
     }
 
     private static func testCurrentSnapshotForceRefreshBypassesFreshCache() async throws {
+        let testHome = try makeIsolatedHome(name: "force-refresh")
+        defer { try? FileManager.default.removeItem(at: testHome) }
+
         let cache = UsageCache(ttl: 600)
         let fetcher = UsageFetcher(
             accountStore: AccountStore(rootDir: FileManager.default.temporaryDirectory),
-            cache: cache
+            cache: cache,
+            homeDirectory: testHome
         )
 
         let json = """
@@ -178,7 +186,8 @@ enum UsageFetcherTests {
                 }
                 """
                 return Data(json.utf8)
-            }
+            },
+            homeDirectory: root
         )
 
         let profile = UsageProfile(
@@ -249,5 +258,12 @@ enum UsageFetcherTests {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
+    }
+
+    private static func makeIsolatedHome(name: String) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("usage-fetcher-home-\(name)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
     }
 }

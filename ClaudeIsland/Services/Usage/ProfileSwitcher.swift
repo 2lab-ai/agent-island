@@ -115,7 +115,8 @@ final class ProfileSwitcher {
         var warnings: [String] = []
         var accountsWritten: [UsageAccount] = []
 
-        var profile = UsageProfile(name: trimmed, claudeAccountId: nil, codexAccountId: nil, geminiAccountId: nil)
+        var profile = snapshot.profiles.first(where: { $0.name == trimmed })
+            ?? UsageProfile(name: trimmed, claudeAccountId: nil, codexAccountId: nil, geminiAccountId: nil)
 
         let now = Date()
         if let data = credentials.claude {
@@ -137,19 +138,23 @@ final class ProfileSwitcher {
         }
 
         if let data = credentials.codex {
-            let (account, written) = try writeAccount(
-                service: .codex,
-                data: data,
-                updatedAt: now,
-                snapshot: &snapshot
-            )
-            profile = UsageProfile(
-                name: trimmed,
-                claudeAccountId: profile.claudeAccountId,
-                codexAccountId: account.id,
-                geminiAccountId: profile.geminiAccountId
-            )
-            if written { accountsWritten.append(account) }
+            if hasCodexRequiredTokens(data) {
+                let (account, written) = try writeAccount(
+                    service: .codex,
+                    data: data,
+                    updatedAt: now,
+                    snapshot: &snapshot
+                )
+                profile = UsageProfile(
+                    name: trimmed,
+                    claudeAccountId: profile.claudeAccountId,
+                    codexAccountId: account.id,
+                    geminiAccountId: profile.geminiAccountId
+                )
+                if written { accountsWritten.append(account) }
+            } else {
+                warnings.append("Codex credentials incomplete (missing tokens.access_token/account_id/id_token)")
+            }
         } else {
             warnings.append("Codex credentials not found")
         }
@@ -219,10 +224,10 @@ final class ProfileSwitcher {
                 let src = URL(fileURLWithPath: account.rootPath, isDirectory: true)
                     .appendingPathComponent(".codex/auth.json")
                 let dst = activeHomeDir.appendingPathComponent(".codex/auth.json")
-                if copyCredentialFileIfPresent(from: src, to: dst) {
+                if copyCodexCredentialFileIfPresent(from: src, to: dst) {
                     codexSwitched = true
                 } else {
-                    warnings.append("Codex credentials missing for account \(id)")
+                    warnings.append("Codex credentials missing or invalid for account \(id)")
                 }
             } else {
                 warnings.append("Codex account not found: \(id)")
@@ -308,16 +313,85 @@ final class ProfileSwitcher {
         guard fileManager.fileExists(atPath: sourceURL.path) else { return false }
 
         do {
-            try fileManager.createDirectory(
-                at: destinationURL.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
             let data = try Data(contentsOf: sourceURL)
-            try data.write(to: destinationURL, options: [.atomic])
-            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destinationURL.path)
+            try writeCredentialData(data, to: destinationURL)
             return true
         } catch {
             return false
         }
+    }
+
+    private func copyCodexCredentialFileIfPresent(from sourceURL: URL, to destinationURL: URL) -> Bool {
+        guard fileManager.fileExists(atPath: sourceURL.path) else { return false }
+
+        do {
+            let sourceData = try Data(contentsOf: sourceURL)
+            guard var root = parseJSONObject(sourceData),
+                  var sourceTokens = root["tokens"] as? [String: Any]
+            else {
+                return false
+            }
+
+            if normalizedCodexToken(sourceTokens["id_token"]) == nil {
+                guard
+                    let sourceAccountId = normalizedCodexToken(sourceTokens["account_id"]),
+                    let destinationData = try? Data(contentsOf: destinationURL),
+                    let destinationRoot = parseJSONObject(destinationData),
+                    let destinationTokens = destinationRoot["tokens"] as? [String: Any],
+                    let destinationAccountId = normalizedCodexToken(destinationTokens["account_id"]),
+                    let destinationIDToken = normalizedCodexToken(destinationTokens["id_token"]),
+                    sourceAccountId == destinationAccountId
+                else {
+                    return false
+                }
+
+                sourceTokens["id_token"] = destinationIDToken
+                if sourceTokens["refresh_token"] == nil,
+                   let destinationRefreshToken = normalizedCodexToken(destinationTokens["refresh_token"]) {
+                    sourceTokens["refresh_token"] = destinationRefreshToken
+                }
+                root["tokens"] = sourceTokens
+            }
+
+            guard hasCodexRequiredTokens(root) else { return false }
+
+            let mergedData = try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+            try writeCredentialData(mergedData, to: destinationURL)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func writeCredentialData(_ data: Data, to destinationURL: URL) throws {
+        try fileManager.createDirectory(
+            at: destinationURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: destinationURL, options: [.atomic])
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destinationURL.path)
+    }
+
+    private func hasCodexRequiredTokens(_ data: Data) -> Bool {
+        guard let root = parseJSONObject(data) else { return false }
+        return hasCodexRequiredTokens(root)
+    }
+
+    private func hasCodexRequiredTokens(_ root: [String: Any]) -> Bool {
+        guard let tokens = root["tokens"] as? [String: Any] else { return false }
+        return normalizedCodexToken(tokens["access_token"]) != nil &&
+            normalizedCodexToken(tokens["account_id"]) != nil &&
+            normalizedCodexToken(tokens["id_token"]) != nil
+    }
+
+    private func parseJSONObject(_ data: Data) -> [String: Any]? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        return json as? [String: Any]
+    }
+
+    private func normalizedCodexToken(_ value: Any?) -> String? {
+        guard let raw = value as? String else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

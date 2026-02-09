@@ -71,18 +71,21 @@ final class UsageFetcher {
     private let cache: UsageCache
     private let dockerImage: String
     private let dockerRunner: DockerCheckUsageRunner?
+    private let homeDirectory: URL
     private let identityCache = IdentityCache()
 
     init(
         accountStore: AccountStore = AccountStore(),
         cache: UsageCache = UsageCache(),
         dockerImage: String = "node:20-alpine",
-        dockerRunner: DockerCheckUsageRunner? = nil
+        dockerRunner: DockerCheckUsageRunner? = nil,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) {
         self.accountStore = accountStore
         self.cache = cache
         self.dockerImage = dockerImage
         self.dockerRunner = dockerRunner
+        self.homeDirectory = homeDirectory
     }
 
     func fetchSnapshot(for profile: UsageProfile, forceRefresh: Bool = false) async -> UsageSnapshot {
@@ -280,7 +283,7 @@ final class UsageFetcher {
     }
 
     private func buildTempHome(profile: UsageProfile, accounts: [UsageAccount]) throws -> TempHomeBuildResult {
-        let root = FileManager.default.homeDirectoryForCurrentUser
+        let root = homeDirectory
             .appendingPathComponent(".agent-island/tmp-homes", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
@@ -327,14 +330,14 @@ final class UsageFetcher {
             throw UsageFetcherError.noCredentialsFound
         }
 
-        let root = FileManager.default.homeDirectoryForCurrentUser
+        let root = homeDirectory
             .appendingPathComponent(".agent-island/tmp-homes", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         let tempHome = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempHome, withIntermediateDirectories: true)
 
-        let activeHome = FileManager.default.homeDirectoryForCurrentUser
+        let activeHome = homeDirectory
         var syncTargets: [CredentialSyncTarget] = []
 
         if let claudeData = credentials.claude {
@@ -617,7 +620,7 @@ private extension UsageFetcher {
     }
 
     func loadCurrentCredentialsFromHome() -> ExportCredentials {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        let home = homeDirectory
 
         func read(_ relativePath: String) -> Data? {
             let path = home.appendingPathComponent(relativePath)
