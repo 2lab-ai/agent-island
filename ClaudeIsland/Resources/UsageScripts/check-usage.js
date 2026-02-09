@@ -16,6 +16,7 @@ import { join } from "path";
 import { homedir } from "os";
 var KEYCHAIN_CACHE_TTL_MS = 1e4;
 var CLAUDE_TOKEN_REFRESH_BUFFER_MS = 7 * 60 * 60 * 1e3;
+var CLAUDE_KEYCHAIN_SERVICE_NAME = "Claude Code-credentials";
 var CLAUDE_OAUTH_CLIENT_ID = process.env.CLAUDE_CODE_OAUTH_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 var CLAUDE_TOKEN_ENDPOINT = process.env.CLAUDE_CODE_TOKEN_URL || "https://platform.claude.com/v1/oauth/token";
 var CLAUDE_DEFAULT_SCOPE = "user:profile user:inference user:sessions:claude_code user:mcp_servers";
@@ -38,7 +39,7 @@ async function getCredentialsFromKeychain() {
   try {
     const result = execFileSync(
       "security",
-      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      ["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE_NAME, "-w"],
       { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
     ).trim();
     const parsed = parseClaudeCredentials(JSON.parse(result));
@@ -46,6 +47,78 @@ async function getCredentialsFromKeychain() {
     return parsed;
   } catch {
     return await getCredentialsFromFile();
+  }
+}
+function getClaudeKeychainAccountName() {
+  if (process.platform !== "darwin") {
+    return null;
+  }
+  try {
+    const metadata = execFileSync(
+      "security",
+      ["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE_NAME],
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+    );
+    const accountMatch = metadata.match(/"acct"<blob>="([^"]+)"/);
+    if (accountMatch?.[1]) {
+      return accountMatch[1];
+    }
+  } catch {
+  }
+  return null;
+}
+function getCurrentClaudeKeychainRoot() {
+  if (process.platform !== "darwin") {
+    return null;
+  }
+  try {
+    const raw = execFileSync(
+      "security",
+      ["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE_NAME, "-w"],
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+    ).trim();
+    if (!raw) {
+      return null;
+    }
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+function saveClaudeCredentialsToKeychain(root) {
+  if (process.platform !== "darwin") {
+    return;
+  }
+  try {
+    const existingRoot = getCurrentClaudeKeychainRoot() ?? {};
+    const existingOauth = existingRoot?.claudeAiOauth ?? {};
+    const nextOauth = root?.claudeAiOauth ?? {};
+    const mergedRoot = {
+      ...existingRoot,
+      ...root,
+      claudeAiOauth: {
+        ...existingOauth,
+        ...nextOauth
+      }
+    };
+    const account = getClaudeKeychainAccountName() || process.env.USER || "default";
+    execFileSync(
+      "security",
+      [
+        "add-generic-password",
+        "-U",
+        "-a",
+        account,
+        "-s",
+        CLAUDE_KEYCHAIN_SERVICE_NAME,
+        "-w",
+        JSON.stringify(mergedRoot)
+      ],
+      { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
+    );
+    debugLog("claude", "saveClaudeCredentialsToKeychain: saved");
+  } catch (err) {
+    debugLog("claude", "saveClaudeCredentialsToKeychain: error", err);
   }
 }
 async function getCredentialsFromFile() {
@@ -230,6 +303,7 @@ async function saveClaudeCredentialsToFile(credentials, rawResponse) {
     }
     await writeFile(credPath, JSON.stringify(nextRoot, null, 2), { mode: 384 });
     debugLog("claude", "saveClaudeCredentialsToFile: saved");
+    saveClaudeCredentialsToKeychain(nextRoot);
   } catch (err) {
     debugLog("claude", "saveClaudeCredentialsToFile: error", err);
   }
