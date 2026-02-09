@@ -85,17 +85,8 @@ actor UsageIdentityStore {
     func update(accountId: String, email: String?, tier: String?, claudeIsTeam: Bool?) throws {
         try loadIfNeeded()
 
-        let normalizedEmail: String? = {
-            guard let email else { return nil }
-            let trimmed = email.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }()
-
-        let normalizedTier: String? = {
-            guard let tier else { return nil }
-            let trimmed = tier.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
-        }()
+        let normalizedEmail = normalizedIdentityEmail(email)
+        let normalizedTier = normalizedIdentityValue(tier)
 
         var next = identities[accountId] ?? Identity(email: nil, tier: nil, plan: nil, claudeIsTeam: nil)
         var changed = false
@@ -115,8 +106,17 @@ actor UsageIdentityStore {
             changed = true
         }
 
-        guard changed else { return }
-        identities[accountId] = next
+        var shouldSave = false
+        if changed {
+            identities[accountId] = next
+            shouldSave = true
+        }
+
+        if dedupeIdentities(preferredAccountId: accountId) {
+            shouldSave = true
+        }
+
+        guard shouldSave else { return }
         try save()
     }
 
@@ -174,7 +174,8 @@ actor UsageIdentityStore {
 
         // Schema upgrade: older files won't include `plan`. Re-write once so the field is present (as null) for
         // easy manual editing.
-        if !hadPlanKey {
+        let deduped = dedupeIdentities()
+        if !hadPlanKey || deduped {
             try save()
         }
     }
@@ -187,5 +188,109 @@ actor UsageIdentityStore {
         try data.write(to: fileURL, options: [.atomic])
         // Best-effort: keep this file user-readable only.
         try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+    }
+
+    private struct IdentitySignature: Hashable {
+        let service: UsageService
+        let email: String
+        let claudeType: String?
+    }
+
+    private func dedupeIdentities(preferredAccountId: String? = nil) -> Bool {
+        var idsBySignature: [IdentitySignature: [String]] = [:]
+        for (accountId, identity) in identities {
+            guard let signature = identitySignature(accountId: accountId, identity: identity) else { continue }
+            idsBySignature[signature, default: []].append(accountId)
+        }
+
+        var changed = false
+        for ids in idsBySignature.values {
+            guard ids.count > 1 else { continue }
+
+            let canonicalId = canonicalAccountId(from: ids, preferredAccountId: preferredAccountId)
+            var merged = Identity(email: nil, tier: nil, plan: nil, claudeIsTeam: nil)
+            for id in ids.sorted() {
+                guard let identity = identities[id] else { continue }
+                merged = mergedIdentity(base: merged, next: identity)
+            }
+
+            if identities[canonicalId] != merged {
+                identities[canonicalId] = merged
+                changed = true
+            }
+
+            for id in ids where id != canonicalId {
+                if identities.removeValue(forKey: id) != nil {
+                    changed = true
+                }
+            }
+        }
+
+        return changed
+    }
+
+    private func identitySignature(accountId: String, identity: Identity) -> IdentitySignature? {
+        guard let service = service(fromAccountId: accountId) else { return nil }
+        guard let email = normalizedIdentityEmail(identity.email) else { return nil }
+
+        if service == .claude {
+            let claudeType: String
+            if let isTeam = identity.claudeIsTeam {
+                claudeType = isTeam ? "team" : "personal"
+            } else {
+                claudeType = "unknown"
+            }
+            return IdentitySignature(service: service, email: email, claudeType: claudeType)
+        }
+
+        return IdentitySignature(service: service, email: email, claudeType: nil)
+    }
+
+    private func canonicalAccountId(from ids: [String], preferredAccountId: String?) -> String {
+        if let preferredAccountId, ids.contains(preferredAccountId) {
+            return preferredAccountId
+        }
+        return ids.sorted().first ?? ids[0]
+    }
+
+    private func mergedIdentity(base: Identity, next: Identity) -> Identity {
+        var merged = base
+
+        if merged.email == nil {
+            merged.email = normalizedIdentityEmail(next.email)
+        }
+
+        if merged.tier == nil {
+            merged.tier = normalizedIdentityValue(next.tier)
+        }
+
+        if merged.plan == nil {
+            merged.plan = normalizedIdentityValue(next.plan)
+        }
+
+        if merged.claudeIsTeam == nil {
+            merged.claudeIsTeam = next.claudeIsTeam
+        }
+
+        return merged
+    }
+
+    private func service(fromAccountId accountId: String) -> UsageService? {
+        if accountId.hasPrefix("acct_claude_") { return .claude }
+        if accountId.hasPrefix("acct_codex_") { return .codex }
+        if accountId.hasPrefix("acct_gemini_") { return .gemini }
+        return nil
+    }
+
+    private func normalizedIdentityEmail(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func normalizedIdentityValue(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

@@ -336,7 +336,8 @@ final class UsageDashboardViewModel: ObservableObject {
                 currentCodexAccountId: currentAccountIds.codex,
                 currentGeminiAccountId: currentAccountIds.gemini,
                 profile: profile,
-                emailByAccountId: lastKnownEmailByAccountId
+                emailByAccountId: lastKnownEmailByAccountId,
+                claudeTeamByAccountId: lastKnownClaudeIsTeamByAccountId
             )
         }?.name
     }
@@ -1109,7 +1110,8 @@ struct UsageDashboardView: View {
             UsageAccountIdentityMatcher.identityKey(
                 service: service(for: tile.provider),
                 accountId: tile.accountId,
-                email: tile.email
+                email: tile.email,
+                claudeIsTeam: tile.claudeIsTeam
             )
         }
 
