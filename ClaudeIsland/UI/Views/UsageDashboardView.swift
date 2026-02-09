@@ -187,15 +187,21 @@ final class UsageDashboardViewModel: ObservableObject {
     }
 
     private func updateCurrentAccountIds(credentials: ExportCredentials) {
+        let previous = currentAccountIds
         let computed = computeAccountIds(credentials: credentials)
+        let next: UsageAccountIdSet
+
         if computed.hasAny {
             lastKnownCurrentAccountIds = computed
-            currentAccountIds = computed
+            next = computed
         } else if lastKnownCurrentAccountIds.hasAny {
-            currentAccountIds = lastKnownCurrentAccountIds
+            next = lastKnownCurrentAccountIds
         } else {
-            currentAccountIds = computed
+            next = computed
         }
+
+        currentAccountIds = next
+        invalidateCurrentIdentityCacheIfNeeded(previous: previous, next: next)
     }
 
     private func computeAccountIds(credentials: ExportCredentials) -> UsageAccountIdSet {
@@ -204,6 +210,32 @@ final class UsageDashboardViewModel: ObservableObject {
             codex: credentials.codex.map { UsageCredentialHasher.fingerprint(service: .codex, data: $0).accountId },
             gemini: credentials.gemini.map { UsageCredentialHasher.fingerprint(service: .gemini, data: $0).accountId }
         )
+    }
+
+    private func invalidateCurrentIdentityCacheIfNeeded(previous: UsageAccountIdSet, next: UsageAccountIdSet) {
+        guard previous != next else { return }
+
+        if previous.claude != next.claude, let accountId = next.claude {
+            invalidateCachedIdentity(for: accountId)
+        }
+
+        if previous.codex != next.codex, let accountId = next.codex {
+            invalidateCachedIdentity(for: accountId)
+        }
+
+        if previous.gemini != next.gemini, let accountId = next.gemini {
+            invalidateCachedIdentity(for: accountId)
+        }
+    }
+
+    private func invalidateCachedIdentity(for accountId: String) {
+        lastKnownEmailByAccountId.removeValue(forKey: accountId)
+        lastKnownTierByAccountId.removeValue(forKey: accountId)
+        lastKnownClaudeIsTeamByAccountId.removeValue(forKey: accountId)
+
+        Task { [identityStore] in
+            try? await identityStore.invalidateCachedIdentity(accountId: accountId)
+        }
     }
 
     private func snapshotWithRememberedIdentities(_ snapshot: UsageSnapshot, accountIds: UsageAccountIdSet) -> UsageSnapshot {
@@ -298,7 +330,20 @@ final class UsageDashboardViewModel: ObservableObject {
             return
         }
 
-        liveProfileName = profiles.first(where: { currentAccountIds.matches(profile: $0) })?.name
+        liveProfileName = profiles.first { profile in
+            UsageAccountIdentityMatcher.matchesProfile(
+                currentClaudeAccountId: currentAccountIds.claude,
+                currentCodexAccountId: currentAccountIds.codex,
+                currentGeminiAccountId: currentAccountIds.gemini,
+                profile: profile,
+                emailByAccountId: lastKnownEmailByAccountId
+            )
+        }?.name
+    }
+
+    func rememberedEmail(for accountId: String?) -> String? {
+        guard let accountId else { return nil }
+        return lastKnownEmailByAccountId[accountId]
     }
 
     func saveProfile(named name: String) async -> Bool {
@@ -1052,13 +1097,30 @@ struct UsageDashboardView: View {
             return value
         }
 
+        func service(for provider: UsageProvider) -> UsageService {
+            switch provider {
+            case .claude: return .claude
+            case .codex: return .codex
+            case .gemini: return .gemini
+            }
+        }
+
+        func dedupeKey(for tile: UsageAccountTile) -> String {
+            UsageAccountIdentityMatcher.identityKey(
+                service: service(for: tile.provider),
+                accountId: tile.accountId,
+                email: tile.email
+            )
+        }
+
         func consider(_ tile: UsageAccountTile) {
-            if let existing = tilesByKey[tile.id] {
+            let key = dedupeKey(for: tile)
+            if let existing = tilesByKey[key] {
                 if score(tile) > score(existing) {
-                    tilesByKey[tile.id] = tile
+                    tilesByKey[key] = tile
                 }
             } else {
-                tilesByKey[tile.id] = tile
+                tilesByKey[key] = tile
             }
         }
 
@@ -1072,7 +1134,7 @@ struct UsageDashboardView: View {
                         provider: .claude,
                         accountId: accountId,
                         label: profile.name,
-                        email: snapshot?.identities.claudeEmail,
+                        email: snapshot?.identities.claudeEmail ?? model.rememberedEmail(for: accountId),
                         tier: snapshot?.identities.claudeTier,
                         claudeIsTeam: snapshot?.identities.claudeIsTeam,
                         tokenRefresh: snapshot?.tokenRefresh.claude,
@@ -1089,7 +1151,7 @@ struct UsageDashboardView: View {
                         provider: .codex,
                         accountId: accountId,
                         label: profile.name,
-                        email: snapshot?.identities.codexEmail,
+                        email: snapshot?.identities.codexEmail ?? model.rememberedEmail(for: accountId),
                         tier: nil,
                         claudeIsTeam: nil,
                         tokenRefresh: snapshot?.tokenRefresh.codex,
@@ -1106,7 +1168,7 @@ struct UsageDashboardView: View {
                         provider: .gemini,
                         accountId: accountId,
                         label: profile.name,
-                        email: snapshot?.identities.geminiEmail,
+                        email: snapshot?.identities.geminiEmail ?? model.rememberedEmail(for: accountId),
                         tier: nil,
                         claudeIsTeam: nil,
                         tokenRefresh: snapshot?.tokenRefresh.gemini,
@@ -1128,7 +1190,7 @@ struct UsageDashboardView: View {
                         provider: .claude,
                         accountId: accountId,
                         label: "Current",
-                        email: snapshot?.identities.claudeEmail,
+                        email: snapshot?.identities.claudeEmail ?? model.rememberedEmail(for: accountId),
                         tier: snapshot?.identities.claudeTier,
                         claudeIsTeam: snapshot?.identities.claudeIsTeam,
                         tokenRefresh: snapshot?.tokenRefresh.claude,
@@ -1145,7 +1207,7 @@ struct UsageDashboardView: View {
                         provider: .codex,
                         accountId: accountId,
                         label: "Current",
-                        email: snapshot?.identities.codexEmail,
+                        email: snapshot?.identities.codexEmail ?? model.rememberedEmail(for: accountId),
                         tier: nil,
                         claudeIsTeam: nil,
                         tokenRefresh: snapshot?.tokenRefresh.codex,
@@ -1162,7 +1224,7 @@ struct UsageDashboardView: View {
                         provider: .gemini,
                         accountId: accountId,
                         label: "Current",
-                        email: snapshot?.identities.geminiEmail,
+                        email: snapshot?.identities.geminiEmail ?? model.rememberedEmail(for: accountId),
                         tier: nil,
                         claudeIsTeam: nil,
                         tokenRefresh: snapshot?.tokenRefresh.gemini,
