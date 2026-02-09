@@ -8,6 +8,7 @@ enum UsageFetcherTests {
         try testIncompleteIdentityCacheEntryIsNotReused()
         try await testCurrentIdentityCacheInvalidatesWhenCredentialsChange()
         try await testCurrentSnapshotForceRefreshBypassesFreshCache()
+        try await testClaudeSubscriptionMetadataFallbackFromCredentials()
         try await testProfileTokenRefreshReflectsCredentialUpdateAfterDockerRun()
         print("OK")
     }
@@ -178,6 +179,57 @@ enum UsageFetcherTests {
 
         let forced = await fetcher.fetchCurrentSnapshot(credentials: empty, forceRefresh: true)
         assert(forced.isStale == true, "Expected forced refresh to bypass cache and fail into stale fallback with empty credentials.")
+    }
+
+    private static func testClaudeSubscriptionMetadataFallbackFromCredentials() async throws {
+        let cache = UsageCache(ttl: 600)
+        let fetcher = UsageFetcher(
+            accountStore: AccountStore(rootDir: FileManager.default.temporaryDirectory),
+            cache: cache
+        )
+
+        let json = """
+        {
+          "claude": { "name": "Claude", "available": true, "error": false },
+          "codex": null,
+          "gemini": null,
+          "zai": null,
+          "recommendation": null,
+          "recommendationReason": "n/a"
+        }
+        """
+        let output = try UsageFetcher.decodeUsageOutput(Data(json.utf8))
+        await cache.set(profileName: "__current__", output: output)
+
+        let max20Creds = Data("""
+        {
+          "claudeAiOauth": {
+            "subscriptionType": "max",
+            "rateLimitTier": "default_claude_max_20x"
+          }
+        }
+        """.utf8)
+
+        let max20Snapshot = await fetcher.fetchCurrentSnapshot(
+            credentials: ExportCredentials(claude: max20Creds, codex: nil, gemini: nil)
+        )
+        assert(max20Snapshot.identities.claudeTier == "Max 20x", "Expected Max 20x tier from local credentials metadata.")
+        assert(max20Snapshot.identities.claudeIsTeam == false, "Expected non-team for subscriptionType=max.")
+
+        let team5Creds = Data("""
+        {
+          "claudeAiOauth": {
+            "subscriptionType": "team",
+            "rateLimitTier": "default_claude_max_5x"
+          }
+        }
+        """.utf8)
+
+        let team5Snapshot = await fetcher.fetchCurrentSnapshot(
+            credentials: ExportCredentials(claude: team5Creds, codex: nil, gemini: nil)
+        )
+        assert(team5Snapshot.identities.claudeTier == "Max 5x", "Expected Max 5x tier from local credentials metadata.")
+        assert(team5Snapshot.identities.claudeIsTeam == true, "Expected team account for subscriptionType=team.")
     }
 
     private static func testProfileTokenRefreshReflectsCredentialUpdateAfterDockerRun() async throws {

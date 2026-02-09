@@ -674,17 +674,107 @@ private extension UsageFetcher {
         let isTeam: Bool?
     }
 
+    struct ClaudeCredentialMetadata {
+        let email: String?
+        let tier: String?
+        let isTeam: Bool?
+    }
+
     func resolveClaudeProfile(credentials: Data?) async -> ClaudeProfile {
+        let metadata = resolveClaudeCredentialMetadata(credentials: credentials)
+
         guard let token = extractClaudeAccessToken(credentials: credentials) else {
-            return ClaudeProfile(email: nil, tier: nil, isTeam: nil)
+            return ClaudeProfile(
+                email: metadata.email,
+                tier: metadata.tier,
+                isTeam: metadata.isTeam
+            )
         }
 
         let profile = await fetchClaudeProfile(accessToken: token)
         return ClaudeProfile(
-            email: profile.email,
-            tier: profile.tier,
-            isTeam: profile.isTeam
+            email: profile.email ?? metadata.email,
+            tier: profile.tier ?? metadata.tier,
+            isTeam: profile.isTeam ?? metadata.isTeam
         )
+    }
+
+    func resolveClaudeCredentialMetadata(credentials: Data?) -> ClaudeCredentialMetadata {
+        guard let credentials else {
+            return ClaudeCredentialMetadata(email: nil, tier: nil, isTeam: nil)
+        }
+
+        guard let root = try? JSONSerialization.jsonObject(with: credentials) as? [String: Any] else {
+            return ClaudeCredentialMetadata(email: nil, tier: nil, isTeam: nil)
+        }
+
+        let oauth = root["claudeAiOauth"] as? [String: Any] ?? [:]
+
+        let email: String? = {
+            if let account = root["account"] as? [String: Any],
+               let raw = account["email"] as? String,
+               let extracted = extractEmailAddress(from: raw) {
+                return extracted
+            }
+            if let account = oauth["account"] as? [String: Any],
+               let raw = account["email"] as? String,
+               let extracted = extractEmailAddress(from: raw) {
+                return extracted
+            }
+            if let raw = root["email"] as? String,
+               let extracted = extractEmailAddress(from: raw) {
+                return extracted
+            }
+            if let raw = oauth["email"] as? String,
+               let extracted = extractEmailAddress(from: raw) {
+                return extracted
+            }
+            return nil
+        }()
+
+        let subscriptionType = normalizedString(oauth["subscriptionType"])
+            ?? normalizedString(root["subscriptionType"])
+        let rateLimitTier = normalizedString(oauth["rateLimitTier"])
+            ?? normalizedString(root["rateLimitTier"])
+        let tier = resolveClaudeTier(subscriptionType: subscriptionType, rateLimitTier: rateLimitTier)
+        let isTeam = resolveClaudeIsTeam(root: root, oauth: oauth, subscriptionType: subscriptionType)
+
+        return ClaudeCredentialMetadata(email: email, tier: tier, isTeam: isTeam)
+    }
+
+    func resolveClaudeTier(subscriptionType: String?, rateLimitTier: String?) -> String? {
+        if let rateLimitTier,
+           let normalized = normalizeClaudeTier(string: rateLimitTier) {
+            return normalized
+        }
+
+        guard let subscriptionType else { return nil }
+        let lowered = subscriptionType.lowercased()
+        if lowered.contains("pro") { return "Pro" }
+        if lowered.contains("max") { return "Max" }
+        return nil
+    }
+
+    func resolveClaudeIsTeam(root: [String: Any], oauth: [String: Any], subscriptionType: String?) -> Bool? {
+        if let org = root["organization"] as? [String: Any],
+           let orgType = org["organization_type"] as? String {
+            return orgType.lowercased().contains("team")
+        }
+
+        if let org = oauth["organization"] as? [String: Any],
+           let orgType = org["organization_type"] as? String {
+            return orgType.lowercased().contains("team")
+        }
+
+        if let bool = parseBoolean(oauth["isTeam"]) ?? parseBoolean(root["isTeam"]) {
+            return bool
+        }
+
+        if let subscriptionType {
+            return subscriptionType.lowercased().contains("team")
+        }
+
+        return nil
     }
 
     // MARK: - Token Refresh
@@ -867,6 +957,24 @@ private extension UsageFetcher {
         if let double = value as? Double { return double }
         if let int = value as? Int { return Double(int) }
         if let string = value as? String { return Double(string) }
+        return nil
+    }
+
+    func normalizedString(_ value: Any?) -> String? {
+        guard let raw = value as? String else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    func parseBoolean(_ value: Any?) -> Bool? {
+        if let bool = value as? Bool { return bool }
+        if let number = value as? NSNumber { return number.boolValue }
+        if let string = normalizedString(value) {
+            let lowered = string.lowercased()
+            if lowered == "true" || lowered == "1" || lowered == "yes" { return true }
+            if lowered == "false" || lowered == "0" || lowered == "no" { return false }
+            if lowered.contains("team") { return true }
+        }
         return nil
     }
 

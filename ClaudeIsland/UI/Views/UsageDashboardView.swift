@@ -107,6 +107,16 @@ final class UsageDashboardViewModel: ObservableObject {
     func load() {
         do {
             loadErrorMessage = nil
+            do {
+                let migrated = try switcher.migrateStoredClaudeAccountsUsingIdentityCache()
+                if migrated {
+                    Task { [weak self] in
+                        await self?.reloadClaudeCodeTokenStatuses(silent: true)
+                    }
+                }
+            } catch {
+                lastActionMessage = error.localizedDescription
+            }
             profiles = try profileStore.loadProfiles()
         } catch {
             loadErrorMessage = error.localizedDescription
@@ -1842,6 +1852,13 @@ private struct UsageProviderColumn: View {
         VStack(alignment: .leading, spacing: 8) {
             header
 
+            if let claudeSubscriptionSummary {
+                Text(claudeSubscriptionSummary)
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundColor(Color.white.opacity(0.42))
+                    .lineLimit(1)
+            }
+
             UsageTokenRefreshRow(tokenRefresh: tokenRefresh, now: now)
 
             usageRows
@@ -1977,6 +1994,7 @@ private struct UsageProviderColumn: View {
         if normalized.contains("max20") || (hasToken("max") && (hasToken("20x") || hasToken("20"))) { return "Max20" }
         if normalized.contains("max5") || (hasToken("max") && (hasToken("5x") || hasToken("5"))) { return "Max5" }
         if hasToken("pro") { return "Pro" }
+        if hasToken("max") || normalized.contains("max") { return "Max" }
 
         return nil
     }
@@ -2036,6 +2054,12 @@ private struct UsageProviderColumn: View {
         case .gemini:
             return inferGeminiTier(model: info?.model, plan: info?.plan)
         }
+    }
+
+    private var claudeSubscriptionSummary: String? {
+        guard provider == .claude else { return nil }
+        guard let tier = resolvedTier?.trimmingCharacters(in: .whitespacesAndNewlines), !tier.isEmpty else { return nil }
+        return "Plan \(tier)"
     }
 
     @ViewBuilder
@@ -2124,6 +2148,7 @@ private struct TierBadge: View {
         let lowered = tier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if lowered.contains("max") && lowered.contains("20") { return "Max20" }
         if lowered.contains("max") && lowered.contains("5") { return "Max5" }
+        if lowered.contains("max") { return "Max" }
         if lowered.contains("plus") { return "Plus" }
         if lowered.contains("pro") { return "Pro" }
         if lowered.contains("flash") { return "Flash" }
@@ -2140,6 +2165,7 @@ private struct TierBadge: View {
             if key == "pro" { return (Color.white.opacity(0.9), Color.black.opacity(0.85)) }
             if key == "max5" { return (TerminalColors.amber, Color.black.opacity(0.85)) }
             if key == "max20" { return (TerminalColors.red, Color.white.opacity(0.9)) }
+            if key == "max" { return (TerminalColors.red.opacity(0.85), Color.white.opacity(0.9)) }
         case .codex:
             if key == "plus" { return (Color.white.opacity(0.9), Color.black.opacity(0.85)) }
             if key == "pro" { return (TerminalColors.red, Color.white.opacity(0.9)) }

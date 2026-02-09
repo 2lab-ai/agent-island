@@ -7,6 +7,7 @@ enum ProfileSwitcherTests {
         try testStableFingerprintForCodexAccountID()
         try testSaveProfileSkipsIncompleteCodexCredentials()
         try testSwitchToProfileBackfillsMissingCodexIDToken()
+        try testMigrateStoredClaudeAccountsToCanonicalIDs()
 
         let fm = FileManager.default
         let home = URL(fileURLWithPath: "/tmp/claude-island-profile-switcher-home", isDirectory: true)
@@ -184,6 +185,114 @@ enum ProfileSwitcherTests {
         assert(activeTokens["account_id"] as? String == "acct-same")
         assert(activeTokens["id_token"] as? String == "id-stable")
         assert(activeTokens["refresh_token"] as? String == "refresh-stable")
+    }
+
+    private static func testMigrateStoredClaudeAccountsToCanonicalIDs() throws {
+        let fm = FileManager.default
+        let home = URL(fileURLWithPath: "/tmp/claude-island-profile-switcher-claude-migrate", isDirectory: true)
+        if fm.fileExists(atPath: home.path) {
+            try fm.removeItem(at: home)
+        }
+        try fm.createDirectory(at: home, withIntermediateDirectories: true)
+
+        let root = home.appendingPathComponent(".agent-island", isDirectory: true)
+        let accountsDir = root.appendingPathComponent("accounts", isDirectory: true)
+        try fm.createDirectory(at: accountsDir, withIntermediateDirectories: true)
+
+        let store = AccountStore(rootDir: root)
+        let switcher = ProfileSwitcher(accountStore: store, exporter: CredentialExporter(), activeHomeDir: home)
+
+        let oldA = "acct_claude_old_a"
+        let oldB = "acct_claude_old_b"
+        let canonical = "acct_claude_z_insightquest_io"
+
+        let oldARoot = accountsDir.appendingPathComponent(oldA, isDirectory: true)
+        let oldBRoot = accountsDir.appendingPathComponent(oldB, isDirectory: true)
+        try fm.createDirectory(at: oldARoot.appendingPathComponent(".claude", isDirectory: true), withIntermediateDirectories: true)
+        try fm.createDirectory(at: oldBRoot.appendingPathComponent(".claude", isDirectory: true), withIntermediateDirectories: true)
+
+        let oldACreds = Data("{\"claudeAiOauth\":{\"accessToken\":\"at-a\",\"refreshToken\":\"rt-a\"}}".utf8)
+        let oldBCreds = Data("{\"claudeAiOauth\":{\"accessToken\":\"at-b\",\"refreshToken\":\"rt-b\"}}".utf8)
+        try oldACreds.write(to: oldARoot.appendingPathComponent(".claude/.credentials.json"), options: [.atomic])
+        try oldBCreds.write(to: oldBRoot.appendingPathComponent(".claude/.credentials.json"), options: [.atomic])
+
+        let now = Date()
+        let snapshot = AccountsSnapshot(
+            accounts: [
+                UsageAccount(
+                    id: oldA,
+                    service: .claude,
+                    label: "claude:a",
+                    rootPath: oldARoot.path,
+                    updatedAt: now.addingTimeInterval(-100)
+                ),
+                UsageAccount(
+                    id: oldB,
+                    service: .claude,
+                    label: "claude:b",
+                    rootPath: oldBRoot.path,
+                    updatedAt: now
+                ),
+            ],
+            profiles: [
+                UsageProfile(name: "home", claudeAccountId: oldA, codexAccountId: nil, geminiAccountId: nil),
+                UsageProfile(name: "work", claudeAccountId: oldB, codexAccountId: nil, geminiAccountId: nil),
+            ]
+        )
+        try store.saveSnapshot(snapshot)
+
+        let identities = """
+        {
+          "\(oldA)": { "email": "z@insightquest.io", "claudeIsTeam": false },
+          "\(oldB)": { "email": " z@insightquest.io ", "claudeIsTeam": false }
+        }
+        """
+        try Data(identities.utf8).write(to: root.appendingPathComponent("usage-identities.json"), options: [.atomic])
+
+        let tokens = """
+        {
+          "\(oldA)": { "token": "token-a", "enabled": true },
+          "\(oldB)": { "token": "token-b", "enabled": true }
+        }
+        """
+        try Data(tokens.utf8).write(to: root.appendingPathComponent("claude-code-tokens.json"), options: [.atomic])
+
+        let changed = try switcher.migrateStoredClaudeAccountsUsingIdentityCache()
+        assert(changed, "Expected migration to report changed=true")
+
+        let migrated = try store.loadSnapshot()
+        let claudeAccounts = migrated.accounts.filter { $0.service == .claude }
+        assert(claudeAccounts.count == 1, "Expected duplicate Claude accounts to merge into one")
+        assert(claudeAccounts[0].id == canonical, "Expected canonical Claude account ID")
+        assert(claudeAccounts[0].rootPath.hasSuffix("/accounts/\(canonical)"), "Expected canonical Claude root path")
+
+        let profileIDs = Set(migrated.profiles.compactMap(\.claudeAccountId))
+        assert(profileIDs == Set([canonical]), "Expected all profiles to point to canonical Claude account ID")
+
+        let canonicalCredPath = accountsDir.appendingPathComponent(canonical, isDirectory: true)
+            .appendingPathComponent(".claude/.credentials.json")
+        let canonicalCreds = try Data(contentsOf: canonicalCredPath)
+        assert(canonicalCreds == oldBCreds, "Expected newest account credentials to win during merge")
+        assert(!fm.fileExists(atPath: oldARoot.path), "Expected old Claude account dir A removed")
+        assert(!fm.fileExists(atPath: oldBRoot.path), "Expected old Claude account dir B removed")
+
+        let migratedIdentitiesData = try Data(contentsOf: root.appendingPathComponent("usage-identities.json"))
+        guard let migratedIdentities = try JSONSerialization.jsonObject(with: migratedIdentitiesData) as? [String: Any] else {
+            assertionFailure("Expected usage-identities.json object")
+            return
+        }
+        assert(migratedIdentities[canonical] != nil, "Expected canonical usage identity key")
+        assert(migratedIdentities[oldA] == nil, "Expected old identity key A removed")
+        assert(migratedIdentities[oldB] == nil, "Expected old identity key B removed")
+
+        let migratedTokensData = try Data(contentsOf: root.appendingPathComponent("claude-code-tokens.json"))
+        guard let migratedTokens = try JSONSerialization.jsonObject(with: migratedTokensData) as? [String: [String: Any]] else {
+            assertionFailure("Expected claude-code-tokens.json object")
+            return
+        }
+        assert(migratedTokens[canonical] != nil, "Expected canonical Claude token key")
+        assert(migratedTokens[oldA] == nil, "Expected old token key A removed")
+        assert(migratedTokens[oldB] == nil, "Expected old token key B removed")
     }
 
     private static func makeCodexCredential(
