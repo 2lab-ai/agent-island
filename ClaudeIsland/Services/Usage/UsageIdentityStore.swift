@@ -120,6 +120,32 @@ actor UsageIdentityStore {
         try save()
     }
 
+    /// Clears volatile identity fields for an account while preserving user-maintained plan overrides.
+    func invalidateCachedIdentity(accountId: String) throws {
+        try loadIfNeeded()
+        guard var identity = identities[accountId] else { return }
+
+        var changed = false
+        if identity.email != nil {
+            identity.email = nil
+            changed = true
+        }
+
+        if identity.tier != nil {
+            identity.tier = nil
+            changed = true
+        }
+
+        if identity.claudeIsTeam != nil {
+            identity.claudeIsTeam = nil
+            changed = true
+        }
+
+        guard changed else { return }
+        identities[accountId] = identity
+        try save()
+    }
+
     // MARK: - Internals
 
     private func loadIfNeeded() throws {

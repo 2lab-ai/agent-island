@@ -5,6 +5,7 @@ enum UsageFetcherTests {
     static func main() async throws {
         try testDecodeUsageOutput()
         try await testCacheTTL()
+        try await testCurrentIdentityCacheInvalidatesWhenCredentialsChange()
         print("OK")
     }
 
@@ -69,5 +70,52 @@ enum UsageFetcherTests {
 
         let anyAtT1 = await cache.getAny(profileName: "A")
         assert(anyAtT1 != nil)
+    }
+
+    private static func testCurrentIdentityCacheInvalidatesWhenCredentialsChange() async throws {
+        let fetcher = UsageFetcher(
+            accountStore: AccountStore(rootDir: FileManager.default.temporaryDirectory),
+            cache: UsageCache(ttl: 0)
+        )
+
+        let firstCredentials = ExportCredentials(
+            claude: nil,
+            codex: try makeJWTBackedCredential(email: "dev1@insightquest.io"),
+            gemini: nil
+        )
+
+        let secondCredentials = ExportCredentials(
+            claude: nil,
+            codex: try makeJWTBackedCredential(email: "z@insightquest.io"),
+            gemini: nil
+        )
+
+        let first = await fetcher.fetchCurrentSnapshot(credentials: firstCredentials)
+        assert(first.identities.codexEmail == "dev1@insightquest.io")
+
+        let second = await fetcher.fetchCurrentSnapshot(credentials: secondCredentials)
+        assert(second.identities.codexEmail == "z@insightquest.io")
+    }
+
+    private static func makeJWTBackedCredential(email: String) throws -> Data {
+        let header = try base64URLJSON(["alg": "HS256", "typ": "JWT"])
+        let payload = try base64URLJSON(["email": email, "exp": 1_910_000_000]) // 2030-07-18 UTC
+        let token = "\(header).\(payload).signature"
+
+        let root: [String: Any] = [
+            "tokens": [
+                "access_token": token,
+            ],
+        ]
+        return try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+    }
+
+    private static func base64URLJSON(_ object: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return data
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
     }
 }

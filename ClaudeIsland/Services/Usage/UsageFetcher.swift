@@ -83,13 +83,15 @@ final class UsageFetcher {
     func fetchSnapshot(for profile: UsageProfile) async -> UsageSnapshot {
         var tokenRefresh = UsageTokenRefresh.empty
         var cachedIdentities = UsageIdentities.empty
+        var identityKey = "profile:\(profile.name)"
 
         do {
             let snapshot = try accountStore.loadSnapshot()
             let credentials = loadCredentials(profile: profile, accounts: snapshot.accounts)
+            identityKey = identityCacheKey(namespace: "profile:\(profile.name)", credentials: credentials)
 
             tokenRefresh = resolveTokenRefresh(credentials: credentials)
-            cachedIdentities = await resolveIdentitiesCached(key: profile.name, credentials: credentials)
+            cachedIdentities = await resolveIdentitiesCached(key: identityKey, credentials: credentials)
 
             if let entry = await cache.getFresh(profileName: profile.name) {
                 return UsageSnapshot(
@@ -117,7 +119,7 @@ final class UsageFetcher {
             )
         } catch {
             let entry = await cache.getAny(profileName: profile.name)
-            let identities = await identityCache.getFresh(key: profile.name) ?? cachedIdentities
+            let identities = await identityCache.getFresh(key: identityKey) ?? cachedIdentities
             return UsageSnapshot(
                 profileName: profile.name,
                 output: entry?.output,
@@ -133,9 +135,10 @@ final class UsageFetcher {
     func fetchCurrentSnapshot(credentials: ExportCredentials) async -> UsageSnapshot {
         let cacheKey = "__current__"
         let profileName = "Current"
+        let identityKey = identityCacheKey(namespace: cacheKey, credentials: credentials)
 
         let tokenRefresh = resolveTokenRefresh(credentials: credentials)
-        let identities = await resolveIdentitiesCached(key: cacheKey, credentials: credentials)
+        let identities = await resolveIdentitiesCached(key: identityKey, credentials: credentials)
 
         if let entry = await cache.getFresh(profileName: cacheKey) {
             return UsageSnapshot(
@@ -442,6 +445,21 @@ private actor IdentityCache {
 }
 
 private extension UsageFetcher {
+    func identityCacheKey(namespace: String, credentials: ExportCredentials) -> String {
+        "\(namespace)|claude:\(stableDataHash(credentials.claude))|codex:\(stableDataHash(credentials.codex))|gemini:\(stableDataHash(credentials.gemini))"
+    }
+
+    // Lightweight in-memory hash for cache keying; avoids reusing identities across credential changes.
+    func stableDataHash(_ data: Data?) -> String {
+        guard let data else { return "-" }
+        var hash: UInt64 = 1469598103934665603
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash &*= 1099511628211
+        }
+        return String(hash, radix: 16)
+    }
+
     func resolveIdentitiesCached(key: String, credentials: ExportCredentials) async -> UsageIdentities {
         if let cached = await identityCache.getFresh(key: key) { return cached }
         let identities = await resolveIdentities(credentials: credentials)
