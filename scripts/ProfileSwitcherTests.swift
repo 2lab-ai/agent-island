@@ -3,6 +3,9 @@ import Foundation
 @main
 enum ProfileSwitcherTests {
     static func main() throws {
+        try testStableFingerprintForClaudeRefreshToken()
+        try testStableFingerprintForCodexAccountID()
+
         let fm = FileManager.default
         let home = URL(fileURLWithPath: "/tmp/claude-island-profile-switcher-home", isDirectory: true)
         if fm.fileExists(atPath: home.path) {
@@ -58,5 +61,42 @@ enum ProfileSwitcherTests {
 
         print("OK")
     }
-}
 
+    private static func testStableFingerprintForClaudeRefreshToken() throws {
+        let first = Data("""
+        {"claudeAiOauth":{"accessToken":"at-1","refreshToken":"rt-stable","expiresAt":1735689600000}}
+        """.utf8)
+        let second = Data("""
+        {"claudeAiOauth":{"accessToken":"at-2","refreshToken":"rt-stable","expiresAt":1735693200000}}
+        """.utf8)
+        let third = Data("""
+        {"claudeAiOauth":{"accessToken":"at-3","refreshToken":"rt-rotated","expiresAt":1735696800000}}
+        """.utf8)
+
+        let firstID = UsageCredentialHasher.fingerprint(service: .claude, data: first).accountId
+        let secondID = UsageCredentialHasher.fingerprint(service: .claude, data: second).accountId
+        let thirdID = UsageCredentialHasher.fingerprint(service: .claude, data: third).accountId
+
+        assert(firstID == secondID)
+        assert(firstID != thirdID)
+    }
+
+    private static func testStableFingerprintForCodexAccountID() throws {
+        let first = Data("""
+        {"tokens":{"access_token":"tok-a","account_id":"acct-user-1"}}
+        """.utf8)
+        let second = Data("""
+        {"tokens":{"access_token":"tok-b","account_id":"acct-user-1"}}
+        """.utf8)
+        let third = Data("""
+        {"tokens":{"access_token":"tok-c","account_id":"acct-user-2"}}
+        """.utf8)
+
+        let firstID = UsageCredentialHasher.fingerprint(service: .codex, data: first).accountId
+        let secondID = UsageCredentialHasher.fingerprint(service: .codex, data: second).accountId
+        let thirdID = UsageCredentialHasher.fingerprint(service: .codex, data: third).accountId
+
+        assert(firstID == secondID)
+        assert(firstID != thirdID)
+    }
+}

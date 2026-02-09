@@ -3,10 +3,50 @@ import Foundation
 
 enum UsageCredentialHasher {
     static func fingerprint(service: UsageService, data: Data) -> (accountId: String, hashPrefix: String) {
-        let digest = SHA256.hash(data: data)
+        let digestInput: Data
+        if let stableKey = stableFingerprintKey(service: service, data: data) {
+            digestInput = Data(stableKey.utf8)
+        } else {
+            digestInput = data
+        }
+
+        let digest = SHA256.hash(data: digestInput)
         let hex = digest.map { String(format: "%02x", $0) }.joined()
         let hashPrefix = String(hex.prefix(16))
         return (accountId: "acct_\(service.rawValue)_\(hashPrefix)", hashPrefix: hashPrefix)
+    }
+
+    private static func stableFingerprintKey(service: UsageService, data: Data) -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) else { return nil }
+
+        switch service {
+        case .claude:
+            guard let dict = root as? [String: Any] else { return nil }
+            let oauth = dict["claudeAiOauth"] as? [String: Any]
+            guard let refreshToken = normalizedString(oauth?["refreshToken"]) else { return nil }
+            return "claude:refresh:\(refreshToken)"
+        case .codex:
+            guard let dict = root as? [String: Any] else { return nil }
+            let tokens = dict["tokens"] as? [String: Any]
+            guard let accountID = normalizedString(tokens?["account_id"]) else { return nil }
+            return "codex:account:\(accountID)"
+        case .gemini:
+            guard let dict = root as? [String: Any] else { return nil }
+            let tokenRoot = dict["token"] as? [String: Any]
+            if let refreshToken = normalizedString(dict["refresh_token"]) {
+                return "gemini:refresh:\(refreshToken)"
+            }
+            if let refreshToken = normalizedString(tokenRoot?["refreshToken"]) {
+                return "gemini:refresh:\(refreshToken)"
+            }
+            return nil
+        }
+    }
+
+    private static func normalizedString(_ value: Any?) -> String? {
+        guard let raw = value as? String else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

@@ -181,17 +181,42 @@ final class UsageFetcher {
 
     // MARK: - Internals
 
+    private struct TempHomeBuildResult {
+        let homeURL: URL
+        let syncTargets: [CredentialSyncTarget]
+    }
+
+    private struct CredentialSyncTarget {
+        let relativePath: String
+        let destinationURL: URL
+    }
+
     private func fetchUsageFromDocker(profile: UsageProfile, accounts: [UsageAccount]) async throws -> CheckUsageOutput {
-        let tempHomeURL = try buildTempHome(profile: profile, accounts: accounts)
-        defer { try? FileManager.default.removeItem(at: tempHomeURL) }
-        return try await fetchUsageFromDocker(homeURL: tempHomeURL)
+        let build = try buildTempHome(profile: profile, accounts: accounts)
+        defer { try? FileManager.default.removeItem(at: build.homeURL) }
+
+        do {
+            let output = try await fetchUsageFromDocker(homeURL: build.homeURL)
+            try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets)
+            return output
+        } catch {
+            try? persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets)
+            throw error
+        }
     }
 
     private func fetchUsageFromDocker(credentials: ExportCredentials) async throws -> CheckUsageOutput {
-        let tempHomeURL = try buildTempHome(credentials: credentials)
-        defer { try? FileManager.default.removeItem(at: tempHomeURL) }
+        let build = try buildTempHome(credentials: credentials)
+        defer { try? FileManager.default.removeItem(at: build.homeURL) }
 
-        return try await fetchUsageFromDocker(homeURL: tempHomeURL)
+        do {
+            let output = try await fetchUsageFromDocker(homeURL: build.homeURL)
+            try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets)
+            return output
+        } catch {
+            try? persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets)
+            throw error
+        }
     }
 
     private func fetchUsageFromDocker(homeURL: URL) async throws -> CheckUsageOutput {
@@ -235,7 +260,7 @@ final class UsageFetcher {
         throw UsageFetcherError.vendoredScriptNotFound
     }
 
-    private func buildTempHome(profile: UsageProfile, accounts: [UsageAccount]) throws -> URL {
+    private func buildTempHome(profile: UsageProfile, accounts: [UsageAccount]) throws -> TempHomeBuildResult {
         let root = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".agent-island/tmp-homes", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -243,29 +268,42 @@ final class UsageFetcher {
         let tempHome = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempHome, withIntermediateDirectories: true)
 
+        var syncTargets: [CredentialSyncTarget] = []
+
         try copyServiceDir(
             service: .claude,
             accountId: profile.claudeAccountId,
             accounts: accounts,
             toHome: tempHome
         )
+        if let target = accountSyncTarget(service: .claude, accountId: profile.claudeAccountId, accounts: accounts) {
+            syncTargets.append(target)
+        }
+
         try copyServiceDir(
             service: .codex,
             accountId: profile.codexAccountId,
             accounts: accounts,
             toHome: tempHome
         )
+        if let target = accountSyncTarget(service: .codex, accountId: profile.codexAccountId, accounts: accounts) {
+            syncTargets.append(target)
+        }
+
         try copyServiceDir(
             service: .gemini,
             accountId: profile.geminiAccountId,
             accounts: accounts,
             toHome: tempHome
         )
+        if let target = accountSyncTarget(service: .gemini, accountId: profile.geminiAccountId, accounts: accounts) {
+            syncTargets.append(target)
+        }
 
-        return tempHome
+        return TempHomeBuildResult(homeURL: tempHome, syncTargets: syncTargets)
     }
 
-    private func buildTempHome(credentials: ExportCredentials) throws -> URL {
+    private func buildTempHome(credentials: ExportCredentials) throws -> TempHomeBuildResult {
         if credentials.claude == nil, credentials.codex == nil, credentials.gemini == nil {
             throw UsageFetcherError.noCredentialsFound
         }
@@ -277,22 +315,43 @@ final class UsageFetcher {
         let tempHome = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempHome, withIntermediateDirectories: true)
 
+        let activeHome = FileManager.default.homeDirectoryForCurrentUser
+        var syncTargets: [CredentialSyncTarget] = []
+
         if let claudeData = credentials.claude {
             let dir = tempHome.appendingPathComponent(".claude", isDirectory: true)
             try writeFile(data: claudeData, to: dir.appendingPathComponent(".credentials.json"))
+            syncTargets.append(
+                CredentialSyncTarget(
+                    relativePath: credentialRelativePath(for: .claude),
+                    destinationURL: activeHome.appendingPathComponent(credentialRelativePath(for: .claude))
+                )
+            )
         }
 
         if let codexData = credentials.codex {
             let dir = tempHome.appendingPathComponent(".codex", isDirectory: true)
             try writeFile(data: codexData, to: dir.appendingPathComponent("auth.json"))
+            syncTargets.append(
+                CredentialSyncTarget(
+                    relativePath: credentialRelativePath(for: .codex),
+                    destinationURL: activeHome.appendingPathComponent(credentialRelativePath(for: .codex))
+                )
+            )
         }
 
         if let geminiData = credentials.gemini {
             let dir = tempHome.appendingPathComponent(".gemini", isDirectory: true)
             try writeFile(data: geminiData, to: dir.appendingPathComponent("oauth_creds.json"))
+            syncTargets.append(
+                CredentialSyncTarget(
+                    relativePath: credentialRelativePath(for: .gemini),
+                    destinationURL: activeHome.appendingPathComponent(credentialRelativePath(for: .gemini))
+                )
+            )
         }
 
-        return tempHome
+        return TempHomeBuildResult(homeURL: tempHome, syncTargets: syncTargets)
     }
 
     private func writeFile(data: Data, to fileURL: URL) throws {
@@ -329,6 +388,48 @@ final class UsageFetcher {
 
         guard FileManager.default.fileExists(atPath: sourceURL.path) else { return }
         try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+    }
+
+    private func accountSyncTarget(
+        service: UsageService,
+        accountId: String?,
+        accounts: [UsageAccount]
+    ) -> CredentialSyncTarget? {
+        guard let accountId else { return nil }
+        guard let account = accounts.first(where: { $0.id == accountId }) else { return nil }
+
+        let relativePath = credentialRelativePath(for: service)
+        let accountRoot = URL(fileURLWithPath: account.rootPath, isDirectory: true)
+        return CredentialSyncTarget(
+            relativePath: relativePath,
+            destinationURL: accountRoot.appendingPathComponent(relativePath)
+        )
+    }
+
+    private func credentialRelativePath(for service: UsageService) -> String {
+        switch service {
+        case .claude:
+            return ".claude/.credentials.json"
+        case .codex:
+            return ".codex/auth.json"
+        case .gemini:
+            return ".gemini/oauth_creds.json"
+        }
+    }
+
+    private func persistUpdatedCredentials(from homeURL: URL, targets: [CredentialSyncTarget]) throws {
+        for target in targets {
+            let sourceURL = homeURL.appendingPathComponent(target.relativePath)
+            guard FileManager.default.fileExists(atPath: sourceURL.path) else { continue }
+
+            let sourceData = try Data(contentsOf: sourceURL)
+            if let existingData = try? Data(contentsOf: target.destinationURL),
+               existingData == sourceData {
+                continue
+            }
+
+            try writeFile(data: sourceData, to: target.destinationURL)
+        }
     }
 
     private func stageVendoredScript(into homeURL: URL, scriptURL: URL) throws {

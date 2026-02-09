@@ -15,7 +15,12 @@ import { readFile, stat } from "fs/promises";
 import { join } from "path";
 import { homedir } from "os";
 var KEYCHAIN_CACHE_TTL_MS = 1e4;
+var CLAUDE_TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1e3;
+var CLAUDE_OAUTH_CLIENT_ID = process.env.CLAUDE_CODE_OAUTH_CLIENT_ID || "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+var CLAUDE_TOKEN_ENDPOINT = process.env.CLAUDE_CODE_TOKEN_URL || "https://platform.claude.com/v1/oauth/token";
+var CLAUDE_DEFAULT_SCOPE = "user:profile user:inference user:sessions:claude_code user:mcp_servers";
 var credentialsCache = null;
+var pendingClaudeRefreshRequests = /* @__PURE__ */ new Map();
 async function getCredentials() {
   try {
     if (process.platform === "darwin") {
@@ -28,7 +33,7 @@ async function getCredentials() {
 }
 async function getCredentialsFromKeychain() {
   if (credentialsCache?.timestamp && Date.now() - credentialsCache.timestamp < KEYCHAIN_CACHE_TTL_MS) {
-    return credentialsCache.token;
+    return credentialsCache.credentials;
   }
   try {
     const result = execFileSync(
@@ -36,10 +41,9 @@ async function getCredentialsFromKeychain() {
       ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
       { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
     ).trim();
-    const creds = JSON.parse(result);
-    const token = creds?.claudeAiOauth?.accessToken ?? null;
-    credentialsCache = { token, timestamp: Date.now() };
-    return token;
+    const parsed = parseClaudeCredentials(JSON.parse(result));
+    credentialsCache = { credentials: parsed, timestamp: Date.now() };
+    return parsed;
   } catch {
     return await getCredentialsFromFile();
   }
@@ -50,16 +54,165 @@ async function getCredentialsFromFile() {
     const fileStat = await stat(credPath);
     const mtime = fileStat.mtimeMs;
     if (credentialsCache?.mtime === mtime) {
-      return credentialsCache.token;
+      return credentialsCache.credentials;
     }
     const content = await readFile(credPath, "utf-8");
-    const creds = JSON.parse(content);
-    const token = creds?.claudeAiOauth?.accessToken ?? null;
-    credentialsCache = { token, mtime };
-    return token;
+    const parsed = parseClaudeCredentials(JSON.parse(content));
+    credentialsCache = { credentials: parsed, mtime };
+    return parsed;
   } catch {
     return null;
   }
+}
+function parseClaudeCredentials(root) {
+  const oauth = root?.claudeAiOauth;
+  const accessToken = oauth?.accessToken;
+  if (!accessToken) {
+    return null;
+  }
+  return {
+    accessToken,
+    refreshToken: oauth?.refreshToken ?? null,
+    expiresAt: parseClaudeTimestamp(
+      oauth?.expiresAt ?? oauth?.expires_at ?? oauth?.expiresAtMs ?? oauth?.expires_at_ms ?? oauth?.expiresAtSeconds ?? oauth?.expires_at_seconds
+    ),
+    scopes: normalizeClaudeScopes(oauth?.scopes)
+  };
+}
+function parseClaudeTimestamp(value) {
+  if (value === null || value === void 0) {
+    return null;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (value > 1e12) {
+      return value;
+    }
+    if (value > 1e9) {
+      return value * 1e3;
+    }
+    return null;
+  }
+  if (typeof value === "string") {
+    const numeric = Number(value);
+    if (Number.isFinite(numeric) && value.trim() !== "") {
+      return parseClaudeTimestamp(numeric);
+    }
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return null;
+}
+function normalizeClaudeScopes(scopes) {
+  if (Array.isArray(scopes)) {
+    return scopes.filter((scope) => typeof scope === "string" && scope.trim() !== "");
+  }
+  if (typeof scopes === "string") {
+    return scopes.split(" ").map((scope) => scope.trim()).filter(Boolean);
+  }
+  return [];
+}
+function tokenNeedsRefreshClaude(credentials) {
+  if (!credentials?.expiresAt) {
+    return false;
+  }
+  return credentials.expiresAt < Date.now() + CLAUDE_TOKEN_REFRESH_BUFFER_MS;
+}
+async function refreshClaudeTokenInternal(credentials) {
+  if (!credentials?.refreshToken) {
+    return null;
+  }
+  try {
+    const scope = credentials.scopes.length > 0 ? credentials.scopes.join(" ") : CLAUDE_DEFAULT_SCOPE;
+    const response = await fetch(CLAUDE_TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: credentials.refreshToken,
+        client_id: CLAUDE_OAUTH_CLIENT_ID,
+        scope
+      }),
+      signal: AbortSignal.timeout(API_TIMEOUT_MS)
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const json = await response.json();
+    if (!json?.access_token) {
+      return null;
+    }
+    const next = {
+      accessToken: json.access_token,
+      refreshToken: json.refresh_token || credentials.refreshToken,
+      expiresAt: typeof json.expires_in === "number" ? Date.now() + json.expires_in * 1e3 : credentials.expiresAt,
+      scopes: normalizeClaudeScopes(json.scope || credentials.scopes)
+    };
+    await saveClaudeCredentialsToFile(next, json);
+    credentialsCache = null;
+    return next;
+  } catch {
+    return null;
+  }
+}
+async function refreshClaudeToken(credentials) {
+  if (!credentials?.refreshToken) {
+    return null;
+  }
+  const dedupeKey = hashToken(credentials.refreshToken);
+  const pending = pendingClaudeRefreshRequests.get(dedupeKey);
+  if (pending) {
+    return pending;
+  }
+  const refreshPromise = refreshClaudeTokenInternal(credentials).finally(() => {
+    pendingClaudeRefreshRequests.delete(dedupeKey);
+  });
+  pendingClaudeRefreshRequests.set(dedupeKey, refreshPromise);
+  return refreshPromise;
+}
+async function saveClaudeCredentialsToFile(credentials, rawResponse) {
+  try {
+    const credPath = join(homedir(), ".claude", ".credentials.json");
+    let existingRoot = {};
+    try {
+      const raw = await readFile(credPath, "utf-8");
+      existingRoot = JSON.parse(raw);
+    } catch {
+    }
+    const existingOauth = existingRoot?.claudeAiOauth ?? {};
+    const nextScopes = credentials.scopes.length > 0 ? credentials.scopes : normalizeClaudeScopes(existingOauth?.scopes);
+    const nextRoot = {
+      ...existingRoot,
+      claudeAiOauth: {
+        ...existingOauth,
+        accessToken: credentials.accessToken,
+        refreshToken: credentials.refreshToken,
+        expiresAt: credentials.expiresAt ?? existingOauth?.expiresAt,
+        scopes: nextScopes
+      }
+    };
+    if (rawResponse?.scope) {
+      nextRoot.claudeAiOauth.scopes = normalizeClaudeScopes(rawResponse.scope);
+    }
+    await writeFile(credPath, JSON.stringify(nextRoot, null, 2), { mode: 384 });
+  } catch {
+  }
+}
+async function getValidClaudeCredentials() {
+  let credentials = await getCredentials();
+  if (!credentials) {
+    return null;
+  }
+  if (tokenNeedsRefreshClaude(credentials)) {
+    const refreshed = await refreshClaudeToken(credentials);
+    if (refreshed?.accessToken) {
+      return refreshed;
+    }
+  }
+  return credentials;
 }
 
 // scripts/utils/hash.ts
@@ -98,8 +251,8 @@ function isCacheValid(tokenHash, ttlSeconds) {
   return ageSeconds < ttlSeconds;
 }
 async function fetchUsageLimits(ttlSeconds = 60) {
-  const token = await getCredentials();
-  if (!token) {
+  const credentials = await getValidClaudeCredentials();
+  if (!credentials?.accessToken) {
     if (lastTokenHash) {
       const cached = usageCacheMap.get(lastTokenHash);
       if (cached)
@@ -110,7 +263,7 @@ async function fetchUsageLimits(ttlSeconds = 60) {
     }
     return null;
   }
-  const tokenHash = hashToken(token);
+  const tokenHash = hashToken(credentials.accessToken);
   lastTokenHash = tokenHash;
   if (isCacheValid(tokenHash, ttlSeconds)) {
     const cached = usageCacheMap.get(tokenHash);
@@ -126,7 +279,7 @@ async function fetchUsageLimits(ttlSeconds = 60) {
   if (pending) {
     return pending;
   }
-  const requestPromise = fetchFromApi(token, tokenHash);
+  const requestPromise = fetchFromApi(credentials, tokenHash);
   pendingRequests.set(tokenHash, requestPromise);
   try {
     return await requestPromise;
@@ -134,36 +287,56 @@ async function fetchUsageLimits(ttlSeconds = 60) {
     pendingRequests.delete(tokenHash);
   }
 }
-async function fetchFromApi(token, tokenHash) {
+async function fetchFromApi(credentials, tokenHash, allowRefreshRetry = true) {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    const response = await fetchClaudeUsageWithToken(credentials.accessToken);
+    if (response.statusCode === 401 && allowRefreshRetry) {
+      const refreshed = await refreshClaudeToken(credentials);
+      if (refreshed?.accessToken) {
+        const refreshedHash = hashToken(refreshed.accessToken);
+        return fetchFromApi(refreshed, refreshedHash, false);
+      }
+    }
+    if (!response.ok || !response.data) {
+      return null;
+    }
+    const limits = {
+      five_hour: response.data.five_hour ?? null,
+      seven_day: response.data.seven_day ?? null,
+      seven_day_sonnet: response.data.seven_day_sonnet ?? null
+    };
+    lastTokenHash = tokenHash;
+    usageCacheMap.set(tokenHash, { data: limits, timestamp: Date.now() });
+    await saveFileCache(tokenHash, limits);
+    return limits;
+  } catch {
+    return null;
+  }
+}
+async function fetchClaudeUsageWithToken(accessToken) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
     const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
       method: "GET",
       headers: {
         Accept: "application/json",
         "Content-Type": "application/json",
         "User-Agent": `claude-dashboard/${VERSION}`,
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${accessToken}`,
         "anthropic-beta": "oauth-2025-04-20"
       },
       signal: controller.signal
     });
-    clearTimeout(timeout);
     if (!response.ok) {
-      return null;
+      return { ok: false, statusCode: response.status, data: null };
     }
     const data = await response.json();
-    const limits = {
-      five_hour: data.five_hour ?? null,
-      seven_day: data.seven_day ?? null,
-      seven_day_sonnet: data.seven_day_sonnet ?? null
-    };
-    usageCacheMap.set(tokenHash, { data: limits, timestamp: Date.now() });
-    await saveFileCache(tokenHash, limits);
-    return limits;
+    return { ok: true, statusCode: response.status, data };
   } catch {
-    return null;
+    return { ok: false, statusCode: 0, data: null };
+  } finally {
+    clearTimeout(timeout);
   }
 }
 async function loadFileCache(tokenHash, ttlSeconds) {
