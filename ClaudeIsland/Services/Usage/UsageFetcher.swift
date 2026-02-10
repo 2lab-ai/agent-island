@@ -611,18 +611,27 @@ final class UsageFetcher {
 
         let source = claudeTokenFingerprint(from: sourceData)
         let destination = claudeTokenFingerprint(from: destinationData)
+        let tokenMaterialChanged =
+            source.refreshFingerprint != destination.refreshFingerprint ||
+            source.accessFingerprint != destination.accessFingerprint
 
-        if source.refreshFingerprint == destination.refreshFingerprint {
-            return .write("same_refresh_fingerprint_on_error")
+        if !tokenMaterialChanged {
+            return .skip("same_token_material_on_error")
         }
 
-        if let sourceExpiry = source.expiresAt,
-           let destinationExpiry = destination.expiresAt,
-           sourceExpiry.timeIntervalSince(destinationExpiry) > 300 {
-            return .write("newer_expiry_on_error")
+        guard let sourceExpiry = source.expiresAt else {
+            return .skip("missing_source_expiry_on_error")
         }
 
-        return .skip("claude_refresh_guard_rejected")
+        guard let destinationExpiry = destination.expiresAt else {
+            return .write("token_changed_and_destination_missing_expiry_on_error")
+        }
+
+        if sourceExpiry.timeIntervalSince(destinationExpiry) > 300 {
+            return .write("token_changed_and_newer_expiry_on_error")
+        }
+
+        return .skip("token_changed_but_not_newer_on_error")
     }
 
     private func appendClaudeSyncFingerprints(
