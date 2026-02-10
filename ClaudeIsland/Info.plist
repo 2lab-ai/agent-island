@@ -19,7 +19,7 @@
 
     <!-- Sparkle Update Configuration (Direct distribution only; disabled for App Store) -->
     <key>SUFeedURL</key>
-    <string>https://agentisland.app/appcast.xml</string>
+    <string>https://github.com/2lab-ai/agent-island/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key>
     <string>w5NwH5KRfE7LfeZ09J8lWx3UQrWTqUbfH4HHBa1OPRk=</string>
     <key>SUEnableAutomaticChecks</key>

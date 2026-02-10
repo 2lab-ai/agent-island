@@ -7,6 +7,8 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_DIR/build"
 EXPORT_PATH="$BUILD_DIR/export"
 RELEASE_DIR="$PROJECT_DIR/releases"
+APPCAST_DIR="$RELEASE_DIR/appcast"
+APPCAST_XML_PATH="$APPCAST_DIR/appcast.xml"
 KEYS_DIR="$PROJECT_DIR/.sparkle-keys"
 
 # Website repo for auto-updating appcast
@@ -239,7 +241,6 @@ else
 
         # Generate/update appcast
         echo "Generating appcast..."
-        APPCAST_DIR="$RELEASE_DIR/appcast"
         mkdir -p "$APPCAST_DIR"
 
         # Copy DMG to appcast directory
@@ -248,7 +249,7 @@ else
         # Generate appcast.xml
         "$GENERATE_APPCAST" --ed-key-file "$KEYS_DIR/eddsa_private_key" "$APPCAST_DIR"
 
-        echo "Appcast generated at: $APPCAST_DIR/appcast.xml"
+        echo "Appcast generated at: $APPCAST_XML_PATH"
     fi
 fi
 
@@ -263,13 +264,25 @@ if ! command -v gh &> /dev/null; then
     echo "WARNING: gh CLI not found. Install with: brew install gh"
     echo "Skipping GitHub release."
 else
+    if [ ! -f "$APPCAST_XML_PATH" ]; then
+        echo "ERROR: appcast missing at $APPCAST_XML_PATH"
+        echo "Sparkle appcast is required so Check for Updates can find GitHub releases."
+        exit 1
+    fi
+
+    GITHUB_DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/download/v$VERSION/$APP_NAME-$VERSION.dmg"
+    GITHUB_APPCAST_URL="https://github.com/$GITHUB_REPO/releases/latest/download/appcast.xml"
+
+    # Ensure appcast points to this version's GitHub-hosted DMG.
+    sed -i '' "s|url=\"[^\"]*\\.dmg\"|url=\"$GITHUB_DOWNLOAD_URL\"|g" "$APPCAST_XML_PATH"
+
     # Check if release already exists
     if gh release view "v$VERSION" --repo "$GITHUB_REPO" &>/dev/null; then
         echo "Release v$VERSION already exists. Updating..."
-        gh release upload "v$VERSION" "$DMG_PATH" --repo "$GITHUB_REPO" --clobber
+        gh release upload "v$VERSION" "$DMG_PATH" "$APPCAST_XML_PATH" --repo "$GITHUB_REPO" --clobber
     else
         echo "Creating release v$VERSION..."
-        gh release create "v$VERSION" "$DMG_PATH" \
+        gh release create "v$VERSION" "$DMG_PATH" "$APPCAST_XML_PATH" \
             --repo "$GITHUB_REPO" \
             --title "Agent Island v$VERSION" \
             --notes "## Agent Island v$VERSION
@@ -283,9 +296,9 @@ else
 After installation, Agent Island will automatically check for updates."
     fi
 
-    GITHUB_DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/download/v$VERSION/$APP_NAME-$VERSION.dmg"
     echo "GitHub release created: https://github.com/$GITHUB_REPO/releases/tag/v$VERSION"
     echo "Download URL: $GITHUB_DOWNLOAD_URL"
+    echo "Sparkle feed URL: $GITHUB_APPCAST_URL"
 fi
 
 echo ""
@@ -297,9 +310,9 @@ echo "=== Step 6: Updating Website ==="
 
 if is_true "$DEPLOY_SKIP_WEBSITE"; then
     echo "Skipping website update (DEPLOY_SKIP_WEBSITE=$DEPLOY_SKIP_WEBSITE)."
-elif [ -d "$WEBSITE_PUBLIC" ] && [ -f "$RELEASE_DIR/appcast/appcast.xml" ]; then
+elif [ -d "$WEBSITE_PUBLIC" ] && [ -f "$APPCAST_XML_PATH" ]; then
     # Copy appcast to website
-    cp "$RELEASE_DIR/appcast/appcast.xml" "$WEBSITE_PUBLIC/appcast.xml"
+    cp "$APPCAST_XML_PATH" "$WEBSITE_PUBLIC/appcast.xml"
 
     # Update the download URL in appcast to point to GitHub releases
     if [ -n "$GITHUB_DOWNLOAD_URL" ]; then
@@ -358,8 +371,8 @@ echo "=== Release Complete ==="
 echo ""
 echo "Files created:"
 echo "  - DMG: $DMG_PATH"
-if [ -f "$RELEASE_DIR/appcast/appcast.xml" ]; then
-    echo "  - Appcast: $RELEASE_DIR/appcast/appcast.xml"
+if [ -f "$APPCAST_XML_PATH" ]; then
+    echo "  - Appcast: $APPCAST_XML_PATH"
 fi
 if [ -n "$GITHUB_DOWNLOAD_URL" ]; then
     echo "  - GitHub: https://github.com/$GITHUB_REPO/releases/tag/v$VERSION"
