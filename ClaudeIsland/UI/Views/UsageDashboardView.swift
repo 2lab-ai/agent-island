@@ -2064,49 +2064,63 @@ private struct UsageProviderColumn: View {
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
-            UsageProviderIcon(provider: provider, size: 14)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                UsageProviderIcon(provider: provider, size: 14)
+
+                Spacer(minLength: 0)
+
+                if let tier = tierBadgeTier {
+                    TierBadge(provider: provider, tier: tier)
+                }
+
+                if showsClaudeTeamBadge {
+                    Text("TEAM")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundColor(Color.white.opacity(0.7))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.08))
+                        )
+                }
+
+                if let badge = statusBadge {
+                    Text(badge.label)
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .foregroundColor(badge.foreground)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(badge.background)
+                        )
+                }
+            }
 
             Text(headerTitle)
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .font(.system(size: headerTitleFontSize, weight: .semibold, design: .monospaced))
                 .foregroundColor(headerTitleColor)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .minimumScaleFactor(0.7)
+                .minimumScaleFactor(0.35)
+                .allowsTightening(true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
 
-            Spacer(minLength: 6)
-
-            if let tier = tierBadgeTier {
-                TierBadge(provider: provider, tier: tier)
-            }
-
-            if showsClaudeTeamBadge {
-                Text("TEAM")
-                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                    .foregroundColor(Color.white.opacity(0.7))
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        Capsule(style: .continuous)
-                            .fill(Color.white.opacity(0.08))
-                    )
-            }
-
-            if let badge = statusBadge {
-                Text(badge.label)
-                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
-                    .foregroundColor(badge.foreground)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(
-                        Capsule(style: .continuous)
-                            .fill(badge.background)
-                    )
-            }
+    private var headerTitleFontSize: CGFloat {
+        let count = headerTitle.count
+        switch count {
+        case 0...16: return 12
+        case 17...26: return 11.5
+        case 27...38: return 11
+        default: return 10.5
         }
     }
 
@@ -2336,7 +2350,6 @@ private struct UsageTokenRefreshRow: View {
             .frame(width: 46)
 
             timeRemainingText
-                .font(.system(size: 10, weight: .semibold, design: .monospaced))
                 .frame(width: 46, alignment: .center)
                 .lineLimit(1)
                 .minimumScaleFactor(0.7)
@@ -2488,7 +2501,6 @@ private struct UsageWindowRow: View {
                     .minimumScaleFactor(0.8)
 
                 timeRemainingText
-                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .frame(width: 46, alignment: .center)
                     .lineLimit(1)
                     .minimumScaleFactor(0.7)

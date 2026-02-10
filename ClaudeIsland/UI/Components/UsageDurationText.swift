@@ -13,25 +13,33 @@ enum UsageDurationText {
         secondUnitColor: Color = Color.white.opacity(0.35)
     ) -> Text {
         let clamped = max(0, seconds)
+        let largestDigitSize: CGFloat = 12
+        let mediumDigitSize: CGFloat = 11
+        let baseDigitSize: CGFloat = 10
 
-        func part(_ value: String, unit: String, unitColor: Color) -> Text {
-            Text(value).foregroundColor(digitColor)
-                + Text(unit).foregroundColor(unitColor)
+        func piece(_ value: String, size: CGFloat, color: Color) -> Text {
+            Text(value)
+                .font(.system(size: size, weight: .semibold, design: .monospaced))
+                .foregroundColor(color)
         }
 
-        let spacer = Text(" ").foregroundColor(digitColor)
+        func part(_ value: String, unit: String, unitColor: Color, digitSize: CGFloat, unitSize: CGFloat? = nil) -> Text {
+            piece(value, size: digitSize, color: digitColor)
+                + piece(unit, size: unitSize ?? max(9, digitSize - 1), color: unitColor)
+        }
+
+        let spacer = piece(" ", size: baseDigitSize, color: digitColor)
 
         if clamped < 60 {
-            return Text("<1").foregroundColor(digitColor)
-                + Text("m").foregroundColor(minuteUnitColor)
+            return part("<1", unit: "m", unitColor: minuteUnitColor, digitSize: largestDigitSize)
         }
 
         if clamped < 3_600 {
             let minutes = clamped / 60
             let seconds = clamped % 60
-            return part("\(minutes)", unit: "m", unitColor: minuteUnitColor)
+            return part("\(minutes)", unit: "m", unitColor: minuteUnitColor, digitSize: largestDigitSize)
                 + spacer
-                + part(String(format: "%02d", seconds), unit: "s", unitColor: secondUnitColor)
+                + part(String(format: "%02d", seconds), unit: "s", unitColor: secondUnitColor, digitSize: mediumDigitSize)
         }
 
         var remaining = clamped
@@ -42,16 +50,15 @@ enum UsageDurationText {
         let minutes = remaining / 60
 
         if days > 0 {
-            return part("\(days)", unit: "d", unitColor: dayUnitColor)
+            return part("\(days)", unit: "d", unitColor: dayUnitColor, digitSize: largestDigitSize)
                 + spacer
-                + part("\(hours)", unit: "h", unitColor: hourUnitColor)
+                + part("\(hours)", unit: "h", unitColor: hourUnitColor, digitSize: mediumDigitSize)
                 + spacer
-                + part("\(minutes)", unit: "m", unitColor: minuteUnitColor)
+                + part("\(minutes)", unit: "m", unitColor: minuteUnitColor, digitSize: baseDigitSize)
         }
 
-        return part("\(hours)", unit: "h", unitColor: hourUnitColor)
+        return part("\(hours)", unit: "h", unitColor: hourUnitColor, digitSize: largestDigitSize)
             + spacer
-            + part(String(format: "%02d", minutes), unit: "m", unitColor: minuteUnitColor)
+            + part(String(format: "%02d", minutes), unit: "m", unitColor: minuteUnitColor, digitSize: baseDigitSize)
     }
 }
-
