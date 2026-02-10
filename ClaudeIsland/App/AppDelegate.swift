@@ -95,12 +95,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         #if !APPSTORE
         if updater.canCheckForUpdates {
-            updater.checkForUpdates()
+            updater.checkForUpdatesInBackground()
         }
 
         updateCheckTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
             guard let updater = self?.updater, updater.canCheckForUpdates else { return }
-            updater.checkForUpdates()
+            updater.checkForUpdatesInBackground()
         }
         #endif
     }

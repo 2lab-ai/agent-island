@@ -45,6 +45,7 @@ class UpdateManager: NSObject, ObservableObject {
     private var downloadedBytes: Int64 = 0
     private var expectedBytes: Int64 = 0
     private var currentVersion: String = ""
+    private var shouldAutoInstallAfterCheck: Bool = false
 
     #if !APPSTORE
     private var installHandler: ((SPUUserUpdateChoice) -> Void)?
@@ -61,12 +62,30 @@ class UpdateManager: NSObject, ObservableObject {
         #if APPSTORE
         state = .upToDate
         #else
-        state = .checking
-        if let updater = AppDelegate.shared?.updater {
-            updater.checkForUpdates()
-        } else {
+        guard let updater = AppDelegate.shared?.updater else {
             state = .error(message: "Updater not initialized")
+            return
         }
+
+        guard updater.canCheckForUpdates else {
+            state = .error(message: "Updater is not ready")
+            return
+        }
+
+        shouldAutoInstallAfterCheck = true
+        state = .checking
+        updater.checkForUpdates()
+        #endif
+    }
+
+    func checkForUpdatesInBackground() {
+        #if !APPSTORE
+        shouldAutoInstallAfterCheck = false
+
+        guard let updater = AppDelegate.shared?.updater else { return }
+        guard updater.canCheckForUpdates else { return }
+
+        updater.checkForUpdatesInBackground()
         #endif
     }
 
@@ -86,6 +105,7 @@ class UpdateManager: NSObject, ObservableObject {
         #if !APPSTORE
         installHandler?(.skip)
         #endif
+        shouldAutoInstallAfterCheck = false
         state = .idle
     }
 
@@ -93,11 +113,13 @@ class UpdateManager: NSObject, ObservableObject {
         #if !APPSTORE
         installHandler?(.dismiss)
         #endif
+        shouldAutoInstallAfterCheck = false
         state = .idle
     }
 
     func cancelDownload() {
         cancellationHandler?()
+        shouldAutoInstallAfterCheck = false
         state = .idle
     }
 
@@ -106,6 +128,13 @@ class UpdateManager: NSObject, ObservableObject {
     #if !APPSTORE
     func updateFound(version: String, releaseNotes: String?, installHandler: @escaping (SPUUserUpdateChoice) -> Void) {
         self.currentVersion = version
+
+        if shouldAutoInstallAfterCheck {
+            self.state = .downloading(progress: 0)
+            installHandler(.install)
+            return
+        }
+
         self.installHandler = installHandler
         self.state = .found(version: version, releaseNotes: releaseNotes)
         if !hasSeenUpdateThisSession {
@@ -146,6 +175,12 @@ class UpdateManager: NSObject, ObservableObject {
 
     #if !APPSTORE
     func readyToInstall(installHandler: @escaping (SPUUserUpdateChoice) -> Void) {
+        if shouldAutoInstallAfterCheck {
+            self.state = .installing
+            installHandler(.install)
+            return
+        }
+
         self.installHandler = installHandler
         self.state = .readyToInstall(version: currentVersion)
     }
@@ -156,10 +191,12 @@ class UpdateManager: NSObject, ObservableObject {
     }
 
     func installed(relaunched: Bool) {
+        shouldAutoInstallAfterCheck = false
         self.state = .idle
     }
 
     func noUpdateFound() {
+        shouldAutoInstallAfterCheck = false
         self.state = .upToDate
         // Reset to idle after a few seconds
         Task {
@@ -171,6 +208,7 @@ class UpdateManager: NSObject, ObservableObject {
     }
 
     func updateError(_ message: String) {
+        shouldAutoInstallAfterCheck = false
         self.state = .error(message: message)
     }
 
@@ -179,6 +217,7 @@ class UpdateManager: NSObject, ObservableObject {
             return
         }
         self.state = .idle
+        self.shouldAutoInstallAfterCheck = false
         #if !APPSTORE
         self.installHandler = nil
         #endif
