@@ -38,6 +38,7 @@ Pods/
 
 # Release artifacts
 releases/
+build-appstore/
 
 # Xcode backup
 *.xcodeproj.backup/
@@ -47,5 +48,6 @@ CLAUDE.md
 # Local AI agent logs
 .claude/raw_logs/
 .claude/chat_logs/
+.claude/omc/
 **/.claude/raw_logs/
 **/.claude/chat_logs/
