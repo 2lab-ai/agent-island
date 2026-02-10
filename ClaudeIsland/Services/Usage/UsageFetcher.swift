@@ -568,14 +568,33 @@ final class UsageFetcher {
             return shellPath
         }
 
+        if let whichPath = dockerPathFromInteractiveShell(command: "which docker"),
+           fm.isExecutableFile(atPath: whichPath) {
+            return whichPath
+        }
+
+        if let wherePath = dockerPathFromInteractiveShell(command: "where docker"),
+           fm.isExecutableFile(atPath: wherePath) {
+            return wherePath
+        }
+
         return "/usr/bin/env"
     }
 
     private func dockerPathFromLoginShell() -> String? {
+        dockerPathFromShell(command: "command -v docker", shellModeFlag: "-lc")
+    }
+
+    // Final fallback for GUI launches: interactive shell lookup requested by user.
+    private func dockerPathFromInteractiveShell(command: String) -> String? {
+        dockerPathFromShell(command: command, shellModeFlag: "-ic")
+    }
+
+    private func dockerPathFromShell(command: String, shellModeFlag: String) -> String? {
         let process = Process()
         let outPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-lc", "command -v docker"]
+        process.arguments = [shellModeFlag, command]
         process.standardOutput = outPipe
         process.standardError = Pipe()
 
@@ -590,8 +609,19 @@ final class UsageFetcher {
 
         let data = outPipe.fileHandleForReading.readDataToEndOfFile()
         guard let raw = String(data: data, encoding: .utf8) else { return nil }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        return firstExecutablePath(in: raw)
+    }
+
+    private func firstExecutablePath(in rawOutput: String) -> String? {
+        let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ":"))
+        for component in rawOutput.components(separatedBy: separators) {
+            let candidate = component.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !candidate.isEmpty, candidate.hasPrefix("/") else { continue }
+            if FileManager.default.isExecutableFile(atPath: candidate) {
+                return candidate
+            }
+        }
+        return nil
     }
 
     func shouldReuseCachedIdentities(_ identities: UsageIdentities, credentials: ExportCredentials) -> Bool {
