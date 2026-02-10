@@ -1,4 +1,4 @@
-.PHONY: up
+.PHONY: up deploy
 
 APP_NAME ?= Agent Island.app
 BUNDLE_ID ?= ai.2lab.AgentIsalnd
@@ -22,3 +22,7 @@ up:
 	mkdir -p "$(INSTALL_DIR)"
 	mv "$(INSTALL_PATH).tmp" "$(INSTALL_PATH)"
 	open "$(INSTALL_PATH)"
+
+deploy:
+	bash scripts/build.sh
+	DEPLOY_NONINTERACTIVE=1 DEPLOY_SKIP_WEBSITE=1 bash scripts/create-release.sh

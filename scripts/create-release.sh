@@ -9,9 +9,6 @@ EXPORT_PATH="$BUILD_DIR/export"
 RELEASE_DIR="$PROJECT_DIR/releases"
 KEYS_DIR="$PROJECT_DIR/.sparkle-keys"
 
-# GitHub repository (owner/repo format)
-GITHUB_REPO="icedac/agent-island"
-
 # Website repo for auto-updating appcast
 WEBSITE_DIR="${AGENT_ISLAND_WEBSITE:-$PROJECT_DIR/../AgentIsland-website}"
 WEBSITE_PUBLIC="$WEBSITE_DIR/public"
@@ -19,6 +16,43 @@ WEBSITE_PUBLIC="$WEBSITE_DIR/public"
 APP_PATH="$EXPORT_PATH/Agent Island.app"
 APP_NAME="AgentIsland"
 KEYCHAIN_PROFILE="AgentIsland"
+DEPLOY_NONINTERACTIVE="${DEPLOY_NONINTERACTIVE:-0}"
+DEPLOY_SKIP_WEBSITE="${DEPLOY_SKIP_WEBSITE:-0}"
+
+is_true() {
+    case "${1:-}" in
+        1|true|TRUE|yes|YES|y|Y|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+resolve_github_repo() {
+    if [ -n "${AGENT_ISLAND_GITHUB_REPO:-}" ]; then
+        echo "$AGENT_ISLAND_GITHUB_REPO"
+        return
+    fi
+
+    local origin_url repo
+    origin_url="$(git -C "$PROJECT_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    case "$origin_url" in
+        git@github.com:*)
+            repo="${origin_url#git@github.com:}"
+            ;;
+        https://github.com/*)
+            repo="${origin_url#https://github.com/}"
+            ;;
+        http://github.com/*)
+            repo="${origin_url#http://github.com/}"
+            ;;
+        *)
+            repo="icedac/agent-island"
+            ;;
+    esac
+    repo="${repo%.git}"
+    echo "$repo"
+}
+
+GITHUB_REPO="$(resolve_github_repo)"
 
 echo "=== Creating Release ==="
 echo ""
@@ -56,13 +90,19 @@ if ! xcrun notarytool history --keychain-profile "$KEYCHAIN_PROFILE" &>/dev/null
     echo ""
     echo "Create an app-specific password at: https://appleid.apple.com"
     echo ""
-    read -p "Skip notarization for now? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
+    if is_true "$DEPLOY_NONINTERACTIVE"; then
+        SKIP_NOTARIZATION=true
+        echo "Non-interactive mode: skipping notarization (no keychain profile)."
+        echo "WARNING: Users will see Gatekeeper warnings!"
+    else
+        read -p "Skip notarization for now? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 1
+        fi
+        SKIP_NOTARIZATION=true
+        echo "WARNING: Skipping notarization. Users will see Gatekeeper warnings!"
     fi
-    SKIP_NOTARIZATION=true
-    echo "WARNING: Skipping notarization. Users will see Gatekeeper warnings!"
 else
     # Create zip for notarization
     ZIP_PATH="$BUILD_DIR/$APP_NAME-$VERSION.zip"
@@ -110,8 +150,17 @@ if command -v create-dmg &> /dev/null; then
         "$APP_PATH"
 else
     echo "Using hdiutil (install create-dmg for prettier DMG: brew install create-dmg)"
+    DMG_STAGING_DIR="$(mktemp -d "$BUILD_DIR/dmg-staging.XXXXXX")"
+    cleanup_dmg_staging() {
+        rm -rf "$DMG_STAGING_DIR"
+    }
+    trap cleanup_dmg_staging EXIT
+
+    ditto "$APP_PATH" "$DMG_STAGING_DIR/Agent Island.app"
+    ln -s /Applications "$DMG_STAGING_DIR/Applications"
+
     hdiutil create -volname "Agent Island" \
-        -srcfolder "$APP_PATH" \
+        -srcfolder "$DMG_STAGING_DIR" \
         -ov -format UDZO \
         "$DMG_PATH"
 fi
@@ -239,7 +288,9 @@ echo ""
 # ============================================
 echo "=== Step 6: Updating Website ==="
 
-if [ -d "$WEBSITE_PUBLIC" ] && [ -f "$RELEASE_DIR/appcast/appcast.xml" ]; then
+if is_true "$DEPLOY_SKIP_WEBSITE"; then
+    echo "Skipping website update (DEPLOY_SKIP_WEBSITE=$DEPLOY_SKIP_WEBSITE)."
+elif [ -d "$WEBSITE_PUBLIC" ] && [ -f "$RELEASE_DIR/appcast/appcast.xml" ]; then
     # Copy appcast to website
     cp "$RELEASE_DIR/appcast/appcast.xml" "$WEBSITE_PUBLIC/appcast.xml"
 
@@ -268,13 +319,18 @@ EOF
             git commit -m "Update appcast for v$VERSION"
             echo "Committed appcast update"
 
-            read -p "Push website changes to deploy? (Y/n) " -n 1 -r
-            echo
-            if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            if is_true "$DEPLOY_NONINTERACTIVE"; then
                 git push
-                echo "Website deployed!"
+                echo "Website deployed (non-interactive mode)."
             else
-                echo "Changes committed but not pushed. Run 'git push' in $WEBSITE_DIR to deploy."
+                read -p "Push website changes to deploy? (Y/n) " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+                    git push
+                    echo "Website deployed!"
+                else
+                    echo "Changes committed but not pushed. Run 'git push' in $WEBSITE_DIR to deploy."
+                fi
             fi
         else
             echo "No changes to commit"
