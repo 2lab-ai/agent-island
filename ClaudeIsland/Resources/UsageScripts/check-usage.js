@@ -397,17 +397,36 @@ async function fetchUsageLimits(ttlSeconds = 60) {
     pendingRequests.delete(tokenHash);
   }
 }
+function shouldRetryWithRefresh(statusCode, errorMessage) {
+  if (statusCode === 401) {
+    return true;
+  }
+  if (statusCode !== 403) {
+    return false;
+  }
+  const lowered = (errorMessage || "").toLowerCase();
+  if (lowered.includes("permission_error")) {
+    return true;
+  }
+  if (lowered.includes("oauth token has been revoked")) {
+    return true;
+  }
+  if (lowered.includes("obtain a new token")) {
+    return true;
+  }
+  return false;
+}
 async function fetchFromApi(credentials, tokenHash, allowRefreshRetry = true) {
   try {
     const response = await fetchClaudeUsageWithToken(credentials.accessToken);
-    if (response.statusCode === 401 && allowRefreshRetry) {
-      debugLog("claude", "fetchFromApi: usage 401, trying refresh");
+    if (allowRefreshRetry && shouldRetryWithRefresh(response.statusCode, response.errorMessage)) {
+      debugLog("claude", "fetchFromApi: usage auth failure, trying refresh", `status=${response.statusCode}`);
       const refreshed = await refreshClaudeToken(credentials);
       if (refreshed?.accessToken) {
         const refreshedHash = hashToken(refreshed.accessToken);
         return fetchFromApi(refreshed, refreshedHash, false);
       }
-      debugLog("claude", "fetchFromApi: refresh after 401 failed");
+      debugLog("claude", "fetchFromApi: refresh after auth failure failed", `status=${response.statusCode}`);
     }
     if (!response.ok || !response.data) {
       debugLog(
