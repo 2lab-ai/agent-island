@@ -534,7 +534,8 @@ function debugLog(context, message, error) {
   if (error) {
     console.error(`${timestamp} ${prefix} ${message}`, error);
   } else {
-    console.log(`${timestamp} ${prefix} ${message}`);
+    // Keep stdout reserved for machine-readable JSON output.
+    console.error(`${timestamp} ${prefix} ${message}`);
   }
 }
 

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct UsageIdentities: Sendable {
@@ -72,6 +73,7 @@ final class UsageFetcher {
     private let dockerImage: String
     private let dockerRunner: DockerCheckUsageRunner?
     private let homeDirectory: URL
+    private let refreshLogWriter: UsageRefreshLogWriter
     private let identityCache = IdentityCache()
 
     init(
@@ -86,6 +88,7 @@ final class UsageFetcher {
         self.dockerImage = dockerImage
         self.dockerRunner = dockerRunner
         self.homeDirectory = homeDirectory
+        self.refreshLogWriter = UsageRefreshLogWriter(homeDirectory: homeDirectory)
     }
 
     func fetchSnapshot(for profile: UsageProfile, forceRefresh: Bool = false) async -> UsageSnapshot {
@@ -214,34 +217,81 @@ final class UsageFetcher {
     }
 
     private func fetchUsageFromDocker(profile: UsageProfile, accounts: [UsageAccount]) async throws -> CheckUsageOutput {
+        let traceID = UUID().uuidString.lowercased()
         let build = try buildTempHome(profile: profile, accounts: accounts)
         defer { try? FileManager.default.removeItem(at: build.homeURL) }
+        logRefresh(event: "refresh_cycle_started", fields: [
+            "trace_id": traceID,
+            "scope": "profile",
+            "profile_name": profile.name,
+            "claude_account_id": profile.claudeAccountId,
+            "codex_account_id": profile.codexAccountId,
+            "gemini_account_id": profile.geminiAccountId,
+            "temp_home": build.homeURL.path,
+        ])
 
         do {
-            let output = try await fetchUsageFromDocker(homeURL: build.homeURL)
-            try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets)
+            let output = try await fetchUsageFromDocker(homeURL: build.homeURL, traceID: traceID)
+            try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "success")
+            logRefresh(event: "refresh_cycle_completed", fields: [
+                "trace_id": traceID,
+                "scope": "profile",
+                "result": "success",
+            ])
             return output
         } catch {
-            try? persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets)
+            try? persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "error")
+            logRefresh(event: "refresh_cycle_completed", fields: [
+                "trace_id": traceID,
+                "scope": "profile",
+                "result": "error",
+                "error": String(describing: error),
+            ])
             throw error
         }
     }
 
     private func fetchUsageFromDocker(credentials: ExportCredentials) async throws -> CheckUsageOutput {
+        let traceID = UUID().uuidString.lowercased()
         let build = try buildTempHome(credentials: credentials)
         defer { try? FileManager.default.removeItem(at: build.homeURL) }
+        var fields: [String: String?] = [
+            "trace_id": traceID,
+            "scope": "current",
+            "temp_home": build.homeURL.path,
+        ]
+        let fileClaude = claudeTokenFingerprint(from: credentials.claude)
+        fields["current_claude_file_refresh_fp"] = fileClaude.refreshFingerprint
+        fields["current_claude_file_access_fp"] = fileClaude.accessFingerprint
+        fields["current_claude_file_expires_at"] = fileClaude.expiresAtISO8601
+        let keychainClaude = claudeTokenFingerprint(from: readClaudeKeychainCredentials())
+        fields["current_claude_keychain_refresh_fp"] = keychainClaude.refreshFingerprint
+        fields["current_claude_keychain_access_fp"] = keychainClaude.accessFingerprint
+        fields["current_claude_keychain_expires_at"] = keychainClaude.expiresAtISO8601
+        logRefresh(event: "refresh_cycle_started", fields: fields)
 
         do {
-            let output = try await fetchUsageFromDocker(homeURL: build.homeURL)
-            try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets)
+            let output = try await fetchUsageFromDocker(homeURL: build.homeURL, traceID: traceID)
+            try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "success")
+            logRefresh(event: "refresh_cycle_completed", fields: [
+                "trace_id": traceID,
+                "scope": "current",
+                "result": "success",
+            ])
             return output
         } catch {
-            try? persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets)
+            try? persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "error")
+            logRefresh(event: "refresh_cycle_completed", fields: [
+                "trace_id": traceID,
+                "scope": "current",
+                "result": "error",
+                "error": String(describing: error),
+            ])
             throw error
         }
     }
 
-    private func fetchUsageFromDocker(homeURL: URL) async throws -> CheckUsageOutput {
+    private func fetchUsageFromDocker(homeURL: URL, traceID: String) async throws -> CheckUsageOutput {
         let scriptPathInContainer = "/home/node/.agent-island-scripts/check-usage.js"
         if dockerRunner == nil {
             let scriptURL = try Self.vendoredScriptURL()
@@ -252,7 +302,8 @@ final class UsageFetcher {
             try await runDockerCheckUsage(
                 homeURL: homeURL,
                 scriptPathInContainer: scriptPathInContainer,
-                dockerContext: dockerContext
+                dockerContext: dockerContext,
+                traceID: traceID
             )
         }
 
@@ -262,6 +313,11 @@ final class UsageFetcher {
         } catch let error as UsageFetcherError {
             if case .dockerFailed(_, let stderr) = error,
                stderr.contains("Cannot find module") || stderr.contains("MODULE_NOT_FOUND") {
+                logRefresh(event: "docker_context_retry", fields: [
+                    "trace_id": traceID,
+                    "reason": "module_not_found",
+                    "retry_context": "desktop-linux",
+                ])
                 json = try await runner(homeURL, scriptPathInContainer, "desktop-linux")
             } else {
                 throw error
@@ -271,6 +327,11 @@ final class UsageFetcher {
         do {
             return try Self.decodeUsageOutput(json)
         } catch {
+            logRefresh(event: "docker_json_decode_failed", fields: [
+                "trace_id": traceID,
+                "error": String(describing: error),
+                "output_prefix": String(data: json.prefix(800), encoding: .utf8),
+            ])
             throw UsageFetcherError.invalidJSON(underlying: error)
         }
     }
@@ -439,19 +500,144 @@ final class UsageFetcher {
         }
     }
 
-    private func persistUpdatedCredentials(from homeURL: URL, targets: [CredentialSyncTarget]) throws {
+    private func persistUpdatedCredentials(
+        from homeURL: URL,
+        targets: [CredentialSyncTarget],
+        traceID: String,
+        reason: String
+    ) throws {
+        logRefresh(event: "credential_sync_started", fields: [
+            "trace_id": traceID,
+            "reason": reason,
+            "target_count": String(targets.count),
+        ])
+
         for target in targets {
             let sourceURL = homeURL.appendingPathComponent(target.relativePath)
-            guard FileManager.default.fileExists(atPath: sourceURL.path) else { continue }
-
-            let sourceData = try Data(contentsOf: sourceURL)
-            if let existingData = try? Data(contentsOf: target.destinationURL),
-               existingData == sourceData {
+            guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+                logRefresh(event: "credential_sync_skipped", fields: [
+                    "trace_id": traceID,
+                    "reason": reason,
+                    "decision": "missing_source",
+                    "relative_path": target.relativePath,
+                    "destination_path": target.destinationURL.path,
+                ])
                 continue
             }
 
-            try writeFile(data: sourceData, to: target.destinationURL)
+            let sourceData = try Data(contentsOf: sourceURL)
+            let existingData = try? Data(contentsOf: target.destinationURL)
+            if let existingData, existingData == sourceData {
+                logRefresh(event: "credential_sync_skipped", fields: [
+                    "trace_id": traceID,
+                    "reason": reason,
+                    "decision": "unchanged",
+                    "relative_path": target.relativePath,
+                    "destination_path": target.destinationURL.path,
+                ])
+                continue
+            }
+
+            let decision = credentialSyncDecision(
+                relativePath: target.relativePath,
+                reason: reason,
+                sourceData: sourceData,
+                destinationData: existingData
+            )
+
+            switch decision {
+            case .skip(let detail):
+                var fields: [String: String?] = [
+                    "trace_id": traceID,
+                    "reason": reason,
+                    "decision": "skipped",
+                    "decision_detail": detail,
+                    "relative_path": target.relativePath,
+                    "destination_path": target.destinationURL.path,
+                ]
+                appendClaudeSyncFingerprints(
+                    into: &fields,
+                    sourceData: sourceData,
+                    destinationData: existingData
+                )
+                logRefresh(event: "credential_sync_skipped", fields: fields)
+            case .write(let detail):
+                try writeFile(data: sourceData, to: target.destinationURL)
+                var fields: [String: String?] = [
+                    "trace_id": traceID,
+                    "reason": reason,
+                    "decision": "written",
+                    "decision_detail": detail,
+                    "relative_path": target.relativePath,
+                    "destination_path": target.destinationURL.path,
+                ]
+                appendClaudeSyncFingerprints(
+                    into: &fields,
+                    sourceData: sourceData,
+                    destinationData: existingData
+                )
+                logRefresh(event: "credential_sync_written", fields: fields)
+            }
         }
+
+        logRefresh(event: "credential_sync_completed", fields: [
+            "trace_id": traceID,
+            "reason": reason,
+        ])
+    }
+
+    private enum CredentialSyncDecision {
+        case write(String)
+        case skip(String)
+    }
+
+    private func credentialSyncDecision(
+        relativePath: String,
+        reason: String,
+        sourceData: Data,
+        destinationData: Data?
+    ) -> CredentialSyncDecision {
+        if reason == "success" {
+            return .write("success_path")
+        }
+
+        guard let destinationData else {
+            return .write("destination_missing_on_error")
+        }
+
+        if !relativePath.hasPrefix(".claude/") {
+            return .skip("non_claude_error_guard")
+        }
+
+        let source = claudeTokenFingerprint(from: sourceData)
+        let destination = claudeTokenFingerprint(from: destinationData)
+
+        if source.refreshFingerprint == destination.refreshFingerprint {
+            return .write("same_refresh_fingerprint_on_error")
+        }
+
+        if let sourceExpiry = source.expiresAt,
+           let destinationExpiry = destination.expiresAt,
+           sourceExpiry.timeIntervalSince(destinationExpiry) > 300 {
+            return .write("newer_expiry_on_error")
+        }
+
+        return .skip("claude_refresh_guard_rejected")
+    }
+
+    private func appendClaudeSyncFingerprints(
+        into fields: inout [String: String?],
+        sourceData: Data?,
+        destinationData: Data?
+    ) {
+        let source = claudeTokenFingerprint(from: sourceData)
+        let destination = claudeTokenFingerprint(from: destinationData)
+        fields["source_refresh_fp"] = source.refreshFingerprint
+        fields["source_access_fp"] = source.accessFingerprint
+        fields["source_expires_at"] = source.expiresAtISO8601
+        fields["destination_refresh_fp"] = destination.refreshFingerprint
+        fields["destination_access_fp"] = destination.accessFingerprint
+        fields["destination_expires_at"] = destination.expiresAtISO8601
     }
 
     private func stageVendoredScript(into homeURL: URL, scriptURL: URL) throws {
@@ -484,12 +670,23 @@ final class UsageFetcher {
     private func runDockerCheckUsage(
         homeURL: URL,
         scriptPathInContainer: String,
-        dockerContext: String?
+        dockerContext: String?,
+        traceID: String
     ) async throws -> Data {
 
         let process = Process()
         let outPipe = Pipe()
         let errPipe = Pipe()
+        let startedAt = Date()
+        let logWriter = refreshLogWriter
+
+        let sanitizeLog: (String) -> String? = { value in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            if trimmed.count <= 20_000 { return trimmed }
+            let prefix = trimmed.prefix(20_000)
+            return "\(prefix)…[truncated \(trimmed.count - 20_000) chars]"
+        }
 
         let dockerExecutable = resolveDockerExecutablePath()
         process.executableURL = URL(fileURLWithPath: dockerExecutable)
@@ -507,9 +704,19 @@ final class UsageFetcher {
             "--rm",
             "--user", "node",
             "--env", "HOME=/home/node",
+            "--env", "DEBUG=1",
             "--volume", "\(homeURL.path):/home/node",
             dockerImage,
             "node", scriptPathInContainer, "--json",
+        ])
+
+        logWriter.write(event: "docker_run_started", fields: [
+            "trace_id": traceID,
+            "docker_context": dockerContext ?? "default",
+            "docker_executable": dockerExecutable,
+            "docker_image": dockerImage,
+            "home_path": homeURL.path,
+            "arguments": arguments.joined(separator: " "),
         ])
 
         process.arguments = arguments
@@ -522,10 +729,35 @@ final class UsageFetcher {
                 let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                 let stderr = String(data: errData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let durationMS = Int(Date().timeIntervalSince(startedAt) * 1000)
 
                 if proc.terminationStatus == 0 {
+                    Task { @MainActor in
+                        logWriter.write(event: "docker_run_completed", fields: [
+                            "trace_id": traceID,
+                            "docker_context": dockerContext ?? "default",
+                            "result": "success",
+                            "exit_code": String(proc.terminationStatus),
+                            "duration_ms": String(durationMS),
+                            "stdout_bytes": String(outData.count),
+                            "stderr_bytes": String(errData.count),
+                            "stderr": sanitizeLog(stderr),
+                        ])
+                    }
                     continuation.resume(returning: outData)
                 } else {
+                    Task { @MainActor in
+                        logWriter.write(event: "docker_run_completed", fields: [
+                            "trace_id": traceID,
+                            "docker_context": dockerContext ?? "default",
+                            "result": "error",
+                            "exit_code": String(proc.terminationStatus),
+                            "duration_ms": String(durationMS),
+                            "stdout_bytes": String(outData.count),
+                            "stderr_bytes": String(errData.count),
+                            "stderr": sanitizeLog(stderr),
+                        ])
+                    }
                     continuation.resume(
                         throwing: UsageFetcherError.dockerFailed(exitCode: proc.terminationStatus, stderr: stderr)
                     )
@@ -535,6 +767,11 @@ final class UsageFetcher {
             do {
                 try process.run()
             } catch {
+                logWriter.write(event: "docker_run_launch_failed", fields: [
+                    "trace_id": traceID,
+                    "docker_context": dockerContext ?? "default",
+                    "error": String(describing: error),
+                ])
                 continuation.resume(throwing: error)
             }
         }
@@ -622,6 +859,130 @@ final class UsageFetcher {
             }
         }
         return nil
+    }
+
+    private struct ClaudeTokenFingerprint {
+        let refreshFingerprint: String?
+        let accessFingerprint: String?
+        let expiresAtISO8601: String?
+        let expiresAt: Date?
+    }
+
+    private func logRefresh(event: String, fields: [String: String?]) {
+        refreshLogWriter.write(event: event, fields: fields)
+    }
+
+    private func sanitizedLogString(_ value: String?, maxLength: Int = 20_000) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.count <= maxLength { return trimmed }
+
+        let prefix = trimmed.prefix(maxLength)
+        return "\(prefix)…[truncated \(trimmed.count - maxLength) chars]"
+    }
+
+    private func claudeTokenFingerprint(from data: Data?) -> ClaudeTokenFingerprint {
+        guard let data else {
+            return ClaudeTokenFingerprint(
+                refreshFingerprint: nil,
+                accessFingerprint: nil,
+                expiresAtISO8601: nil,
+                expiresAt: nil
+            )
+        }
+
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ClaudeTokenFingerprint(
+                refreshFingerprint: nil,
+                accessFingerprint: nil,
+                expiresAtISO8601: nil,
+                expiresAt: nil
+            )
+        }
+
+        let oauth = root["claudeAiOauth"] as? [String: Any] ?? [:]
+        let refreshToken = oauth["refreshToken"] as? String
+        let accessToken = oauth["accessToken"] as? String
+        let expiresAt = parseDateFromAny(oauth["expiresAt"])
+            ?? parseDateFromAny(oauth["expires_at"])
+            ?? parseDateFromAny(root["expiresAt"])
+            ?? parseDateFromAny(root["expires_at"])
+
+        return ClaudeTokenFingerprint(
+            refreshFingerprint: tokenFingerprint(refreshToken),
+            accessFingerprint: tokenFingerprint(accessToken),
+            expiresAtISO8601: iso8601String(expiresAt),
+            expiresAt: expiresAt
+        )
+    }
+
+    private func tokenFingerprint(_ token: String?) -> String? {
+        guard let token else { return nil }
+        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let digest = SHA256.hash(data: Data(trimmed.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return String(hex.prefix(16))
+    }
+
+    private func iso8601String(_ date: Date?) -> String? {
+        guard let date else { return nil }
+        return UsageRefreshLogWriter.iso8601Formatter.string(from: date)
+    }
+
+    private func readClaudeKeychainCredentials() -> Data? {
+        guard let value = readKeychain(service: "Claude Code-credentials") else { return nil }
+        return Data(value.utf8)
+    }
+
+    private func readKeychain(service: String, account: String? = nil) -> String? {
+        var arguments = ["find-generic-password", "-s", service]
+        if let account {
+            arguments.append(contentsOf: ["-a", account])
+        }
+        arguments.append("-w")
+
+        guard let result = runCommand(executable: "/usr/bin/security", arguments: arguments) else {
+            return nil
+        }
+
+        if result.status != 0 {
+            logRefresh(event: "keychain_read_failed", fields: [
+                "service": service,
+                "account": account,
+                "exit_code": String(result.status),
+                "stderr": sanitizedLogString(result.stderr),
+            ])
+            return nil
+        }
+
+        let trimmed = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private func runCommand(executable: String, arguments: [String]) -> (status: Int32, stdout: String, stderr: String)? {
+        let process = Process()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return nil
+        }
+
+        let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        let stdout = String(data: outData, encoding: .utf8) ?? ""
+        let stderr = String(data: errData, encoding: .utf8) ?? ""
+        return (process.terminationStatus, stdout, stderr)
     }
 
     func shouldReuseCachedIdentities(_ identities: UsageIdentities, credentials: ExportCredentials) -> Bool {
@@ -1284,5 +1645,85 @@ private extension UsageFetcher {
         }
 
         return Data(base64Encoded: base64)
+    }
+}
+
+private final class UsageRefreshLogWriter {
+    static let iso8601Formatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private let logFileURL: URL
+    private let logDirURL: URL
+    private let queue = DispatchQueue(label: "ai.2lab.agent-island.usage-refresh-log")
+    private let maxLogBytes = 5 * 1024 * 1024
+
+    init(homeDirectory: URL) {
+        logDirURL = homeDirectory.appendingPathComponent(".agent-island/logs", isDirectory: true)
+        logFileURL = logDirURL.appendingPathComponent("usage-refresh.log")
+    }
+
+    func write(event: String, fields: [String: String?]) {
+        queue.async { [self] in
+            do {
+                try prepareLogFileIfNeeded()
+
+                var payload: [String: String] = [
+                    "timestamp": Self.iso8601Formatter.string(from: Date()),
+                    "event": event,
+                ]
+
+                for (key, value) in fields {
+                    guard let value else { continue }
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { continue }
+                    payload[key] = trimmed
+                }
+
+                let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+                guard let line = String(data: data, encoding: .utf8) else { return }
+                try append(line: line)
+            } catch {
+                // Best-effort diagnostic logging only; never fail caller.
+            }
+        }
+    }
+
+    private func prepareLogFileIfNeeded() throws {
+        try FileManager.default.createDirectory(at: logDirURL, withIntermediateDirectories: true)
+
+        if !FileManager.default.fileExists(atPath: logFileURL.path) {
+            FileManager.default.createFile(
+                atPath: logFileURL.path,
+                contents: Data(),
+                attributes: [.posixPermissions: 0o600]
+            )
+            return
+        }
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: logFileURL.path)
+        let currentSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        if currentSize <= maxLogBytes { return }
+
+        let rotatedURL = logDirURL.appendingPathComponent("usage-refresh.log.1")
+        if FileManager.default.fileExists(atPath: rotatedURL.path) {
+            try FileManager.default.removeItem(at: rotatedURL)
+        }
+        try FileManager.default.moveItem(at: logFileURL, to: rotatedURL)
+        FileManager.default.createFile(
+            atPath: logFileURL.path,
+            contents: Data(),
+            attributes: [.posixPermissions: 0o600]
+        )
+    }
+
+    private func append(line: String) throws {
+        guard let payload = "\(line)\n".data(using: .utf8) else { return }
+        let handle = try FileHandle(forWritingTo: logFileURL)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: payload)
     }
 }
