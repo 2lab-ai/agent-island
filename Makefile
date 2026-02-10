@@ -1,4 +1,4 @@
-.PHONY: up deploy
+.PHONY: up deploy setup-tools
 
 APP_NAME ?= Agent Island.app
 BUNDLE_ID ?= ai.2lab.AgentIsalnd
@@ -26,3 +26,12 @@ up:
 deploy:
 	bash scripts/build.sh
 	DEPLOY_NONINTERACTIVE=1 DEPLOY_SKIP_WEBSITE=1 bash scripts/create-release.sh
+
+setup-tools:
+	bash scripts/ensure-tools.sh "$(TOOLS_MODE)"
+
+up: TOOLS_MODE=up
+up: setup-tools
+
+deploy: TOOLS_MODE=deploy
+deploy: setup-tools

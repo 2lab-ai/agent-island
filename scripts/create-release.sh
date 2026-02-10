@@ -19,6 +19,13 @@ KEYCHAIN_PROFILE="AgentIsland"
 DEPLOY_NONINTERACTIVE="${DEPLOY_NONINTERACTIVE:-0}"
 DEPLOY_SKIP_WEBSITE="${DEPLOY_SKIP_WEBSITE:-0}"
 
+# Load Homebrew environment for non-login shells.
+if [ -x /opt/homebrew/bin/brew ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [ -x /usr/local/bin/brew ]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+fi
+
 is_true() {
     case "${1:-}" in
         1|true|TRUE|yes|YES|y|Y|on|ON) return 0 ;;

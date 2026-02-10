@@ -8,6 +8,19 @@ BUILD_DIR="$PROJECT_DIR/build"
 ARCHIVE_PATH="$BUILD_DIR/ClaudeIsland.xcarchive"
 EXPORT_PATH="$BUILD_DIR/export"
 
+# Load Homebrew environment for non-login shells.
+if [ -x /opt/homebrew/bin/brew ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [ -x /usr/local/bin/brew ]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+fi
+
+# Include user gem binaries (for xcpretty installed via --user-install).
+GEM_USER_BIN="$(ruby -r rubygems -e 'print Gem.user_dir' 2>/dev/null)/bin"
+if [ -d "$GEM_USER_BIN" ]; then
+    export PATH="$GEM_USER_BIN:$PATH"
+fi
+
 echo "=== Building Agent Island ==="
 echo ""
 
