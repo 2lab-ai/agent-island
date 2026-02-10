@@ -491,8 +491,14 @@ final class UsageFetcher {
         let outPipe = Pipe()
         let errPipe = Pipe()
 
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        var arguments: [String] = ["docker"]
+        let dockerExecutable = resolveDockerExecutablePath()
+        process.executableURL = URL(fileURLWithPath: dockerExecutable)
+
+        var arguments: [String] = []
+        if dockerExecutable == "/usr/bin/env" {
+            arguments.append("docker")
+        }
+
         if let dockerContext {
             arguments.append(contentsOf: ["--context", dockerContext])
         }
@@ -532,6 +538,60 @@ final class UsageFetcher {
                 continuation.resume(throwing: error)
             }
         }
+    }
+
+    // Resolve Docker CLI path for GUI app launches where PATH is often minimal.
+    private func resolveDockerExecutablePath() -> String {
+        let fm = FileManager.default
+
+        if let overrideRaw = Foundation.ProcessInfo.processInfo.environment["AGENT_ISLAND_DOCKER_PATH"] {
+            let override = overrideRaw.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            if !override.isEmpty, fm.isExecutableFile(atPath: override) {
+                return override
+            }
+        }
+
+        let candidates = [
+            "/usr/local/bin/docker",
+            "/opt/homebrew/bin/docker",
+            "/Applications/Docker.app/Contents/Resources/bin/docker",
+            "/Applications/Docker.app/Contents/MacOS/com.docker.cli",
+            homeDirectory.appendingPathComponent(".docker/bin/docker").path,
+        ]
+
+        if let found = candidates.first(where: { fm.isExecutableFile(atPath: $0) }) {
+            return found
+        }
+
+        if let shellPath = dockerPathFromLoginShell(),
+           fm.isExecutableFile(atPath: shellPath) {
+            return shellPath
+        }
+
+        return "/usr/bin/env"
+    }
+
+    private func dockerPathFromLoginShell() -> String? {
+        let process = Process()
+        let outPipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", "command -v docker"]
+        process.standardOutput = outPipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        guard let raw = String(data: data, encoding: .utf8) else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     func shouldReuseCachedIdentities(_ identities: UsageIdentities, credentials: ExportCredentials) -> Bool {
