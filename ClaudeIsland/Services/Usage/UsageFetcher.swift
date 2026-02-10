@@ -68,6 +68,8 @@ enum UsageFetcherError: LocalizedError {
 final class UsageFetcher {
     typealias DockerCheckUsageRunner = (URL, String, String?) async throws -> Data
 
+    private static let claudeRefreshLockRegistry = ClaudeRefreshLockRegistry()
+
     private let accountStore: AccountStore
     private let cache: UsageCache
     private let dockerImage: String
@@ -218,76 +220,92 @@ final class UsageFetcher {
 
     private func fetchUsageFromDocker(profile: UsageProfile, accounts: [UsageAccount]) async throws -> CheckUsageOutput {
         let traceID = UUID().uuidString.lowercased()
-        let build = try buildTempHome(profile: profile, accounts: accounts)
-        defer { try? FileManager.default.removeItem(at: build.homeURL) }
-        logRefresh(event: "refresh_cycle_started", fields: [
-            "trace_id": traceID,
-            "scope": "profile",
-            "profile_name": profile.name,
-            "claude_account_id": profile.claudeAccountId,
-            "codex_account_id": profile.codexAccountId,
-            "gemini_account_id": profile.geminiAccountId,
-            "temp_home": build.homeURL.path,
-        ])
+        let lockKeys = claudeRefreshLockKeys(profile: profile, accounts: accounts)
+        return try await withClaudeRefreshLocks(
+            keys: lockKeys,
+            traceID: traceID,
+            scope: "profile:\(profile.name)"
+        ) {
+            let build = try buildTempHome(profile: profile, accounts: accounts)
+            defer { try? FileManager.default.removeItem(at: build.homeURL) }
+            logRefresh(event: "refresh_cycle_started", fields: [
+                "trace_id": traceID,
+                "scope": "profile",
+                "profile_name": profile.name,
+                "claude_account_id": profile.claudeAccountId,
+                "codex_account_id": profile.codexAccountId,
+                "gemini_account_id": profile.geminiAccountId,
+                "temp_home": build.homeURL.path,
+                "lock_key_count": String(lockKeys.count),
+            ])
 
-        do {
-            let output = try await fetchUsageFromDocker(homeURL: build.homeURL, traceID: traceID)
-            try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "success")
-            logRefresh(event: "refresh_cycle_completed", fields: [
-                "trace_id": traceID,
-                "scope": "profile",
-                "result": "success",
-            ])
-            return output
-        } catch {
-            try? persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "error")
-            logRefresh(event: "refresh_cycle_completed", fields: [
-                "trace_id": traceID,
-                "scope": "profile",
-                "result": "error",
-                "error": String(describing: error),
-            ])
-            throw error
+            do {
+                let output = try await fetchUsageFromDocker(homeURL: build.homeURL, traceID: traceID)
+                try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "success")
+                logRefresh(event: "refresh_cycle_completed", fields: [
+                    "trace_id": traceID,
+                    "scope": "profile",
+                    "result": "success",
+                ])
+                return output
+            } catch {
+                try? persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "error")
+                logRefresh(event: "refresh_cycle_completed", fields: [
+                    "trace_id": traceID,
+                    "scope": "profile",
+                    "result": "error",
+                    "error": String(describing: error),
+                ])
+                throw error
+            }
         }
     }
 
     private func fetchUsageFromDocker(credentials: ExportCredentials) async throws -> CheckUsageOutput {
         let traceID = UUID().uuidString.lowercased()
-        let build = try buildTempHome(credentials: credentials)
-        defer { try? FileManager.default.removeItem(at: build.homeURL) }
-        var fields: [String: String?] = [
-            "trace_id": traceID,
-            "scope": "current",
-            "temp_home": build.homeURL.path,
-        ]
-        let fileClaude = claudeTokenFingerprint(from: credentials.claude)
-        fields["current_claude_file_refresh_fp"] = fileClaude.refreshFingerprint
-        fields["current_claude_file_access_fp"] = fileClaude.accessFingerprint
-        fields["current_claude_file_expires_at"] = fileClaude.expiresAtISO8601
-        let keychainClaude = claudeTokenFingerprint(from: readClaudeKeychainCredentials())
-        fields["current_claude_keychain_refresh_fp"] = keychainClaude.refreshFingerprint
-        fields["current_claude_keychain_access_fp"] = keychainClaude.accessFingerprint
-        fields["current_claude_keychain_expires_at"] = keychainClaude.expiresAtISO8601
-        logRefresh(event: "refresh_cycle_started", fields: fields)
+        let lockKeys = claudeRefreshLockKeys(credentials: credentials)
+        return try await withClaudeRefreshLocks(
+            keys: lockKeys,
+            traceID: traceID,
+            scope: "current"
+        ) {
+            let build = try buildTempHome(credentials: credentials)
+            defer { try? FileManager.default.removeItem(at: build.homeURL) }
+            var fields: [String: String?] = [
+                "trace_id": traceID,
+                "scope": "current",
+                "temp_home": build.homeURL.path,
+                "lock_key_count": String(lockKeys.count),
+            ]
+            let fileClaude = claudeTokenFingerprint(from: credentials.claude)
+            fields["current_claude_file_refresh_fp"] = fileClaude.refreshFingerprint
+            fields["current_claude_file_access_fp"] = fileClaude.accessFingerprint
+            fields["current_claude_file_expires_at"] = fileClaude.expiresAtISO8601
+            let keychainClaude = claudeTokenFingerprint(from: readClaudeKeychainCredentials())
+            fields["current_claude_keychain_refresh_fp"] = keychainClaude.refreshFingerprint
+            fields["current_claude_keychain_access_fp"] = keychainClaude.accessFingerprint
+            fields["current_claude_keychain_expires_at"] = keychainClaude.expiresAtISO8601
+            logRefresh(event: "refresh_cycle_started", fields: fields)
 
-        do {
-            let output = try await fetchUsageFromDocker(homeURL: build.homeURL, traceID: traceID)
-            try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "success")
-            logRefresh(event: "refresh_cycle_completed", fields: [
-                "trace_id": traceID,
-                "scope": "current",
-                "result": "success",
-            ])
-            return output
-        } catch {
-            try? persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "error")
-            logRefresh(event: "refresh_cycle_completed", fields: [
-                "trace_id": traceID,
-                "scope": "current",
-                "result": "error",
-                "error": String(describing: error),
-            ])
-            throw error
+            do {
+                let output = try await fetchUsageFromDocker(homeURL: build.homeURL, traceID: traceID)
+                try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "success")
+                logRefresh(event: "refresh_cycle_completed", fields: [
+                    "trace_id": traceID,
+                    "scope": "current",
+                    "result": "success",
+                ])
+                return output
+            } catch {
+                try? persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "error")
+                logRefresh(event: "refresh_cycle_completed", fields: [
+                    "trace_id": traceID,
+                    "scope": "current",
+                    "result": "error",
+                    "error": String(describing: error),
+                ])
+                throw error
+            }
         }
     }
 
@@ -497,6 +515,84 @@ final class UsageFetcher {
             return ".codex/auth.json"
         case .gemini:
             return ".gemini/oauth_creds.json"
+        }
+    }
+
+    private func claudeRefreshLockKeys(profile: UsageProfile, accounts: [UsageAccount]) -> [String] {
+        guard let accountId = profile.claudeAccountId,
+              let account = accounts.first(where: { $0.id == accountId }) else {
+            return []
+        }
+
+        let root = URL(fileURLWithPath: account.rootPath, isDirectory: true)
+        var keys = [root.appendingPathComponent(credentialRelativePath(for: .claude)).path]
+        let credentialData = loadCredentialFile(
+            accounts: accounts,
+            accountId: accountId,
+            relativePath: credentialRelativePath(for: .claude)
+        )
+        if let tokenKey = claudeRefreshTokenLockKey(from: credentialData) {
+            keys.append(tokenKey)
+        }
+        return keys
+    }
+
+    private func claudeRefreshLockKeys(credentials: ExportCredentials) -> [String] {
+        guard credentials.claude != nil else { return [] }
+        var keys = [homeDirectory.appendingPathComponent(credentialRelativePath(for: .claude)).path]
+        if let tokenKey = claudeRefreshTokenLockKey(from: credentials.claude) {
+            keys.append(tokenKey)
+        }
+        return keys
+    }
+
+    private func claudeRefreshTokenLockKey(from data: Data?) -> String? {
+        let fingerprint = claudeTokenFingerprint(from: data)
+        guard let refreshFingerprint = fingerprint.refreshFingerprint else { return nil }
+        return "claude-refresh-token:\(refreshFingerprint)"
+    }
+
+    private func withClaudeRefreshLocks<T>(
+        keys: [String],
+        traceID: String,
+        scope: String,
+        operation: () async throws -> T
+    ) async throws -> T {
+        let normalized = Array(Set(keys.filter { !$0.isEmpty })).sorted()
+        guard !normalized.isEmpty else {
+            return try await operation()
+        }
+
+        logRefresh(event: "refresh_lock_wait", fields: [
+            "trace_id": traceID,
+            "scope": scope,
+            "lock_keys": normalized.joined(separator: ","),
+        ])
+        await Self.claudeRefreshLockRegistry.acquire(normalized)
+        logRefresh(event: "refresh_lock_acquired", fields: [
+            "trace_id": traceID,
+            "scope": scope,
+            "lock_keys": normalized.joined(separator: ","),
+        ])
+
+        do {
+            let result = try await operation()
+            await Self.claudeRefreshLockRegistry.release(normalized)
+            logRefresh(event: "refresh_lock_released", fields: [
+                "trace_id": traceID,
+                "scope": scope,
+                "result": "success",
+            ])
+            return result
+        } catch {
+            await Self.claudeRefreshLockRegistry.release(normalized)
+            logRefresh(event: "refresh_lock_released", fields: [
+                "trace_id": traceID,
+                "scope": scope,
+                "result": "error",
+                "error": String(describing: error),
+            ])
+            throw error
         }
     }
 
@@ -1734,5 +1830,50 @@ private final class UsageRefreshLogWriter {
         defer { try? handle.close() }
         try handle.seekToEnd()
         try handle.write(contentsOf: payload)
+    }
+}
+
+private actor ClaudeRefreshLockRegistry {
+    private var lockedKeys: Set<String> = []
+    private var waiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+
+    func acquire(_ keys: [String]) async {
+        for key in keys {
+            await acquireSingle(key)
+        }
+    }
+
+    func release(_ keys: [String]) {
+        for key in keys.reversed() {
+            releaseSingle(key)
+        }
+    }
+
+    private func acquireSingle(_ key: String) async {
+        if !lockedKeys.contains(key) {
+            lockedKeys.insert(key)
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            waiters[key, default: []].append(continuation)
+        }
+    }
+
+    private func releaseSingle(_ key: String) {
+        guard lockedKeys.contains(key) else { return }
+
+        if var queue = waiters[key], !queue.isEmpty {
+            let next = queue.removeFirst()
+            if queue.isEmpty {
+                waiters.removeValue(forKey: key)
+            } else {
+                waiters[key] = queue
+            }
+            next.resume()
+            return
+        }
+
+        lockedKeys.remove(key)
     }
 }
