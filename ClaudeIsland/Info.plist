@@ -21,7 +21,7 @@
     <key>SUFeedURL</key>
     <string>https://github.com/2lab-ai/agent-island/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key>
-    <string>w5NwH5KRfE7LfeZ09J8lWx3UQrWTqUbfH4HHBa1OPRk=</string>
+    <string>0d5tnTBFvhPTWtuAO/Ek9SF1tNqvvARUcDPKz7AIFQY=</string>
     <key>SUEnableAutomaticChecks</key>
     <true/>
 </dict>

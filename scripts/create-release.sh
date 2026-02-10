@@ -248,6 +248,8 @@ else
 
     # Generate/update appcast
     echo "Generating appcast..."
+    # Keep appcast staging deterministic to avoid duplicate bundle version collisions.
+    rm -rf "$APPCAST_DIR"
     mkdir -p "$APPCAST_DIR"
 
     # Copy DMG to appcast directory
