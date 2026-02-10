@@ -216,41 +216,52 @@ for path_pattern in "${POSSIBLE_PATHS[@]}"; do
 done
 
 if [ -z "$SPARKLE_SIGN" ]; then
-    echo "WARNING: Could not find Sparkle tools."
+    echo "ERROR: Could not find Sparkle tools."
     echo "Build the project in Xcode first to download Sparkle package."
-    echo ""
-    echo "Skipping Sparkle signing. You'll need to manually:"
-    echo "1. Sign the DMG with sign_update"
-    echo "2. Generate appcast with generate_appcast"
+    exit 1
 else
-    # Check for private key
-    if [ ! -f "$KEYS_DIR/eddsa_private_key" ]; then
-        echo "WARNING: No private key found at $KEYS_DIR/eddsa_private_key"
-        echo "Run ./scripts/generate-keys.sh first"
-        echo ""
-        echo "Skipping Sparkle signing."
+    SIGN_ARGS=()
+    APPCAST_ARGS=()
+
+    if [ -f "$KEYS_DIR/eddsa_private_key" ]; then
+        SIGN_ARGS=(--ed-key-file "$KEYS_DIR/eddsa_private_key")
+        APPCAST_ARGS=(--ed-key-file "$KEYS_DIR/eddsa_private_key")
+        echo "Using Sparkle private key file: $KEYS_DIR/eddsa_private_key"
     else
-        # Generate signature
-        echo "Signing DMG for Sparkle..."
-        SIGNATURE=$("$SPARKLE_SIGN" --ed-key-file "$KEYS_DIR/eddsa_private_key" "$DMG_PATH")
-
-        echo ""
-        echo "Sparkle signature:"
-        echo "$SIGNATURE"
-        echo ""
-
-        # Generate/update appcast
-        echo "Generating appcast..."
-        mkdir -p "$APPCAST_DIR"
-
-        # Copy DMG to appcast directory
-        cp "$DMG_PATH" "$APPCAST_DIR/"
-
-        # Generate appcast.xml
-        "$GENERATE_APPCAST" --ed-key-file "$KEYS_DIR/eddsa_private_key" "$APPCAST_DIR"
-
-        echo "Appcast generated at: $APPCAST_XML_PATH"
+        echo "No private key file found at $KEYS_DIR/eddsa_private_key"
+        echo "Trying Sparkle key from macOS Keychain account 'ed25519'..."
     fi
+
+    # Generate signature
+    echo "Signing DMG for Sparkle..."
+    if ! SIGNATURE=$("$SPARKLE_SIGN" "${SIGN_ARGS[@]}" "$DMG_PATH"); then
+        echo "ERROR: Sparkle signing failed."
+        echo "Provide $KEYS_DIR/eddsa_private_key or configure Keychain key account 'ed25519'."
+        echo "Run ./scripts/generate-keys.sh if needed."
+        exit 1
+    fi
+
+    echo ""
+    echo "Sparkle signature:"
+    echo "$SIGNATURE"
+    echo ""
+
+    # Generate/update appcast
+    echo "Generating appcast..."
+    mkdir -p "$APPCAST_DIR"
+
+    # Copy DMG to appcast directory
+    cp "$DMG_PATH" "$APPCAST_DIR/"
+
+    # Generate appcast.xml
+    if ! "$GENERATE_APPCAST" "${APPCAST_ARGS[@]}" "$APPCAST_DIR"; then
+        echo "ERROR: appcast generation failed."
+        echo "Provide $KEYS_DIR/eddsa_private_key or configure Keychain key account 'ed25519'."
+        echo "Run ./scripts/generate-keys.sh if needed."
+        exit 1
+    fi
+
+    echo "Appcast generated at: $APPCAST_XML_PATH"
 fi
 
 echo ""
