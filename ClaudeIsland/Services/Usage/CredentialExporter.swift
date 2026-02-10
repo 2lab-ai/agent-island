@@ -57,12 +57,15 @@ final class CredentialExporter {
     }
 
     private func readClaudeCredentials() -> Data? {
+        let path = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".claude/.credentials.json")
+        if let data = try? Data(contentsOf: path) {
+            return data
+        }
         if let keychain = readKeychain(service: "Claude Code-credentials") {
             return Data(keychain.utf8)
         }
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/.credentials.json")
-        return try? Data(contentsOf: path)
+        return nil
     }
 
     private func readCodexCredentials() -> Data? {

@@ -177,9 +177,21 @@ final class UsageDashboardViewModel: ObservableObject {
             updateCurrentAccountIds(credentials: credentials)
             updateLiveProfileName()
             let fetchedCurrent = await fetcher.fetchCurrentSnapshot(credentials: credentials, forceRefresh: forceRefresh)
+            canonicalizeCurrentClaudeAccountId(using: fetchedCurrent)
             let mergedCurrent = snapshotWithRememberedIdentities(fetchedCurrent, accountIds: currentAccountIds)
             rememberIdentities(from: mergedCurrent, accountIds: currentAccountIds)
             currentSnapshot = mergedCurrent
+            updateLiveProfileName()
+
+            do {
+                let latestCredentials = exporter.loadCurrentCredentials()
+                try syncCurrentClaudeCredentialsToStoredProfiles(
+                    credentials: latestCredentials,
+                    currentSnapshot: mergedCurrent
+                )
+            } catch {
+                lastActionMessage = "Credential sync warning: \(error.localizedDescription)"
+            }
 
             for profile in profilesToRefresh {
                 if Task.isCancelled { break }
@@ -212,6 +224,139 @@ final class UsageDashboardViewModel: ObservableObject {
 
         currentAccountIds = next
         invalidateCurrentIdentityCacheIfNeeded(previous: previous, next: next)
+    }
+
+    private func canonicalizeCurrentClaudeAccountId(using snapshot: UsageSnapshot) {
+        guard let email = normalizedIdentityEmail(snapshot.identities.claudeEmail) else { return }
+        guard let canonicalId = UsageAccountIdFormatter.displayAccountId(
+            provider: .claude,
+            email: email,
+            claudeIsTeam: snapshot.identities.claudeIsTeam
+        ) else {
+            return
+        }
+
+        guard canonicalId != currentAccountIds.claude else { return }
+        currentAccountIds = UsageAccountIdSet(
+            claude: canonicalId,
+            codex: currentAccountIds.codex,
+            gemini: currentAccountIds.gemini
+        )
+        lastKnownCurrentAccountIds = currentAccountIds
+    }
+
+    private func syncCurrentClaudeCredentialsToStoredProfiles(
+        credentials: ExportCredentials,
+        currentSnapshot: UsageSnapshot
+    ) throws {
+        guard let claudeData = credentials.claude else { return }
+
+        var accountSnapshot = try accountStore.loadSnapshot()
+        let targetAccountIds = matchingStoredClaudeAccountIds(
+            currentSnapshot: currentSnapshot,
+            accounts: accountSnapshot.accounts
+        )
+        guard !targetAccountIds.isEmpty else { return }
+
+        var changed = false
+        let now = Date()
+
+        for accountId in targetAccountIds {
+            guard let index = accountSnapshot.accounts.firstIndex(where: {
+                $0.service == .claude && $0.id == accountId
+            }) else {
+                continue
+            }
+
+            let account = accountSnapshot.accounts[index]
+            let destinationURL = URL(fileURLWithPath: account.rootPath, isDirectory: true)
+                .appendingPathComponent(".claude/.credentials.json")
+
+            if let existing = try? Data(contentsOf: destinationURL), existing == claudeData {
+                continue
+            }
+
+            try writeCredentialData(claudeData, to: destinationURL)
+            accountSnapshot.accounts[index] = UsageAccount(
+                id: account.id,
+                service: account.service,
+                label: account.label,
+                rootPath: account.rootPath,
+                updatedAt: now
+            )
+            changed = true
+        }
+
+        if changed {
+            try accountStore.saveSnapshot(accountSnapshot)
+        }
+    }
+
+    private func matchingStoredClaudeAccountIds(
+        currentSnapshot: UsageSnapshot,
+        accounts: [UsageAccount]
+    ) -> [String] {
+        guard let currentClaudeId = currentAccountIds.claude else { return [] }
+
+        var ids: Set<String> = []
+        if accounts.contains(where: { $0.service == .claude && $0.id == currentClaudeId }) {
+            ids.insert(currentClaudeId)
+        }
+
+        let currentEmail = normalizedIdentityEmail(currentSnapshot.identities.claudeEmail)
+            ?? normalizedIdentityEmail(lastKnownEmailByAccountId[currentClaudeId])
+        let currentTeam = currentSnapshot.identities.claudeIsTeam
+            ?? lastKnownClaudeIsTeamByAccountId[currentClaudeId]
+
+        guard let currentEmail else { return ids.sorted() }
+
+        if let canonicalId = UsageAccountIdFormatter.displayAccountId(
+            provider: .claude,
+            email: currentEmail,
+            claudeIsTeam: currentTeam
+        ), accounts.contains(where: { $0.service == .claude && $0.id == canonicalId }) {
+            ids.insert(canonicalId)
+        }
+
+        for profile in profiles {
+            guard let profileClaudeId = profile.claudeAccountId else { continue }
+            guard accounts.contains(where: { $0.service == .claude && $0.id == profileClaudeId }) else { continue }
+
+            if profileClaudeId == currentClaudeId {
+                ids.insert(profileClaudeId)
+                continue
+            }
+
+            let profileEmail = normalizedIdentityEmail(lastKnownEmailByAccountId[profileClaudeId])
+            guard profileEmail == currentEmail else { continue }
+
+            let profileTeam = lastKnownClaudeIsTeamByAccountId[profileClaudeId]
+            if let currentTeam, let profileTeam, currentTeam != profileTeam {
+                continue
+            }
+
+            ids.insert(profileClaudeId)
+        }
+
+        return ids.sorted()
+    }
+
+    private func writeCredentialData(_ data: Data, to destinationURL: URL) throws {
+        try FileManager.default.createDirectory(
+            at: destinationURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: destinationURL, options: [.atomic])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: destinationURL.path
+        )
+    }
+
+    private func normalizedIdentityEmail(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty ? nil : normalized
     }
 
     private func computeAccountIds(credentials: ExportCredentials) -> UsageAccountIdSet {
