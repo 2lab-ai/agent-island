@@ -2333,6 +2333,7 @@ private struct TierBadge: View {
 private struct UsageTokenRefreshRow: View {
     let tokenRefresh: TokenRefreshInfo?
     let now: Date
+    private let resetColumnWidth: CGFloat = 60
 
     var body: some View {
         HStack(spacing: 6) {
@@ -2347,12 +2348,12 @@ private struct UsageTokenRefreshRow: View {
                 emptyColor: Color.white.opacity(0.08)
             )
             .frame(height: 6)
-            .frame(width: 46)
+            .frame(width: resetColumnWidth)
 
             timeRemainingText
-                .frame(width: 46, alignment: .center)
+                .frame(width: resetColumnWidth, alignment: .center)
                 .lineLimit(1)
-                .minimumScaleFactor(0.7)
+                .minimumScaleFactor(0.85)
 
             Spacer(minLength: 0)
         }
@@ -2461,6 +2462,8 @@ private struct UsageWindowRow: View {
     let percentUsed: Double?
     let resetAt: Date?
     let now: Date
+    private let usageColumnWidth: CGFloat = 46
+    private let resetColumnWidth: CGFloat = 60
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -2476,7 +2479,7 @@ private struct UsageWindowRow: View {
                     emptyColor: Color.white.opacity(0.08)
                 )
                 .frame(height: 6)
-                .frame(width: 46)
+                .frame(width: usageColumnWidth)
 
                 MiniSegmentBar(
                     fraction: resetRemainingFraction,
@@ -2484,7 +2487,7 @@ private struct UsageWindowRow: View {
                     emptyColor: Color.white.opacity(0.08)
                 )
                 .frame(height: 6)
-                .frame(width: 46)
+                .frame(width: resetColumnWidth)
 
                 Spacer(minLength: 0)
             }
@@ -2496,14 +2499,14 @@ private struct UsageWindowRow: View {
                 Text(remainingPercentString)
                     .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     .foregroundColor(usageTextColor)
-                    .frame(width: 46, alignment: .center)
+                    .frame(width: usageColumnWidth, alignment: .center)
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
 
                 timeRemainingText
-                    .frame(width: 46, alignment: .center)
+                    .frame(width: resetColumnWidth, alignment: .center)
                     .lineLimit(1)
-                    .minimumScaleFactor(0.7)
+                    .minimumScaleFactor(0.85)
 
                 Spacer(minLength: 0)
             }

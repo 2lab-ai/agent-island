@@ -13,7 +13,7 @@ enum UsageDurationText {
         secondUnitColor: Color = Color.white.opacity(0.35)
     ) -> Text {
         let clamped = max(0, seconds)
-        let largestDigitSize: CGFloat = 12
+        let largestDigitSize: CGFloat = 13
         let mediumDigitSize: CGFloat = 11
         let baseDigitSize: CGFloat = 10
 
