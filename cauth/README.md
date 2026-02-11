@@ -1,13 +1,15 @@
 # cauth
 
-`cauth` is a standalone macOS CLI for Claude auth profile save/switch/refresh.
+`cauth` is a standalone Rust CLI for Claude auth profile save/switch/refresh.
 
-## Commands
+## Build and run
 
 ```bash
 cd /Users/icedac/2lab.ai/agent-island/cauth
-swift run cauth help
+cargo run -- help
 ```
+
+## Commands
 
 - `cauth save <profile>`
   - Saves current Claude auth (`~/.claude/.credentials.json`, keychain fallback) into:
@@ -20,13 +22,14 @@ swift run cauth help
     - macOS keychain service: `Claude Code-credentials`
 
 - `cauth refresh`
-  - Refreshes all Claude profiles using refresh token.
+  - Refreshes all saved Claude profiles using refresh tokens.
   - Prints per-profile summary:
     - profile name
-    - email (if present in credential payload)
+    - email
     - plan
-    - 5h / 7d usage
-    - key remaining time
+    - `5h` usage
+    - `7d` usage
+    - key remaining duration
 
 ## Account ID policy
 
@@ -35,23 +38,23 @@ Claude account IDs are email-based when possible:
 - personal: `acct_claude_<email-slug>`
 - team: `acct_claude_team_<email-slug>`
 
-`<email-slug>` replaces non-alphanumeric chars with `_` and lowercases.
+`<email-slug>` is lowercase and replaces non-alphanumeric chars with `_`.
 
 If email is unavailable, fallback is refresh-token fingerprint hash.
 
 ## Refresh safety
 
-- Refresh writes are atomic (`Data.write(..., .atomic)`).
-- Refresh lock key is derived from refresh token fingerprint.
-- Legacy duplicate accounts sharing one refresh token are deduplicated:
+- Credential writes are atomic (tempfile + rename).
+- Refresh lock key is derived from refresh-token fingerprint.
+- Legacy duplicate accounts sharing a refresh token are deduped:
   - token is refreshed once
-  - resulting credential is written back to all matching accounts
+  - resulting credential is written to all matching account paths
 
 ## Test
 
 ```bash
 cd /Users/icedac/2lab.ai/agent-island/cauth
-swift test
+cargo test
 ```
 
 ## Optional env overrides
