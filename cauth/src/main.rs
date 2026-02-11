@@ -11,8 +11,8 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -28,6 +28,7 @@ static REFRESH_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 type ProcessRunner = Arc<dyn Fn(&str, &[String]) -> ProcessExecutionResult + Send + Sync>;
 type RefreshClient = Arc<dyn Fn(&str, &str) -> CliResult<ClaudeRefreshPayload> + Send + Sync>;
 type UsageClient = Arc<dyn Fn(&str) -> Option<UsageSummary> + Send + Sync>;
+type UsageRawClient = Arc<dyn Fn(&str) -> UsageRawResult + Send + Sync>;
 
 #[derive(Debug, Error)]
 #[error("{message}")]
@@ -51,6 +52,7 @@ type CliResult<T> = Result<T, CliError>;
 enum CliCommand {
     Help,
     List,
+    Status,
     Save(String),
     Switch(String),
     Refresh,
@@ -69,6 +71,12 @@ impl CliCommand {
                     return Err(CliError::new("usage: cauth list", 2));
                 }
                 Ok(Self::List)
+            }
+            "status" => {
+                if args.len() != 1 {
+                    return Err(CliError::new("usage: cauth status", 2));
+                }
+                Ok(Self::Status)
             }
             "save" => {
                 if args.len() != 2 {
@@ -205,6 +213,12 @@ struct UsageSummary {
 }
 
 #[derive(Debug, Clone)]
+struct UsageRawResult {
+    request_raw: String,
+    response_raw: String,
+}
+
+#[derive(Debug, Clone)]
 struct RefreshResult {
     credentials_data: Vec<u8>,
     email: Option<String>,
@@ -323,6 +337,7 @@ struct CAuthApp {
     process_runner: ProcessRunner,
     refresh_client: RefreshClient,
     usage_client: UsageClient,
+    usage_raw_client: UsageRawClient,
 }
 
 impl CAuthApp {
@@ -350,6 +365,10 @@ impl CAuthApp {
         let usage_endpoint = claude_usage_endpoint.clone();
         let usage_client: UsageClient =
             Arc::new(move |access_token| default_usage_client(&usage_endpoint, access_token));
+        let usage_raw_endpoint = claude_usage_endpoint.clone();
+        let usage_raw_client: UsageRawClient = Arc::new(move |access_token| {
+            default_usage_raw_client(&usage_raw_endpoint, access_token)
+        });
 
         Self::with_clients_internal(
             home_dir,
@@ -358,6 +377,7 @@ impl CAuthApp {
             Arc::new(default_process_runner),
             refresh_client,
             usage_client,
+            usage_raw_client,
         )
     }
 
@@ -375,6 +395,26 @@ impl CAuthApp {
             process_runner,
             refresh_client,
             usage_client,
+            Arc::new(|access_token| default_usage_raw_client(CLAUDE_USAGE_ENDPOINT, access_token)),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_clients_and_usage_raw(
+        home_dir: PathBuf,
+        process_runner: ProcessRunner,
+        refresh_client: RefreshClient,
+        usage_client: UsageClient,
+        usage_raw_client: UsageRawClient,
+    ) -> Self {
+        Self::with_clients_internal(
+            home_dir,
+            CLAUDE_KEYCHAIN_SERVICE_NAME.to_string(),
+            "/usr/bin/security".to_string(),
+            process_runner,
+            refresh_client,
+            usage_client,
+            usage_raw_client,
         )
     }
 
@@ -385,6 +425,7 @@ impl CAuthApp {
         process_runner: ProcessRunner,
         refresh_client: RefreshClient,
         usage_client: UsageClient,
+        usage_raw_client: UsageRawClient,
     ) -> Self {
         let agent_root = home_dir.join(".agent-island");
         let accounts_dir = agent_root.join("accounts");
@@ -402,6 +443,7 @@ impl CAuthApp {
             process_runner,
             refresh_client,
             usage_client,
+            usage_raw_client,
         }
     }
 
@@ -410,6 +452,7 @@ impl CAuthApp {
             "cauth - Claude auth profile CLI\n\n\
              Usage:\n\
                cauth list                     List saved profiles and current account\n\
+               cauth status                   Raw usage API request/response for keychain + file\n\
                cauth save <profile-name>      Save current Claude auth into named profile\n\
                cauth switch <profile-name>    Switch active Claude auth to named profile\n\
                cauth refresh                  Refresh all saved Claude profiles and print usage\n\
@@ -435,7 +478,8 @@ impl CAuthApp {
         })?;
 
         let mut snapshot = self.account_store.load_snapshot()?;
-        let account_id = self.resolve_snapshot_account_id_for_credentials(&snapshot, &credential_data);
+        let account_id =
+            self.resolve_snapshot_account_id_for_credentials(&snapshot, &credential_data);
         let account_root = self.accounts_dir.join(&account_id);
         let account_credential_path = account_root.join(".claude/.credentials.json");
         write_file_atomic(&account_credential_path, &credential_data)?;
@@ -536,18 +580,110 @@ impl CAuthApp {
         Ok(())
     }
 
+    fn status(&self) -> CliResult<()> {
+        for line in self.status_report_lines() {
+            println!("{}", line);
+        }
+        Ok(())
+    }
+
+    fn status_report_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        let keychain_data = self
+            .read_keychain(&self.keychain_service_name, None)
+            .map(|raw| raw.into_bytes());
+        self.append_status_source_lines(
+            &mut lines,
+            "osxkeychain",
+            "service=Claude Code-credentials",
+            keychain_data.as_deref(),
+            None,
+        );
+
+        lines.push(String::new());
+        let active_path = self.home_dir.join(".claude/.credentials.json");
+        let file_read = fs::read(&active_path);
+        let (file_data, file_error) = match file_read {
+            Ok(data) => (Some(data), None),
+            Err(err) => (
+                None,
+                Some(format!("failed to read {}: {}", active_path.display(), err)),
+            ),
+        };
+        self.append_status_source_lines(
+            &mut lines,
+            "~/.claude/.credentials.json",
+            &active_path.display().to_string(),
+            file_data.as_deref(),
+            file_error.as_deref(),
+        );
+
+        lines
+    }
+
+    fn append_status_source_lines(
+        &self,
+        lines: &mut Vec<String>,
+        source_name: &str,
+        source_detail: &str,
+        credential_data: Option<&[u8]>,
+        read_error: Option<&str>,
+    ) {
+        lines.push(format!("Source: {}", source_name));
+        lines.push(format!("Credential Source Detail: {}", source_detail));
+
+        if let Some(error) = read_error {
+            lines.push(format!("Credential Read Error: {}", error));
+        }
+
+        let Some(credential_data) = credential_data else {
+            lines.push("Raw Credential:".to_string());
+            lines.push("  (skipped: credential not found)".to_string());
+            lines.push("Raw Request:".to_string());
+            lines.push("  (skipped: credential not found)".to_string());
+            lines.push("Raw Response:".to_string());
+            lines.push("  (skipped: credential not found)".to_string());
+            return;
+        };
+
+        lines.push("Raw Credential:".to_string());
+        lines.push(render_raw_credential(credential_data));
+
+        let parsed = parse_claude_credentials(credential_data);
+        let Some(access_token) = parsed.access_token.as_deref() else {
+            lines.push("Raw Request:".to_string());
+            lines.push("  (skipped: accessToken missing in credential)".to_string());
+            lines.push("Raw Response:".to_string());
+            lines.push("  (skipped: accessToken missing in credential)".to_string());
+            return;
+        };
+
+        let raw = (self.usage_raw_client)(access_token);
+        lines.push("Raw Request:".to_string());
+        lines.push(raw.request_raw);
+        lines.push("Raw Response:".to_string());
+        lines.push(raw.response_raw);
+    }
+
     fn collect_claude_inventory_status_from_data(
         &self,
         data: &[u8],
         account_id: Option<&str>,
     ) -> ClaudeInventoryStatus {
         let parsed = parse_claude_credentials(data);
-        let email = extract_claude_email(&parsed.root)
-            .or_else(|| account_id.and_then(email_from_account_id))
-            .unwrap_or_else(|| "-".to_string());
+        let (email, email_source) = self.resolve_inventory_email(&parsed.root, account_id);
         let plan = resolve_claude_plan(&parsed.root).unwrap_or_else(|| "-".to_string());
         let key_remaining = format_key_remaining(parsed.expires_at.as_ref());
         let usage = self.fetch_claude_usage_summary(parsed.access_token.as_deref());
+        self.log_refresh(
+            "cauth_email_resolution",
+            &[
+                ("account_id", account_id.map(|value| value.to_string())),
+                ("email", Some(email.clone())),
+                ("email_source", Some(email_source)),
+            ],
+        );
         let five_hour = format_usage_window(
             usage.as_ref().and_then(|item| item.five_hour_percent),
             usage
@@ -577,10 +713,19 @@ impl CAuthApp {
         account_id: Option<&str>,
     ) -> ClaudeInventoryStatus {
         if !credential_path.exists() {
+            let fallback_email = account_id
+                .and_then(email_from_account_id)
+                .unwrap_or_else(|| "-".to_string());
+            self.log_refresh(
+                "cauth_email_resolution",
+                &[
+                    ("account_id", account_id.map(|value| value.to_string())),
+                    ("email", Some(fallback_email.clone())),
+                    ("email_source", Some("credential_missing".to_string())),
+                ],
+            );
             return ClaudeInventoryStatus {
-                email: account_id
-                    .and_then(email_from_account_id)
-                    .unwrap_or_else(|| "-".to_string()),
+                email: fallback_email,
                 plan: "-".to_string(),
                 key_remaining: "--".to_string(),
                 five_hour: "-- (--)".to_string(),
@@ -592,10 +737,19 @@ impl CAuthApp {
         let data = match fs::read(credential_path) {
             Ok(data) => data,
             Err(_) => {
+                let fallback_email = account_id
+                    .and_then(email_from_account_id)
+                    .unwrap_or_else(|| "-".to_string());
+                self.log_refresh(
+                    "cauth_email_resolution",
+                    &[
+                        ("account_id", account_id.map(|value| value.to_string())),
+                        ("email", Some(fallback_email.clone())),
+                        ("email_source", Some("credential_read_error".to_string())),
+                    ],
+                );
                 return ClaudeInventoryStatus {
-                    email: account_id
-                        .and_then(email_from_account_id)
-                        .unwrap_or_else(|| "-".to_string()),
+                    email: fallback_email,
                     plan: "-".to_string(),
                     key_remaining: "--".to_string(),
                     five_hour: "-- (--)".to_string(),
@@ -606,6 +760,16 @@ impl CAuthApp {
         };
 
         self.collect_claude_inventory_status_from_data(&data, account_id)
+    }
+
+    fn resolve_inventory_email(&self, root: &Value, account_id: Option<&str>) -> (String, String) {
+        if let Some(email) = extract_claude_email(root) {
+            return (email, "credential".to_string());
+        }
+        if let Some(fallback_email) = account_id.and_then(email_from_account_id) {
+            return (fallback_email, "account_id_fallback".to_string());
+        }
+        ("-".to_string(), "missing".to_string())
     }
 
     fn resolve_snapshot_account_id_for_credentials(
@@ -712,12 +876,7 @@ impl CAuthApp {
         if scored.is_empty() {
             return None;
         }
-        scored.sort_by(|left, right| {
-            right
-                .1
-                .cmp(&left.1)
-                .then_with(|| left.0.cmp(&right.0))
-        });
+        scored.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
         if scored.len() > 1 && scored[0].1 == scored[1].1 {
             return None;
         }
@@ -965,13 +1124,11 @@ impl CAuthApp {
         if let (Some(active_data), Some(active_account_id)) =
             (active_data.as_ref(), active_account_id.as_ref())
         {
-            if let Some(index) = snapshot
-                .accounts
-                .iter()
-                .position(|account| account.service == UsageService::Claude && account.id == *active_account_id)
-            {
-                let credential_path =
-                    PathBuf::from(&snapshot.accounts[index].root_path).join(".claude/.credentials.json");
+            if let Some(index) = snapshot.accounts.iter().position(|account| {
+                account.service == UsageService::Claude && account.id == *active_account_id
+            }) {
+                let credential_path = PathBuf::from(&snapshot.accounts[index].root_path)
+                    .join(".claude/.credentials.json");
                 let needs_write = match fs::read(&credential_path) {
                     Ok(existing_data) => existing_data != *active_data,
                     Err(_) => true,
@@ -1224,7 +1381,13 @@ impl CAuthApp {
                     );
                     println!(
                         "{}: {} {} 5h {} 7d {} (key) {}{}",
-                        profile.name, email, plan, five, seven, refreshed.key_remaining, trace_suffix
+                        profile.name,
+                        email,
+                        plan,
+                        five,
+                        seven,
+                        refreshed.key_remaining,
+                        trace_suffix
                     );
                 }
                 AccountRefreshOutcome::Failed(failure) => {
@@ -1651,6 +1814,7 @@ fn run() -> CliResult<()> {
             Ok(())
         }
         CliCommand::List => app.list_profiles(),
+        CliCommand::Status => app.status(),
         CliCommand::Save(name) => app.save_current_profile(&name),
         CliCommand::Switch(name) => app.switch_profile(&name),
         CliCommand::Refresh => app.refresh_all_profiles(),
@@ -1774,6 +1938,69 @@ fn default_usage_client(usage_endpoint: &str, access_token: &str) -> Option<Usag
         seven_day_percent,
         seven_day_reset,
     })
+}
+
+fn default_usage_raw_client(usage_endpoint: &str, access_token: &str) -> UsageRawResult {
+    let request_raw = format!(
+        "GET {}\nAccept: application/json\nContent-Type: application/json\nUser-Agent: cauth/0.1\nanthropic-beta: oauth-2025-04-20\nAuthorization: Bearer {}",
+        usage_endpoint, access_token
+    );
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return UsageRawResult {
+                request_raw,
+                response_raw: format!("request error: failed to build HTTP client: {}", err),
+            }
+        }
+    };
+
+    let response = match client
+        .get(usage_endpoint)
+        .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
+        .header("User-Agent", "cauth/0.1")
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .bearer_auth(access_token)
+        .send()
+    {
+        Ok(response) => response,
+        Err(err) => {
+            return UsageRawResult {
+                request_raw,
+                response_raw: format!("request error: {}", err),
+            }
+        }
+    };
+
+    let status_line = format!("HTTP {}", response.status());
+    let header_lines = response
+        .headers()
+        .iter()
+        .map(|(key, value)| {
+            let value = value.to_str().unwrap_or("<non-utf8>");
+            format!("{}: {}", key.as_str(), value)
+        })
+        .collect::<Vec<_>>();
+    let body = match response.text() {
+        Ok(text) => text,
+        Err(err) => format!("<failed to read response body: {}>", err),
+    };
+
+    let response_raw = if header_lines.is_empty() {
+        format!("{}\n\n{}", status_line, body)
+    } else {
+        format!("{}\n{}\n\n{}", status_line, header_lines.join("\n"), body)
+    };
+
+    UsageRawResult {
+        request_raw,
+        response_raw,
+    }
 }
 
 fn parse_usage_window(value: Option<&Value>) -> (Option<i32>, Option<DateTime<Utc>>) {
@@ -2306,11 +2533,164 @@ fn truncate_chars(raw: &str, max_chars: usize) -> String {
     raw.chars().take(max_chars).collect::<String>()
 }
 
+fn render_raw_credential(data: &[u8]) -> String {
+    match std::str::from_utf8(data) {
+        Ok(text) => text.to_string(),
+        Err(_) => format!("<non-utf8 credential bytes: {}>", data.len()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
+
+    #[test]
+    fn parse_supports_status_command() {
+        let command =
+            CliCommand::parse(&["status".to_string()]).expect("status command should parse");
+        assert!(matches!(command, CliCommand::Status));
+    }
+
+    #[test]
+    fn status_report_lines_include_raw_credential_request_and_response_for_keychain_and_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let home = temp.path().to_path_buf();
+        let active_path = home.join(".claude/.credentials.json");
+        write_credentials(
+            &active_path,
+            "at-file",
+            "rt-file",
+            1_800_000_000_000,
+            Some("file@example.com"),
+            None,
+        )
+        .expect("write file credential");
+
+        let keychain_json = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "at-keychain",
+                "refreshToken": "rt-keychain",
+                "expiresAt": 1_800_001_000_000i64,
+                "scopes": ["user:profile"]
+            }
+        })
+        .to_string();
+        let keychain_for_runner = keychain_json.clone();
+        let process_runner: ProcessRunner = Arc::new(move |executable, arguments| {
+            if !executable.ends_with("security") {
+                return ProcessExecutionResult {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "unexpected executable".to_string(),
+                };
+            }
+            if arguments.first().map(|value| value.as_str()) == Some("find-generic-password")
+                && arguments.iter().any(|value| value == "-w")
+            {
+                return ProcessExecutionResult {
+                    status: 0,
+                    stdout: keychain_for_runner.clone(),
+                    stderr: String::new(),
+                };
+            }
+            ProcessExecutionResult {
+                status: 1,
+                stdout: String::new(),
+                stderr: "unsupported".to_string(),
+            }
+        });
+
+        let seen_tokens = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_tokens_ref = Arc::clone(&seen_tokens);
+        let usage_raw_client: UsageRawClient = Arc::new(move |access_token| {
+            if let Ok(mut list) = seen_tokens_ref.lock() {
+                list.push(access_token.to_string());
+            }
+            UsageRawResult {
+                request_raw: format!("RAW-REQ token={}", access_token),
+                response_raw: format!("RAW-RESP token={}", access_token),
+            }
+        });
+
+        let app = CAuthApp::with_clients_and_usage_raw(
+            home,
+            process_runner,
+            Arc::new(|_, _| Err(CliError::new("refresh should not run", 1))),
+            Arc::new(|_| None),
+            usage_raw_client,
+        );
+
+        let lines = app.status_report_lines();
+        let joined = lines.join("\n");
+        assert!(joined.contains("Source: osxkeychain"));
+        assert!(joined.contains("Raw Credential:"));
+        assert!(joined.contains("rt-keychain"));
+        assert!(joined.contains("RAW-REQ token=at-keychain"));
+        assert!(joined.contains("RAW-RESP token=at-keychain"));
+        assert!(joined.contains("Source: ~/.claude/.credentials.json"));
+        assert!(joined.contains("rt-file"));
+        assert!(joined.contains("RAW-REQ token=at-file"));
+        assert!(joined.contains("RAW-RESP token=at-file"));
+
+        let tokens = seen_tokens.lock().expect("tokens").clone();
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&"at-keychain".to_string()));
+        assert!(tokens.contains(&"at-file".to_string()));
+    }
+
+    #[test]
+    fn list_logs_email_resolution_source_for_traceability() {
+        let temp = TempDir::new().expect("temp dir");
+        let home = temp.path().to_path_buf();
+
+        let account_id = "acct_claude_home_example_com";
+        let account_root = home.join(format!(".agent-island/accounts/{}", account_id));
+        let stored_path = account_root.join(".claude/.credentials.json");
+        write_credentials(
+            &stored_path,
+            "at-list",
+            "rt-list",
+            1_800_000_000_000,
+            None,
+            None,
+        )
+        .expect("write stored credentials");
+
+        let store = AccountStore::new(home.join(".agent-island"));
+        let snapshot = AccountsSnapshot {
+            accounts: vec![UsageAccount {
+                id: account_id.to_string(),
+                service: UsageService::Claude,
+                label: "claude:test".to_string(),
+                root_path: account_root.display().to_string(),
+                updated_at: utc_now_iso(),
+            }],
+            profiles: vec![UsageProfile {
+                name: "home".to_string(),
+                claude_account_id: Some(account_id.to_string()),
+                codex_account_id: None,
+                gemini_account_id: None,
+            }],
+        };
+        store.save_snapshot(&snapshot).expect("save snapshot");
+
+        let recorder = ProcessRecorder::default();
+        let app = CAuthApp::with_clients(
+            home.clone(),
+            recorder.runner(),
+            Arc::new(|_, _| Err(CliError::new("refresh should not run", 1))),
+            Arc::new(|_| None),
+        );
+
+        let _ = app.profile_inventory_lines().expect("list lines");
+        let log_path = home.join(".agent-island/logs/usage-refresh.log");
+        let content = fs::read_to_string(&log_path).expect("read log");
+        assert!(content.contains("\"event\":\"cauth_email_resolution\""));
+        assert!(content.contains("\"email_source\":\"account_id_fallback\""));
+        assert!(content.contains("\"email\":\"home@example.com\""));
+    }
 
     #[test]
     fn save_creates_email_based_account_and_profile_mapping() {
@@ -2438,7 +2818,10 @@ mod tests {
         let parsed = parse_claude_credentials(&current);
         assert_eq!(parsed.access_token.as_deref(), Some("at-keychain"));
         assert_eq!(parsed.refresh_token.as_deref(), Some("rt-shared"));
-        assert_eq!(extract_claude_email(&parsed.root).as_deref(), Some("z@iq.io"));
+        assert_eq!(
+            extract_claude_email(&parsed.root).as_deref(),
+            Some("z@iq.io")
+        );
         assert_eq!(resolve_claude_is_team(&parsed.root), Some(true));
         assert_eq!(
             app.resolve_claude_account_id(&current),
@@ -2471,14 +2854,18 @@ mod tests {
         }))
         .expect("credential data");
 
-        let keys = app.refresh_lock_keys(&data, "acct_claude_lock", Some(credential_path.as_path()));
+        let keys =
+            app.refresh_lock_keys(&data, "acct_claude_lock", Some(credential_path.as_path()));
         assert!(
             keys.contains(&credential_path.display().to_string()),
             "expected credential path key in lock keys: {:?}",
             keys
         );
         assert!(
-            keys.contains(&format!("claude-refresh-token:{}", short_hash_hex("rt-lock".as_bytes()))),
+            keys.contains(&format!(
+                "claude-refresh-token:{}",
+                short_hash_hex("rt-lock".as_bytes())
+            )),
             "expected refresh-token fingerprint key in lock keys: {:?}",
             keys
         );

@@ -86,10 +86,14 @@ class NotchViewModel: ObservableObject {
                 height: 320
             )
         case .menu:
-            // Compact size for settings menu
+            // Menu has many fixed-height rows; 420 can push bottom actions outside
+            // the interactive panel hit area. Keep a larger base height.
+            let baseMenuHeight: CGFloat = 520
+            let expandedHeight = screenSelector.expandedPickerHeight + soundSelector.expandedPickerHeight
+            let maxMenuHeight = max(420, min(windowHeight - 24, screenRect.height - 72))
             return CGSize(
                 width: min(screenRect.width * 0.4, 480),
-                height: 420 + screenSelector.expandedPickerHeight + soundSelector.expandedPickerHeight
+                height: min(baseMenuHeight + expandedHeight, maxMenuHeight)
             )
         case .instances:
             return CGSize(

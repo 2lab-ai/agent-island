@@ -52,7 +52,7 @@ class NotchViewController: NSViewController {
             case .opened:
                 let panelSize = vm.openedSize
                 // Panel is centered horizontally, anchored to top
-                let panelWidth = panelSize.width + 52  // Account for corner radius padding
+                let panelWidth = panelSize.width + NotchGeometry.openedPanelWidthPadding
                 let panelHeight = panelSize.height
                 let screenWidth = geometry.screenRect.width
                 return CGRect(

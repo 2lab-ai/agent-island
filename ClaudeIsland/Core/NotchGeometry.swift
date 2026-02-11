@@ -10,6 +10,8 @@ import Foundation
 
 /// Pure geometry calculations for the notch
 struct NotchGeometry: Sendable {
+    static let openedPanelWidthPadding: CGFloat = 52
+
     let deviceNotchRect: CGRect
     let screenRect: CGRect
     let windowHeight: CGFloat
@@ -26,9 +28,10 @@ struct NotchGeometry: Sendable {
 
     /// The opened panel rect in screen coordinates for a given size
     func openedScreenRect(for size: CGSize) -> CGRect {
-        // Match the actual rendered panel size (tuned to match visual output)
-        let width = size.width - 6
-        let height = size.height - 30
+        // Must stay in sync with NotchViewController.hitTestRect for opened state.
+        // If these diverge, lower rows can become visible but unclickable.
+        let width = size.width + Self.openedPanelWidthPadding
+        let height = size.height
         return CGRect(
             x: screenRect.midX - width / 2,
             y: screenRect.maxY - height,

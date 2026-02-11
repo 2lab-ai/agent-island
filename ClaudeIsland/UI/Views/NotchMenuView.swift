@@ -104,7 +104,7 @@ struct NotchMenuView: View {
                 icon: "star",
                 label: "Star on GitHub"
             ) {
-                if let url = URL(string: "https://github.com/icedac/agent-island") {
+                if let url = URL(string: "https://github.com/2lab-ai/agent-island") {
                     NSWorkspace.shared.open(url)
                 }
             }
@@ -118,7 +118,16 @@ struct NotchMenuView: View {
                 label: "Quit",
                 isDestructive: true
             ) {
-                NSApplication.shared.terminate(nil)
+                if let delegate = AppDelegate.shared {
+                    delegate.requestTerminateFromMenu()
+                } else {
+                    NSApplication.shared.terminate(nil)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        if NSApplication.shared.isRunning {
+                            Darwin.exit(0)
+                        }
+                    }
+                }
             }
         }
         .padding(.horizontal, 8)

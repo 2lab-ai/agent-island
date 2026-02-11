@@ -116,6 +116,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         screenObserver = nil
     }
 
+    @MainActor
+    func requestTerminateFromMenu() {
+        NSApplication.shared.terminate(nil)
+
+        // Some non-activating panel states can swallow the regular terminate flow.
+        // Keep a short fallback so "Quit" always exits.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            if NSApplication.shared.isRunning {
+                Darwin.exit(0)
+            }
+        }
+    }
+
     private func getOrCreateDistinctId() -> String {
         let key = "mixpanel_distinct_id"
 
