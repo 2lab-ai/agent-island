@@ -101,6 +101,18 @@ function saveClaudeCredentialsToKeychain(root) {
         ...nextOauth
       }
     };
+    const existingCredentials = parseClaudeCredentials(existingRoot);
+    const nextCredentials = parseClaudeCredentials(root ?? {});
+    const mergedCredentials = parseClaudeCredentials(mergedRoot);
+    debugLog(
+      "claude",
+      "saveClaudeCredentialsToKeychain: writing",
+      [
+        `before=${formatClaudeCredentialState(existingCredentials)}`,
+        `incoming=${formatClaudeCredentialState(nextCredentials)}`,
+        `merged=${formatClaudeCredentialState(mergedCredentials)}`
+      ].join(" ")
+    );
     const account = getClaudeKeychainAccountName() || process.env.USER || "default";
     execFileSync(
       "security",
@@ -116,7 +128,7 @@ function saveClaudeCredentialsToKeychain(root) {
       ],
       { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }
     );
-    debugLog("claude", "saveClaudeCredentialsToKeychain: saved");
+    debugLog("claude", "saveClaudeCredentialsToKeychain: saved", `after=${formatClaudeCredentialState(mergedCredentials)}`);
   } catch (err) {
     debugLog("claude", "saveClaudeCredentialsToKeychain: error", err);
   }
@@ -186,6 +198,34 @@ function normalizeClaudeScopes(scopes) {
   }
   return [];
 }
+function fingerprintToken(token) {
+  if (typeof token !== "string" || token.length === 0) {
+    return "none";
+  }
+  return hashToken(token);
+}
+function formatClaudeExpiry(expiresAt) {
+  if (!expiresAt) {
+    return "none";
+  }
+  try {
+    return new Date(expiresAt).toISOString();
+  } catch {
+    return String(expiresAt);
+  }
+}
+function formatClaudeCredentialState(credentials) {
+  if (!credentials) {
+    return "at_fp=none rt_fp=none exp=none scopes=0";
+  }
+  const scopeCount = Array.isArray(credentials.scopes) ? credentials.scopes.length : 0;
+  return [
+    `at_fp=${fingerprintToken(credentials.accessToken)}`,
+    `rt_fp=${fingerprintToken(credentials.refreshToken)}`,
+    `exp=${formatClaudeExpiry(credentials.expiresAt)}`,
+    `scopes=${scopeCount}`
+  ].join(" ");
+}
 function tokenNeedsRefreshClaude(credentials) {
   if (!credentials?.expiresAt) {
     debugLog("claude", "tokenNeedsRefreshClaude: missing expiresAt");
@@ -207,7 +247,7 @@ async function refreshClaudeTokenInternal(credentials) {
     return null;
   }
   try {
-    debugLog("claude", "refreshClaudeTokenInternal: attempting refresh");
+    debugLog("claude", "refreshClaudeTokenInternal: attempting refresh", formatClaudeCredentialState(credentials));
     const scope = credentials.scopes.length > 0 ? credentials.scopes.join(" ") : CLAUDE_DEFAULT_SCOPE;
     const response = await fetch(CLAUDE_TOKEN_ENDPOINT, {
       method: "POST",
@@ -222,7 +262,7 @@ async function refreshClaudeTokenInternal(credentials) {
       }),
       signal: AbortSignal.timeout(API_TIMEOUT_MS)
     });
-    debugLog("claude", "refreshClaudeTokenInternal: response status", response.status);
+    debugLog("claude", "refreshClaudeTokenInternal: response status", `status=${response.status} pre=${formatClaudeCredentialState(credentials)}`);
     if (!response.ok) {
       let errorBody = "";
       try {
@@ -232,7 +272,7 @@ async function refreshClaudeTokenInternal(credentials) {
       debugLog(
         "claude",
         "refreshClaudeTokenInternal: refresh failed",
-        `${response.status} ${errorBody}`.trim().slice(0, 200)
+        `status=${response.status} pre=${formatClaudeCredentialState(credentials)} body=${`${errorBody}`.trim().slice(0, 200)}`
       );
       return null;
     }
@@ -241,17 +281,30 @@ async function refreshClaudeTokenInternal(credentials) {
       debugLog("claude", "refreshClaudeTokenInternal: missing access_token in refresh response");
       return null;
     }
+    const responseScopeCount = normalizeClaudeScopes(json.scope).length;
+    debugLog(
+      "claude",
+      "refreshClaudeTokenInternal: refresh response payload",
+      [
+        `access_token=${json?.access_token ? "present" : "missing"}`,
+        `refresh_token=${json?.refresh_token ? "present" : "missing"}`,
+        `refresh_rotated=${json?.refresh_token ? String(json.refresh_token !== credentials.refreshToken) : "false"}`,
+        `expires_in=${typeof json?.expires_in === "number" ? String(json.expires_in) : "missing"}`,
+        `scope_count=${String(responseScopeCount)}`
+      ].join(" ")
+    );
     const next = {
       accessToken: json.access_token,
       refreshToken: json.refresh_token || credentials.refreshToken,
       expiresAt: typeof json.expires_in === "number" ? Date.now() + json.expires_in * 1e3 : credentials.expiresAt,
       scopes: normalizeClaudeScopes(json.scope || credentials.scopes)
     };
-    await saveClaudeCredentialsToFile(next, json);
+    debugLog("claude", "refreshClaudeTokenInternal: computed next token material", `pre=${formatClaudeCredentialState(credentials)} next=${formatClaudeCredentialState(next)}`);
+    await saveClaudeCredentialsToFile(next, json, credentials);
     if (next.expiresAt) {
-      debugLog("claude", "refreshClaudeTokenInternal: refresh success", new Date(next.expiresAt).toISOString());
+      debugLog("claude", "refreshClaudeTokenInternal: refresh success", `next=${formatClaudeCredentialState(next)}`);
     } else {
-      debugLog("claude", "refreshClaudeTokenInternal: refresh success (no expiresAt)");
+      debugLog("claude", "refreshClaudeTokenInternal: refresh success (no expiresAt)", `next=${formatClaudeCredentialState(next)}`);
     }
     credentialsCache = null;
     return next;
@@ -277,7 +330,7 @@ async function refreshClaudeToken(credentials) {
   pendingClaudeRefreshRequests.set(dedupeKey, refreshPromise);
   return refreshPromise;
 }
-async function saveClaudeCredentialsToFile(credentials, rawResponse) {
+async function saveClaudeCredentialsToFile(credentials, rawResponse, previousCredentials) {
   try {
     const credPath = join(homedir(), ".claude", ".credentials.json");
     let existingRoot = {};
@@ -301,8 +354,29 @@ async function saveClaudeCredentialsToFile(credentials, rawResponse) {
     if (rawResponse?.scope) {
       nextRoot.claudeAiOauth.scopes = normalizeClaudeScopes(rawResponse.scope);
     }
+    const existingCredentials = parseClaudeCredentials(existingRoot);
+    debugLog(
+      "claude",
+      "saveClaudeCredentialsToFile: writing",
+      [
+        `path=${credPath}`,
+        `previous=${formatClaudeCredentialState(previousCredentials)}`,
+        `file_before=${formatClaudeCredentialState(existingCredentials)}`,
+        `file_next=${formatClaudeCredentialState(credentials)}`
+      ].join(" ")
+    );
     await writeFile(credPath, JSON.stringify(nextRoot, null, 2), { mode: 384 });
-    debugLog("claude", "saveClaudeCredentialsToFile: saved");
+    try {
+      const persistedRaw = await readFile(credPath, "utf-8");
+      const persistedCredentials = parseClaudeCredentials(JSON.parse(persistedRaw));
+      debugLog(
+        "claude",
+        "saveClaudeCredentialsToFile: saved",
+        `path=${credPath} file_after=${formatClaudeCredentialState(persistedCredentials)}`
+      );
+    } catch (verifyErr) {
+      debugLog("claude", "saveClaudeCredentialsToFile: post-write verify failed", verifyErr);
+    }
     saveClaudeCredentialsToKeychain(nextRoot);
   } catch (err) {
     debugLog("claude", "saveClaudeCredentialsToFile: error", err);
@@ -314,13 +388,15 @@ async function getValidClaudeCredentials() {
     debugLog("claude", "getValidClaudeCredentials: no credentials");
     return null;
   }
+  debugLog("claude", "getValidClaudeCredentials: loaded credentials", formatClaudeCredentialState(credentials));
   if (tokenNeedsRefreshClaude(credentials)) {
-    debugLog("claude", "getValidClaudeCredentials: token expiring, refreshing");
+    debugLog("claude", "getValidClaudeCredentials: token expiring, refreshing", formatClaudeCredentialState(credentials));
     const refreshed = await refreshClaudeToken(credentials);
     if (refreshed?.accessToken) {
+      debugLog("claude", "getValidClaudeCredentials: using refreshed credentials", formatClaudeCredentialState(refreshed));
       return refreshed;
     }
-    debugLog("claude", "getValidClaudeCredentials: refresh failed, using existing token");
+    debugLog("claude", "getValidClaudeCredentials: refresh failed, using existing token", formatClaudeCredentialState(credentials));
   }
   return credentials;
 }
