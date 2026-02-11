@@ -12,6 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -22,6 +23,7 @@ const CLAUDE_TOKEN_ENDPOINT: &str = "https://platform.claude.com/v1/oauth/token"
 const CLAUDE_USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const CLAUDE_DEFAULT_SCOPE: &str =
     "user:profile user:inference user:sessions:claude_code user:mcp_servers";
+static REFRESH_TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type ProcessRunner = Arc<dyn Fn(&str, &[String]) -> ProcessExecutionResult + Send + Sync>;
 type RefreshClient = Arc<dyn Fn(&str, &str) -> CliResult<ClaudeRefreshPayload> + Send + Sync>;
@@ -242,11 +244,80 @@ struct ClaudeInventoryStatus {
     file_state: String,
 }
 
+struct CAuthRefreshLogWriter {
+    log_dir: PathBuf,
+    log_file: PathBuf,
+    max_log_bytes: u64,
+}
+
+impl CAuthRefreshLogWriter {
+    fn new(log_dir: PathBuf) -> Self {
+        let log_file = log_dir.join("usage-refresh.log");
+        Self {
+            log_dir,
+            log_file,
+            max_log_bytes: 5 * 1024 * 1024,
+        }
+    }
+
+    fn write(&self, event: &str, fields: &[(&str, Option<String>)]) {
+        let _ = self.write_inner(event, fields);
+    }
+
+    fn write_inner(&self, event: &str, fields: &[(&str, Option<String>)]) -> std::io::Result<()> {
+        fs::create_dir_all(&self.log_dir)?;
+        self.rotate_if_needed()?;
+
+        let mut payload = Map::new();
+        payload.insert(
+            "timestamp".to_string(),
+            Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
+        );
+        payload.insert("event".to_string(), Value::String(event.to_string()));
+        for (key, value) in fields {
+            let Some(value) = value else { continue };
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            payload.insert((*key).to_string(), Value::String(trimmed.to_string()));
+        }
+
+        let line = match serde_json::to_string(&Value::Object(payload)) {
+            Ok(value) => format!("{}\n", value),
+            Err(_) => return Ok(()),
+        };
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_file)?;
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        file.write_all(line.as_bytes())
+    }
+
+    fn rotate_if_needed(&self) -> std::io::Result<()> {
+        let size = match fs::metadata(&self.log_file) {
+            Ok(metadata) => metadata.len(),
+            Err(_) => return Ok(()),
+        };
+        if size <= self.max_log_bytes {
+            return Ok(());
+        }
+
+        let rotated = self.log_dir.join("usage-refresh.log.1");
+        if rotated.exists() {
+            let _ = fs::remove_file(&rotated);
+        }
+        fs::rename(&self.log_file, rotated)
+    }
+}
+
 struct CAuthApp {
     home_dir: PathBuf,
     agent_root: PathBuf,
     accounts_dir: PathBuf,
     account_store: AccountStore,
+    refresh_log_writer: CAuthRefreshLogWriter,
     keychain_service_name: String,
     security_executable: String,
     process_runner: ProcessRunner,
@@ -318,12 +389,14 @@ impl CAuthApp {
         let agent_root = home_dir.join(".agent-island");
         let accounts_dir = agent_root.join("accounts");
         let account_store = AccountStore::new(agent_root.clone());
+        let refresh_log_writer = CAuthRefreshLogWriter::new(home_dir.join(".agent-island/logs"));
 
         Self {
             home_dir,
             agent_root,
             accounts_dir,
             account_store,
+            refresh_log_writer,
             keychain_service_name,
             security_executable,
             process_runner,
@@ -342,6 +415,10 @@ impl CAuthApp {
                cauth refresh                  Refresh all saved Claude profiles and print usage\n\
                cauth help                     Show this help"
         );
+    }
+
+    fn log_refresh(&self, event: &str, fields: &[(&str, Option<String>)]) {
+        self.refresh_log_writer.write(event, fields);
     }
 
     fn save_current_profile(&self, profile_name: &str) -> CliResult<()> {
@@ -438,8 +515,12 @@ impl CAuthApp {
                 1,
             )
         })?;
-        let lock_keys = self.refresh_lock_keys(&data, &account_id);
-        self.with_refresh_lock(&lock_keys, || self.sync_active_claude_credentials(&data))?;
+        let active_path = self.home_dir.join(".claude/.credentials.json");
+        let lock_keys = self.refresh_lock_keys(&data, &account_id, Some(active_path.as_path()));
+        let trace_id = next_refresh_trace_id();
+        self.with_refresh_lock(&lock_keys, &trace_id, &account_id, || {
+            self.sync_active_claude_credentials(&data)
+        })?;
 
         let parsed = parse_claude_credentials(&data);
         let email = extract_claude_email(&parsed.root).unwrap_or_else(|| "-".to_string());
@@ -909,6 +990,7 @@ impl CAuthApp {
         let mut refreshed_by_account_id: HashMap<String, AccountRefreshOutcome> = HashMap::new();
         let mut refreshed_by_lock_id: HashMap<String, AccountRefreshOutcome> = HashMap::new();
         let mut touched_account_ids: HashSet<String> = HashSet::new();
+        let mut trace_by_account_id: HashMap<String, String> = HashMap::new();
 
         for profile in &profiles {
             let Some(account_id) = profile.claude_account_id.clone() else {
@@ -957,8 +1039,30 @@ impl CAuthApp {
                     continue;
                 }
             };
+            let trace_id = next_refresh_trace_id();
+            trace_by_account_id.insert(account_id.clone(), trace_id.clone());
+            let pre_parsed = parse_claude_credentials(&current_data);
+            let pre_refresh_fp = token_fingerprint(pre_parsed.refresh_token.as_deref());
+            let pre_access_fp = token_fingerprint(pre_parsed.access_token.as_deref());
             let lock_id = self.resolve_refresh_lock_id(&current_data, &account_id);
-            let lock_keys = self.refresh_lock_keys(&current_data, &account_id);
+            let lock_keys =
+                self.refresh_lock_keys(&current_data, &account_id, Some(credential_path.as_path()));
+            self.log_refresh(
+                "cauth_refresh_start",
+                &[
+                    ("trace_id", Some(trace_id.clone())),
+                    ("account_id", Some(account_id.clone())),
+                    ("profile", Some(profile.name.clone())),
+                    ("lock_id", Some(lock_id.clone())),
+                    ("lock_keys", Some(lock_keys.join(","))),
+                    ("pre_refresh_fp", pre_refresh_fp.clone()),
+                    ("pre_access_fp", pre_access_fp.clone()),
+                    (
+                        "credential_path",
+                        Some(credential_path.display().to_string()),
+                    ),
+                ],
+            );
 
             if let Some(existing_outcome) = refreshed_by_lock_id.get(&lock_id).cloned() {
                 let outcome = match &existing_outcome {
@@ -980,11 +1084,29 @@ impl CAuthApp {
                     }
                     AccountRefreshOutcome::Failed(_) => existing_outcome,
                 };
+                let reused_decision = match &outcome {
+                    AccountRefreshOutcome::Success(_) => "reused_success",
+                    AccountRefreshOutcome::Failed(failure) => match failure.kind {
+                        RefreshFailureKind::NeedsLogin => "reused_needs_login",
+                        RefreshFailureKind::Error => "reused_error",
+                    },
+                };
+                self.log_refresh(
+                    "cauth_refresh_result",
+                    &[
+                        ("trace_id", Some(trace_id.clone())),
+                        ("account_id", Some(account_id.clone())),
+                        ("lock_id", Some(lock_id.clone())),
+                        ("decision", Some(reused_decision.to_string())),
+                        ("pre_refresh_fp", pre_refresh_fp.clone()),
+                        ("pre_access_fp", pre_access_fp.clone()),
+                    ],
+                );
                 refreshed_by_account_id.insert(account_id.clone(), outcome);
                 continue;
             }
 
-            let refreshed_data = self.with_refresh_lock(&lock_keys, || {
+            let refreshed_data = self.with_refresh_lock(&lock_keys, &trace_id, &account_id, || {
                 let latest_data = fs::read(&credential_path).map_err(|err| {
                     CliError::new(
                         format!("failed to re-read {}: {}", credential_path.display(), err),
@@ -1028,6 +1150,39 @@ impl CAuthApp {
                 Err(err) => AccountRefreshOutcome::Failed(classify_refresh_failure(&err)),
             };
 
+            let (decision, post_refresh_fp, post_access_fp, failure_message) = match &outcome {
+                AccountRefreshOutcome::Success(result) => {
+                    let post = parse_claude_credentials(&result.credentials_data);
+                    (
+                        "success".to_string(),
+                        token_fingerprint(post.refresh_token.as_deref()),
+                        token_fingerprint(post.access_token.as_deref()),
+                        None,
+                    )
+                }
+                AccountRefreshOutcome::Failed(failure) => {
+                    let label = match failure.kind {
+                        RefreshFailureKind::NeedsLogin => "needs_login",
+                        RefreshFailureKind::Error => "error",
+                    };
+                    (label.to_string(), None, None, Some(failure.message.clone()))
+                }
+            };
+            self.log_refresh(
+                "cauth_refresh_result",
+                &[
+                    ("trace_id", Some(trace_id)),
+                    ("account_id", Some(account_id.clone())),
+                    ("lock_id", Some(lock_id.clone())),
+                    ("decision", Some(decision)),
+                    ("pre_refresh_fp", pre_refresh_fp),
+                    ("pre_access_fp", pre_access_fp),
+                    ("post_refresh_fp", post_refresh_fp),
+                    ("post_access_fp", post_access_fp),
+                    ("error", failure_message),
+                ],
+            );
+
             refreshed_by_lock_id.insert(lock_id, outcome.clone());
             refreshed_by_account_id.insert(account_id, outcome);
         }
@@ -1050,6 +1205,10 @@ impl CAuthApp {
                 println!("{}: - - 5h -- 7d -- (key) --", profile.name);
                 continue;
             };
+            let trace_suffix = trace_by_account_id
+                .get(account_id)
+                .map(|trace| format!(" [trace:{}]", trace))
+                .unwrap_or_default();
 
             match outcome {
                 AccountRefreshOutcome::Success(refreshed) => {
@@ -1064,8 +1223,8 @@ impl CAuthApp {
                         refreshed.seven_day_reset.as_ref(),
                     );
                     println!(
-                        "{}: {} {} 5h {} 7d {} (key) {}",
-                        profile.name, email, plan, five, seven, refreshed.key_remaining
+                        "{}: {} {} 5h {} 7d {} (key) {}{}",
+                        profile.name, email, plan, five, seven, refreshed.key_remaining, trace_suffix
                     );
                 }
                 AccountRefreshOutcome::Failed(failure) => {
@@ -1074,10 +1233,11 @@ impl CAuthApp {
                         RefreshFailureKind::Error => "error",
                     };
                     println!(
-                        "{}: - - 5h -- 7d -- (key) -- [{}] {}",
+                        "{}: - - 5h -- 7d -- (key) -- [{}] {}{}",
                         profile.name,
                         label,
                         truncate_chars(&failure.message, 180),
+                        trace_suffix,
                     );
                     failed_profiles.push(profile.name.clone());
                     if failure.kind == RefreshFailureKind::NeedsLogin {
@@ -1244,21 +1404,33 @@ impl CAuthApp {
         short_hash_hex(refresh_token.as_bytes())
     }
 
-    fn refresh_lock_keys(&self, data: &[u8], account_id: &str) -> Vec<String> {
-        let mut keys = vec![format!("account:{}", account_id)];
-        let parsed = parse_claude_credentials(data);
-        if let Some(refresh_token) = parsed.refresh_token {
-            keys.push(format!(
-                "token:{}",
-                short_hash_hex(refresh_token.as_bytes())
-            ));
+    fn refresh_lock_keys(
+        &self,
+        data: &[u8],
+        account_id: &str,
+        credential_path: Option<&Path>,
+    ) -> Vec<String> {
+        let mut keys = Vec::new();
+        if let Some(path) = credential_path {
+            keys.push(path.display().to_string());
+        } else {
+            keys.push(format!("account:{}", account_id));
+        }
+        if let Some(refresh_fp) = refresh_lock_id_from_credentials_data(data) {
+            keys.push(format!("claude-refresh-token:{}", refresh_fp));
         }
         keys.sort();
         keys.dedup();
         keys
     }
 
-    fn with_refresh_lock<T, F>(&self, lock_ids: &[String], operation: F) -> CliResult<T>
+    fn with_refresh_lock<T, F>(
+        &self,
+        lock_ids: &[String],
+        trace_id: &str,
+        account_id: &str,
+        operation: F,
+    ) -> CliResult<T>
     where
         F: FnOnce() -> CliResult<T>,
     {
@@ -1270,9 +1442,18 @@ impl CAuthApp {
             )
         })?;
 
+        self.log_refresh(
+            "refresh_lock_wait",
+            &[
+                ("trace_id", Some(trace_id.to_string())),
+                ("account_id", Some(account_id.to_string())),
+                ("lock_keys", Some(lock_ids.join(","))),
+            ],
+        );
+
         let mut files = Vec::new();
         for lock_id in lock_ids {
-            let lock_path = lock_root.join(format!("cauth-refresh-{}.lock", lock_id));
+            let lock_path = lock_root.join(process_refresh_lock_file_name(lock_id));
             let file = OpenOptions::new()
                 .create(true)
                 .read(true)
@@ -1295,10 +1476,28 @@ impl CAuthApp {
             files.push(file);
         }
 
+        self.log_refresh(
+            "refresh_lock_acquired",
+            &[
+                ("trace_id", Some(trace_id.to_string())),
+                ("account_id", Some(account_id.to_string())),
+                ("lock_keys", Some(lock_ids.join(","))),
+            ],
+        );
+
         let result = operation();
+        let result_label = if result.is_ok() { "success" } else { "error" };
         for file in files.into_iter().rev() {
             let _ = file.unlock();
         }
+        self.log_refresh(
+            "refresh_lock_released",
+            &[
+                ("trace_id", Some(trace_id.to_string())),
+                ("account_id", Some(account_id.to_string())),
+                ("result", Some(result_label.to_string())),
+            ],
+        );
         result
     }
 
@@ -1896,6 +2095,29 @@ fn short_hash_hex(data: &[u8]) -> String {
     hex::encode(digest)[..16].to_string()
 }
 
+fn token_fingerprint(token: Option<&str>) -> Option<String> {
+    let raw = token?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(short_hash_hex(raw.as_bytes()))
+}
+
+fn next_refresh_trace_id() -> String {
+    let counter = REFRESH_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or_else(|| Utc::now().timestamp_micros() * 1_000);
+    let seed = format!("{}:{}:{}", now, std::process::id(), counter);
+    short_hash_hex(seed.as_bytes())
+}
+
+fn process_refresh_lock_file_name(key: &str) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    let hex = hex::encode(digest);
+    format!("usage-refresh-{}.lock", &hex[..24])
+}
+
 fn get_path_value<'a>(root: &'a Value, path: &[&str]) -> Option<&'a Value> {
     let mut current = root;
     for segment in path {
@@ -2222,6 +2444,70 @@ mod tests {
             app.resolve_claude_account_id(&current),
             "acct_claude_team_z_iq_io".to_string()
         );
+    }
+
+    #[test]
+    fn refresh_lock_keys_match_usage_fetcher_shape() {
+        let temp = TempDir::new().expect("temp dir");
+        let home = temp.path().to_path_buf();
+        let recorder = ProcessRecorder::default();
+        let app = CAuthApp::with_clients(
+            home.clone(),
+            recorder.runner(),
+            Arc::new(|_, _| Err(CliError::new("refresh should not run", 1))),
+            Arc::new(|_| None),
+        );
+
+        let credential_path = home.join(".agent-island/accounts/acct/.claude/.credentials.json");
+        let data = serde_json::to_vec_pretty(&serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "at-lock",
+                "refreshToken": "rt-lock",
+                "expiresAt": 1_800_000_000_000i64,
+                "subscriptionType": "max",
+                "scopes": ["user:profile"]
+            },
+            "email": "lock@example.com"
+        }))
+        .expect("credential data");
+
+        let keys = app.refresh_lock_keys(&data, "acct_claude_lock", Some(credential_path.as_path()));
+        assert!(
+            keys.contains(&credential_path.display().to_string()),
+            "expected credential path key in lock keys: {:?}",
+            keys
+        );
+        assert!(
+            keys.contains(&format!("claude-refresh-token:{}", short_hash_hex("rt-lock".as_bytes()))),
+            "expected refresh-token fingerprint key in lock keys: {:?}",
+            keys
+        );
+
+        let file_name = process_refresh_lock_file_name("claude-refresh-token:test");
+        assert!(file_name.starts_with("usage-refresh-"));
+        assert!(file_name.ends_with(".lock"));
+        assert_eq!(file_name.len(), "usage-refresh-".len() + 24 + ".lock".len());
+    }
+
+    #[test]
+    fn refresh_log_writer_uses_shared_usage_refresh_log_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let log_dir = temp.path().join(".agent-island/logs");
+        let writer = CAuthRefreshLogWriter::new(log_dir.clone());
+        writer.write(
+            "cauth_refresh_result",
+            &[
+                ("trace_id", Some("trace-1".to_string())),
+                ("account_id", Some("acct_claude_test".to_string())),
+                ("decision", Some("success".to_string())),
+            ],
+        );
+
+        let log_path = log_dir.join("usage-refresh.log");
+        let content = fs::read_to_string(log_path).expect("read log");
+        assert!(content.contains("\"event\":\"cauth_refresh_result\""));
+        assert!(content.contains("\"trace_id\":\"trace-1\""));
+        assert!(content.contains("\"account_id\":\"acct_claude_test\""));
     }
 
     #[test]
