@@ -59,13 +59,113 @@ final class CredentialExporter {
     private func readClaudeCredentials() -> Data? {
         let path = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/.credentials.json")
-        if let data = try? Data(contentsOf: path) {
-            return data
+        let fileData = try? Data(contentsOf: path)
+        guard let keychain = readKeychain(service: "Claude Code-credentials"),
+              let keychainData = keychain.data(using: .utf8)
+        else {
+            return fileData
         }
-        if let keychain = readKeychain(service: "Claude Code-credentials") {
-            return Data(keychain.utf8)
+
+        return mergedClaudeCredentials(
+            keychainData: keychainData,
+            fallbackFileData: fileData
+        ) ?? keychainData
+    }
+
+    private func mergedClaudeCredentials(keychainData: Data, fallbackFileData: Data?) -> Data? {
+        guard var keychainRoot = parseJSONObject(from: keychainData) else { return nil }
+
+        let keychainRefreshToken = readClaudeRefreshToken(from: keychainRoot)
+        let fallbackRoot: [String: Any]? = {
+            if let fallbackFileData,
+               let parsed = parseJSONObject(from: fallbackFileData),
+               let keychainRefreshToken,
+               readClaudeRefreshToken(from: parsed) == keychainRefreshToken {
+                return parsed
+            }
+
+            if let keychainRefreshToken,
+               let matched = loadStoredClaudeRoot(refreshToken: keychainRefreshToken) {
+                return matched
+            }
+
+            return fallbackFileData.flatMap(parseJSONObject)
+        }()
+
+        guard let fallbackRoot else {
+            return keychainData
+        }
+
+        keychainRoot = mergeClaudeMetadata(primary: keychainRoot, fallback: fallbackRoot)
+        return try? JSONSerialization.data(withJSONObject: keychainRoot, options: [.prettyPrinted])
+    }
+
+    private func mergeClaudeMetadata(primary: [String: Any], fallback: [String: Any]) -> [String: Any] {
+        var merged = primary
+        var primaryOAuth = primary["claudeAiOauth"] as? [String: Any] ?? [:]
+        let fallbackOAuth = fallback["claudeAiOauth"] as? [String: Any] ?? [:]
+
+        copyIfMissing(key: "email", from: fallback, to: &merged)
+        copyIfMissing(key: "account", from: fallback, to: &merged)
+        copyIfMissing(key: "organization", from: fallback, to: &merged)
+        copyIfMissing(key: "subscriptionType", from: fallback, to: &merged)
+        copyIfMissing(key: "rateLimitTier", from: fallback, to: &merged)
+        copyIfMissing(key: "isTeam", from: fallback, to: &merged)
+
+        copyIfMissing(key: "email", from: fallbackOAuth, to: &primaryOAuth)
+        copyIfMissing(key: "account", from: fallbackOAuth, to: &primaryOAuth)
+        copyIfMissing(key: "organization", from: fallbackOAuth, to: &primaryOAuth)
+        copyIfMissing(key: "subscriptionType", from: fallbackOAuth, to: &primaryOAuth)
+        copyIfMissing(key: "rateLimitTier", from: fallbackOAuth, to: &primaryOAuth)
+        copyIfMissing(key: "isTeam", from: fallbackOAuth, to: &primaryOAuth)
+
+        merged["claudeAiOauth"] = primaryOAuth
+        return merged
+    }
+
+    private func copyIfMissing(key: String, from source: [String: Any], to destination: inout [String: Any]) {
+        if destination[key] != nil {
+            return
+        }
+        if let value = source[key] {
+            destination[key] = value
+        }
+    }
+
+    private func loadStoredClaudeRoot(refreshToken: String) -> [String: Any]? {
+        let accountsRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".agent-island/accounts", isDirectory: true)
+        guard let accountDirectories = try? FileManager.default.contentsOfDirectory(
+            at: accountsRoot,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        for accountDirectory in accountDirectories {
+            let credentialURL = accountDirectory.appendingPathComponent(".claude/.credentials.json")
+            guard let data = try? Data(contentsOf: credentialURL),
+                  let root = parseJSONObject(from: data)
+            else {
+                continue
+            }
+            if readClaudeRefreshToken(from: root) == refreshToken {
+                return root
+            }
         }
         return nil
+    }
+
+    private func parseJSONObject(from data: Data) -> [String: Any]? {
+        (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    private func readClaudeRefreshToken(from root: [String: Any]) -> String? {
+        let oauth = root["claudeAiOauth"] as? [String: Any] ?? [:]
+        guard let raw = oauth["refreshToken"] as? String else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func readCodexCredentials() -> Data? {
