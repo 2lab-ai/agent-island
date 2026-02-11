@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 struct UsageIdentities: Sendable {
@@ -30,6 +31,18 @@ struct UsageTokenRefresh: Sendable {
     static let empty = UsageTokenRefresh(claude: nil, codex: nil, gemini: nil)
 }
 
+enum UsageIssueKind: Sendable, Equatable {
+    case dockerDaemonUnavailable
+    case dockerCredentialHelperMissing
+    case dockerCLIUnavailable
+}
+
+struct UsageIssue: Sendable, Equatable {
+    let kind: UsageIssueKind
+    let message: String
+    let technicalDetails: String?
+}
+
 struct UsageSnapshot: Sendable, Identifiable {
     let profileName: String
     let output: CheckUsageOutput?
@@ -38,6 +51,7 @@ struct UsageSnapshot: Sendable, Identifiable {
     let fetchedAt: Date?
     let isStale: Bool
     let errorMessage: String?
+    let issue: UsageIssue?
 
     var id: String { profileName }
 }
@@ -116,7 +130,8 @@ final class UsageFetcher {
                     tokenRefresh: tokenRefresh,
                     fetchedAt: entry.fetchedAt,
                     isStale: false,
-                    errorMessage: nil
+                    errorMessage: nil,
+                    issue: nil
                 )
             }
 
@@ -133,7 +148,8 @@ final class UsageFetcher {
                 tokenRefresh: tokenRefresh,
                 fetchedAt: entry?.fetchedAt,
                 isStale: false,
-                errorMessage: nil
+                errorMessage: nil,
+                issue: nil
             )
         } catch {
             if !accounts.isEmpty {
@@ -143,6 +159,7 @@ final class UsageFetcher {
 
             let entry = await cache.getAny(profileName: profile.name)
             let identities = await identityCache.getFresh(key: identityKey) ?? cachedIdentities
+            let issue = Self.classifyIssue(from: error)
             return UsageSnapshot(
                 profileName: profile.name,
                 output: entry?.output,
@@ -150,7 +167,8 @@ final class UsageFetcher {
                 tokenRefresh: tokenRefresh,
                 fetchedAt: entry?.fetchedAt,
                 isStale: entry != nil,
-                errorMessage: error.localizedDescription
+                errorMessage: issue?.message ?? error.localizedDescription,
+                issue: issue
             )
         }
     }
@@ -171,7 +189,8 @@ final class UsageFetcher {
                 tokenRefresh: tokenRefresh,
                 fetchedAt: entry.fetchedAt,
                 isStale: false,
-                errorMessage: nil
+                errorMessage: nil,
+                issue: nil
             )
         }
 
@@ -188,12 +207,14 @@ final class UsageFetcher {
                 tokenRefresh: tokenRefresh,
                 fetchedAt: entry?.fetchedAt,
                 isStale: false,
-                errorMessage: nil
+                errorMessage: nil,
+                issue: nil
             )
         } catch {
             tokenRefresh = resolveTokenRefresh(credentials: loadCurrentCredentialsFromHome())
 
             let entry = await cache.getAny(profileName: cacheKey)
+            let issue = Self.classifyIssue(from: error)
             return UsageSnapshot(
                 profileName: profileName,
                 output: entry?.output,
@@ -201,7 +222,8 @@ final class UsageFetcher {
                 tokenRefresh: tokenRefresh,
                 fetchedAt: entry?.fetchedAt,
                 isStale: entry != nil,
-                errorMessage: error.localizedDescription
+                errorMessage: issue?.message ?? error.localizedDescription,
+                issue: issue
             )
         }
     }
@@ -228,7 +250,15 @@ final class UsageFetcher {
         ) {
             let build = try buildTempHome(profile: profile, accounts: accounts)
             defer { try? FileManager.default.removeItem(at: build.homeURL) }
-            logRefresh(event: "refresh_cycle_started", fields: [
+            let profileClaude = claudeTokenFingerprint(
+                from: loadCredentialFile(
+                    accounts: accounts,
+                    accountId: profile.claudeAccountId,
+                    relativePath: credentialRelativePath(for: .claude)
+                )
+            )
+            let keychainClaude = claudeTokenFingerprint(from: readClaudeKeychainCredentials())
+            var fields: [String: String?] = [
                 "trace_id": traceID,
                 "scope": "profile",
                 "profile_name": profile.name,
@@ -237,7 +267,14 @@ final class UsageFetcher {
                 "gemini_account_id": profile.geminiAccountId,
                 "temp_home": build.homeURL.path,
                 "lock_key_count": String(lockKeys.count),
-            ])
+            ]
+            fields["profile_claude_file_refresh_fp"] = profileClaude.refreshFingerprint
+            fields["profile_claude_file_access_fp"] = profileClaude.accessFingerprint
+            fields["profile_claude_file_expires_at"] = profileClaude.expiresAtISO8601
+            fields["profile_claude_keychain_refresh_fp"] = keychainClaude.refreshFingerprint
+            fields["profile_claude_keychain_access_fp"] = keychainClaude.accessFingerprint
+            fields["profile_claude_keychain_expires_at"] = keychainClaude.expiresAtISO8601
+            logRefresh(event: "refresh_cycle_started", fields: fields)
 
             do {
                 let output = try await fetchUsageFromDocker(homeURL: build.homeURL, traceID: traceID)
@@ -563,36 +600,147 @@ final class UsageFetcher {
             return try await operation()
         }
 
-        logRefresh(event: "refresh_lock_wait", fields: [
+        return try await withProcessRefreshLocks(keys: normalized, traceID: traceID, scope: scope) {
+            logRefresh(event: "refresh_lock_wait", fields: [
+                "trace_id": traceID,
+                "scope": scope,
+                "lock_keys": normalized.joined(separator: ","),
+            ])
+            await Self.claudeRefreshLockRegistry.acquire(normalized)
+            logRefresh(event: "refresh_lock_acquired", fields: [
+                "trace_id": traceID,
+                "scope": scope,
+                "lock_keys": normalized.joined(separator: ","),
+            ])
+
+            do {
+                let result = try await operation()
+                await Self.claudeRefreshLockRegistry.release(normalized)
+                logRefresh(event: "refresh_lock_released", fields: [
+                    "trace_id": traceID,
+                    "scope": scope,
+                    "result": "success",
+                ])
+                return result
+            } catch {
+                await Self.claudeRefreshLockRegistry.release(normalized)
+                logRefresh(event: "refresh_lock_released", fields: [
+                    "trace_id": traceID,
+                    "scope": scope,
+                    "result": "error",
+                    "error": String(describing: error),
+                ])
+                throw error
+            }
+        }
+    }
+
+    private func withProcessRefreshLocks<T>(
+        keys: [String],
+        traceID: String,
+        scope: String,
+        operation: () async throws -> T
+    ) async throws -> T {
+        let lockDir = homeDirectory
+            .appendingPathComponent(".agent-island", isDirectory: true)
+            .appendingPathComponent("locks", isDirectory: true)
+        try FileManager.default.createDirectory(at: lockDir, withIntermediateDirectories: true)
+
+        logRefresh(event: "refresh_process_lock_wait", fields: [
             "trace_id": traceID,
             "scope": scope,
-            "lock_keys": normalized.joined(separator: ","),
+            "lock_keys": keys.joined(separator: ","),
         ])
-        await Self.claudeRefreshLockRegistry.acquire(normalized)
-        logRefresh(event: "refresh_lock_acquired", fields: [
+
+        var handles: [ProcessFileLock] = []
+        do {
+            for key in keys {
+                let lockName = processRefreshLockFileName(for: key)
+                let lockURL = lockDir.appendingPathComponent(lockName)
+                let handle = try ProcessFileLock(path: lockURL.path)
+                handles.append(handle)
+            }
+        } catch {
+            handles.reversed().forEach { $0.unlock() }
+            logRefresh(event: "refresh_process_lock_failed", fields: [
+                "trace_id": traceID,
+                "scope": scope,
+                "error": String(describing: error),
+                "lock_keys": keys.joined(separator: ","),
+            ])
+            throw error
+        }
+
+        logRefresh(event: "refresh_process_lock_acquired", fields: [
             "trace_id": traceID,
             "scope": scope,
-            "lock_keys": normalized.joined(separator: ","),
+            "lock_keys": keys.joined(separator: ","),
         ])
 
         do {
             let result = try await operation()
-            await Self.claudeRefreshLockRegistry.release(normalized)
-            logRefresh(event: "refresh_lock_released", fields: [
+            handles.reversed().forEach { $0.unlock() }
+            logRefresh(event: "refresh_process_lock_released", fields: [
                 "trace_id": traceID,
                 "scope": scope,
                 "result": "success",
             ])
             return result
         } catch {
-            await Self.claudeRefreshLockRegistry.release(normalized)
-            logRefresh(event: "refresh_lock_released", fields: [
+            handles.reversed().forEach { $0.unlock() }
+            logRefresh(event: "refresh_process_lock_released", fields: [
                 "trace_id": traceID,
                 "scope": scope,
                 "result": "error",
                 "error": String(describing: error),
             ])
             throw error
+        }
+    }
+
+    private func processRefreshLockFileName(for key: String) -> String {
+        let digest = SHA256.hash(data: Data(key.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return "usage-refresh-\(String(hex.prefix(24))).lock"
+    }
+
+    private final class ProcessFileLock {
+        private let fd: Int32
+        private var isLocked = true
+
+        init(path: String) throws {
+            let descriptor = open(path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+            guard descriptor >= 0 else {
+                throw NSError(
+                    domain: "UsageFetcher.ProcessFileLock",
+                    code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey: "open(\(path)) failed with errno \(errno)"]
+                )
+            }
+
+            if flock(descriptor, LOCK_EX) != 0 {
+                let error = NSError(
+                    domain: "UsageFetcher.ProcessFileLock",
+                    code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey: "flock(\(path)) failed with errno \(errno)"]
+                )
+                close(descriptor)
+                throw error
+            }
+
+            _ = fchmod(descriptor, S_IRUSR | S_IWUSR)
+            fd = descriptor
+        }
+
+        func unlock() {
+            guard isLocked else { return }
+            isLocked = false
+            _ = flock(fd, LOCK_UN)
+            _ = close(fd)
+        }
+
+        deinit {
+            unlock()
         }
     }
 
@@ -624,13 +772,19 @@ final class UsageFetcher {
             let sourceData = try Data(contentsOf: sourceURL)
             let existingData = try? Data(contentsOf: target.destinationURL)
             if let existingData, existingData == sourceData {
-                logRefresh(event: "credential_sync_skipped", fields: [
+                var fields: [String: String?] = [
                     "trace_id": traceID,
                     "reason": reason,
                     "decision": "unchanged",
                     "relative_path": target.relativePath,
                     "destination_path": target.destinationURL.path,
-                ])
+                ]
+                appendClaudeSyncFingerprints(
+                    into: &fields,
+                    sourceData: sourceData,
+                    destinationData: existingData
+                )
+                logRefresh(event: "credential_sync_skipped", fields: fields)
                 continue
             }
 
@@ -694,7 +848,37 @@ final class UsageFetcher {
         destinationData: Data?
     ) -> CredentialSyncDecision {
         if reason == "success" {
-            return .write("success_path")
+            guard let destinationData else {
+                return .write("destination_missing_on_success")
+            }
+
+            if !relativePath.hasPrefix(".claude/") {
+                return .write("success_path_non_claude")
+            }
+
+            let source = claudeTokenFingerprint(from: sourceData)
+            let destination = claudeTokenFingerprint(from: destinationData)
+            let tokenMaterialChanged =
+                source.refreshFingerprint != destination.refreshFingerprint ||
+                source.accessFingerprint != destination.accessFingerprint
+
+            if !tokenMaterialChanged {
+                return .skip("same_token_material_on_success")
+            }
+
+            guard let sourceExpiry = source.expiresAt else {
+                return .skip("missing_source_expiry_on_success")
+            }
+
+            guard let destinationExpiry = destination.expiresAt else {
+                return .write("token_changed_and_destination_missing_expiry_on_success")
+            }
+
+            if sourceExpiry.timeIntervalSince(destinationExpiry) > 5 {
+                return .write("token_changed_and_newer_expiry_on_success")
+            }
+
+            return .skip("token_changed_but_not_newer_on_success")
         }
 
         guard let destinationData else {
@@ -778,7 +962,6 @@ final class UsageFetcher {
         dockerContext: String?,
         traceID: String
     ) async throws -> Data {
-
         let process = Process()
         let outPipe = Pipe()
         let errPipe = Pipe()
@@ -1110,6 +1293,58 @@ final class UsageFetcher {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(CheckUsageOutput.self, from: data)
+    }
+
+    static func classifyIssue(from error: Error) -> UsageIssue? {
+        if case let UsageFetcherError.dockerFailed(exitCode, stderr) = error {
+            return classifyDockerIssue(exitCode: exitCode, stderr: stderr)
+        }
+
+        let description = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = description.lowercased()
+        if lowered.contains("docker"), lowered.contains("not found") {
+            return UsageIssue(
+                kind: .dockerCLIUnavailable,
+                message: "Docker CLI is unavailable. Open Docker Desktop or reinstall Docker Desktop.",
+                technicalDetails: description.isEmpty ? nil : description
+            )
+        }
+
+        return nil
+    }
+
+    private static func classifyDockerIssue(exitCode: Int32, stderr: String) -> UsageIssue? {
+        let details = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = details.lowercased()
+
+        if lowered.contains("/var/run/docker.sock"),
+           lowered.contains("no such file or directory") || lowered.contains("cannot connect") || lowered.contains("failed to connect to the docker api") {
+            return UsageIssue(
+                kind: .dockerDaemonUnavailable,
+                message: "Docker Desktop is not running. Open Docker Desktop, wait until it is running, then refresh usage.",
+                technicalDetails: details.isEmpty ? nil : details
+            )
+        }
+
+        if lowered.contains("docker-credential-desktop"),
+           lowered.contains("executable file not found") || lowered.contains("not found in $path") || lowered.contains("error getting credentials") {
+            return UsageIssue(
+                kind: .dockerCredentialHelperMissing,
+                message: "Docker credential helper is missing. Open Docker Desktop, then check ~/.docker/config.json credentials settings.",
+                technicalDetails: details.isEmpty ? nil : details
+            )
+        }
+
+        if exitCode == 127,
+           lowered.contains("command not found") || lowered.contains("executable file not found") {
+            return UsageIssue(
+                kind: .dockerCLIUnavailable,
+                message: "Docker CLI is unavailable. Open Docker Desktop or reinstall Docker Desktop.",
+                technicalDetails: details.isEmpty ? nil : details
+            )
+        }
+
+        return nil
     }
 }
 

@@ -214,6 +214,24 @@ struct RefreshResult {
     seven_day_reset: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RefreshFailureKind {
+    NeedsLogin,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct RefreshFailure {
+    kind: RefreshFailureKind,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+enum AccountRefreshOutcome {
+    Success(RefreshResult),
+    Failed(RefreshFailure),
+}
+
 #[derive(Debug, Clone)]
 struct ClaudeInventoryStatus {
     email: String,
@@ -783,8 +801,8 @@ impl CAuthApp {
             .as_ref()
             .map(|data| self.resolve_claude_account_id(data));
 
-        let mut refreshed_by_account_id: HashMap<String, RefreshResult> = HashMap::new();
-        let mut refreshed_by_lock_id: HashMap<String, RefreshResult> = HashMap::new();
+        let mut refreshed_by_account_id: HashMap<String, AccountRefreshOutcome> = HashMap::new();
+        let mut refreshed_by_lock_id: HashMap<String, AccountRefreshOutcome> = HashMap::new();
         let mut touched_account_ids: HashSet<String> = HashSet::new();
 
         for profile in &profiles {
@@ -804,60 +822,109 @@ impl CAuthApp {
             let account_root = PathBuf::from(&account.root_path);
             let credential_path = account_root.join(".claude/.credentials.json");
             if !credential_path.exists() {
+                refreshed_by_account_id.insert(
+                    account_id.clone(),
+                    AccountRefreshOutcome::Failed(RefreshFailure {
+                        kind: RefreshFailureKind::Error,
+                        message: format!(
+                            "missing stored credentials: {}",
+                            credential_path.display()
+                        ),
+                    }),
+                );
                 continue;
             }
 
-            let current_data = fs::read(&credential_path).map_err(|err| {
-                CliError::new(
-                    format!("failed to read {}: {}", credential_path.display(), err),
-                    1,
-                )
-            })?;
-            let lock_id = self.resolve_refresh_lock_id(&current_data, &account_id);
-
-            if let Some(existing) = refreshed_by_lock_id.get(&lock_id).cloned() {
-                write_file_atomic(&credential_path, &existing.credentials_data)?;
-                if active_account_id.as_deref() == Some(account_id.as_str()) {
-                    let active_path = self.home_dir.join(".claude/.credentials.json");
-                    write_file_atomic(&active_path, &existing.credentials_data)?;
-                    self.save_claude_credentials_to_keychain(&existing.credentials_data)?;
+            let current_data = match fs::read(&credential_path) {
+                Ok(data) => data,
+                Err(err) => {
+                    refreshed_by_account_id.insert(
+                        account_id.clone(),
+                        AccountRefreshOutcome::Failed(RefreshFailure {
+                            kind: RefreshFailureKind::Error,
+                            message: format!(
+                                "failed to read {}: {}",
+                                credential_path.display(),
+                                err
+                            ),
+                        }),
+                    );
+                    continue;
                 }
-                refreshed_by_account_id.insert(account_id.clone(), existing);
-                touched_account_ids.insert(account_id.clone());
+            };
+            let lock_id = self.resolve_refresh_lock_id(&current_data, &account_id);
+            let lock_keys = self.refresh_lock_keys(&current_data, &account_id);
+
+            if let Some(existing_outcome) = refreshed_by_lock_id.get(&lock_id).cloned() {
+                let outcome = match &existing_outcome {
+                    AccountRefreshOutcome::Success(existing) => {
+                        match self.apply_refreshed_credentials(
+                            account_id.as_str(),
+                            &credential_path,
+                            active_account_id.as_deref(),
+                            &existing.credentials_data,
+                        ) {
+                            Ok(()) => {
+                                touched_account_ids.insert(account_id.clone());
+                                existing_outcome
+                            }
+                            Err(err) => {
+                                AccountRefreshOutcome::Failed(classify_refresh_failure(&err))
+                            }
+                        }
+                    }
+                    AccountRefreshOutcome::Failed(_) => existing_outcome,
+                };
+                refreshed_by_account_id.insert(account_id.clone(), outcome);
                 continue;
             }
 
-            let refreshed_data = self.with_refresh_lock(&lock_id, || {
-                self.refresh_claude_credentials_always(&current_data)
-            })?;
-            write_file_atomic(&credential_path, &refreshed_data)?;
+            let refreshed_data = self.with_refresh_lock(&lock_keys, || {
+                let latest_data = fs::read(&credential_path).map_err(|err| {
+                    CliError::new(
+                        format!("failed to re-read {}: {}", credential_path.display(), err),
+                        1,
+                    )
+                })?;
+                self.refresh_claude_credentials_always(&latest_data)
+            });
+            let outcome = match refreshed_data {
+                Ok(refreshed_data) => match self.apply_refreshed_credentials(
+                    account_id.as_str(),
+                    &credential_path,
+                    active_account_id.as_deref(),
+                    &refreshed_data,
+                ) {
+                    Ok(()) => {
+                        touched_account_ids.insert(account_id.clone());
+                        let parsed = parse_claude_credentials(&refreshed_data);
+                        let plan = resolve_claude_plan(&parsed.root);
+                        let email = extract_claude_email(&parsed.root);
+                        let key_remaining = format_key_remaining(parsed.expires_at.as_ref());
+                        let usage = self.fetch_claude_usage_summary(parsed.access_token.as_deref());
 
-            if active_account_id.as_deref() == Some(account_id.as_str()) {
-                let active_path = self.home_dir.join(".claude/.credentials.json");
-                write_file_atomic(&active_path, &refreshed_data)?;
-                self.save_claude_credentials_to_keychain(&refreshed_data)?;
-            }
-
-            let parsed = parse_claude_credentials(&refreshed_data);
-            let plan = resolve_claude_plan(&parsed.root);
-            let email = extract_claude_email(&parsed.root);
-            let key_remaining = format_key_remaining(parsed.expires_at.as_ref());
-            let usage = self.fetch_claude_usage_summary(parsed.access_token.as_deref());
-
-            let result = RefreshResult {
-                credentials_data: refreshed_data,
-                email,
-                plan,
-                key_remaining,
-                five_hour_percent: usage.as_ref().and_then(|item| item.five_hour_percent),
-                five_hour_reset: usage.as_ref().and_then(|item| item.five_hour_reset),
-                seven_day_percent: usage.as_ref().and_then(|item| item.seven_day_percent),
-                seven_day_reset: usage.as_ref().and_then(|item| item.seven_day_reset),
+                        AccountRefreshOutcome::Success(RefreshResult {
+                            credentials_data: refreshed_data,
+                            email,
+                            plan,
+                            key_remaining,
+                            five_hour_percent: usage
+                                .as_ref()
+                                .and_then(|item| item.five_hour_percent),
+                            five_hour_reset: usage.as_ref().and_then(|item| item.five_hour_reset),
+                            seven_day_percent: usage
+                                .as_ref()
+                                .and_then(|item| item.seven_day_percent),
+                            seven_day_reset: usage.as_ref().and_then(|item| item.seven_day_reset),
+                        })
+                    }
+                    Err(err) => AccountRefreshOutcome::Failed(classify_refresh_failure(&err)),
+                },
+                Err(err) => AccountRefreshOutcome::Failed(classify_refresh_failure(&err)),
             };
 
-            refreshed_by_lock_id.insert(lock_id, result.clone());
-            refreshed_by_account_id.insert(account_id.clone(), result);
-            touched_account_ids.insert(account_id);
+            refreshed_by_lock_id.insert(lock_id, outcome.clone());
+            refreshed_by_account_id.insert(account_id, outcome);
         }
 
         for account in &mut snapshot.accounts {
@@ -867,30 +934,93 @@ impl CAuthApp {
         }
         self.account_store.save_snapshot(&snapshot)?;
 
+        let mut failed_profiles = Vec::new();
+        let mut needs_login_profiles = Vec::new();
         for profile in &profiles {
             let Some(account_id) = profile.claude_account_id.as_ref() else {
                 println!("{}: - - 5h -- 7d -- (key) --", profile.name);
                 continue;
             };
-            let Some(refreshed) = refreshed_by_account_id.get(account_id) else {
+            let Some(outcome) = refreshed_by_account_id.get(account_id) else {
                 println!("{}: - - 5h -- 7d -- (key) --", profile.name);
                 continue;
             };
 
-            let email = refreshed.email.clone().unwrap_or_else(|| "-".to_string());
-            let plan = refreshed.plan.clone().unwrap_or_else(|| "-".to_string());
-            let five = format_usage_window(
-                refreshed.five_hour_percent,
-                refreshed.five_hour_reset.as_ref(),
-            );
-            let seven = format_usage_window(
-                refreshed.seven_day_percent,
-                refreshed.seven_day_reset.as_ref(),
-            );
-            println!(
-                "{}: {} {} 5h {} 7d {} (key) {}",
-                profile.name, email, plan, five, seven, refreshed.key_remaining
-            );
+            match outcome {
+                AccountRefreshOutcome::Success(refreshed) => {
+                    let email = refreshed.email.clone().unwrap_or_else(|| "-".to_string());
+                    let plan = refreshed.plan.clone().unwrap_or_else(|| "-".to_string());
+                    let five = format_usage_window(
+                        refreshed.five_hour_percent,
+                        refreshed.five_hour_reset.as_ref(),
+                    );
+                    let seven = format_usage_window(
+                        refreshed.seven_day_percent,
+                        refreshed.seven_day_reset.as_ref(),
+                    );
+                    println!(
+                        "{}: {} {} 5h {} 7d {} (key) {}",
+                        profile.name, email, plan, five, seven, refreshed.key_remaining
+                    );
+                }
+                AccountRefreshOutcome::Failed(failure) => {
+                    let label = match failure.kind {
+                        RefreshFailureKind::NeedsLogin => "needs-login",
+                        RefreshFailureKind::Error => "error",
+                    };
+                    println!(
+                        "{}: - - 5h -- 7d -- (key) -- [{}] {}",
+                        profile.name,
+                        label,
+                        truncate_chars(&failure.message, 180),
+                    );
+                    failed_profiles.push(profile.name.clone());
+                    if failure.kind == RefreshFailureKind::NeedsLogin {
+                        needs_login_profiles.push(profile.name.clone());
+                    }
+                }
+            }
+        }
+
+        if failed_profiles.is_empty() {
+            return Ok(());
+        }
+
+        if failed_profiles.len() == needs_login_profiles.len() {
+            return Err(CliError::new(
+                format!(
+                    "{} profile(s) need login: {}",
+                    failed_profiles.len(),
+                    needs_login_profiles.join(",")
+                ),
+                1,
+            ));
+        }
+
+        Err(CliError::new(
+            format!(
+                "{} profile(s) failed ({} need login): {}",
+                failed_profiles.len(),
+                needs_login_profiles.len(),
+                failed_profiles.join(",")
+            ),
+            1,
+        ))
+    }
+
+    fn apply_refreshed_credentials(
+        &self,
+        account_id: &str,
+        credential_path: &Path,
+        active_account_id: Option<&str>,
+        refreshed_data: &[u8],
+    ) -> CliResult<()> {
+        write_file_atomic(credential_path, refreshed_data)?;
+
+        if active_account_id == Some(account_id) {
+            let active_path = self.home_dir.join(".claude/.credentials.json");
+            write_file_atomic(&active_path, refreshed_data)?;
+            self.save_claude_credentials_to_keychain(refreshed_data)?;
         }
 
         Ok(())
@@ -930,45 +1060,61 @@ impl CAuthApp {
         short_hash_hex(refresh_token.as_bytes())
     }
 
-    fn with_refresh_lock<T, F>(&self, lock_id: &str, operation: F) -> CliResult<T>
+    fn refresh_lock_keys(&self, data: &[u8], account_id: &str) -> Vec<String> {
+        let mut keys = vec![format!("account:{}", account_id)];
+        let parsed = parse_claude_credentials(data);
+        if let Some(refresh_token) = parsed.refresh_token {
+            keys.push(format!(
+                "token:{}",
+                short_hash_hex(refresh_token.as_bytes())
+            ));
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    fn with_refresh_lock<T, F>(&self, lock_ids: &[String], operation: F) -> CliResult<T>
     where
         F: FnOnce() -> CliResult<T>,
     {
-        let lock_path = self
-            .agent_root
-            .join("locks")
-            .join(format!("cauth-refresh-{}.lock", lock_id));
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
-                CliError::new(
-                    format!("failed to create lock dir {}: {}", parent.display(), err),
-                    1,
-                )
-            })?;
-        }
-
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|err| {
-                CliError::new(
-                    format!("failed to open lock file {}: {}", lock_path.display(), err),
-                    1,
-                )
-            })?;
-        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
-        file.lock_exclusive().map_err(|err| {
+        let lock_root = self.agent_root.join("locks");
+        fs::create_dir_all(&lock_root).map_err(|err| {
             CliError::new(
-                format!("failed to acquire lock {}: {}", lock_path.display(), err),
+                format!("failed to create lock dir {}: {}", lock_root.display(), err),
                 1,
             )
         })?;
 
+        let mut files = Vec::new();
+        for lock_id in lock_ids {
+            let lock_path = lock_root.join(format!("cauth-refresh-{}.lock", lock_id));
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .map_err(|err| {
+                    CliError::new(
+                        format!("failed to open lock file {}: {}", lock_path.display(), err),
+                        1,
+                    )
+                })?;
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+            file.lock_exclusive().map_err(|err| {
+                CliError::new(
+                    format!("failed to acquire lock {}: {}", lock_path.display(), err),
+                    1,
+                )
+            })?;
+            files.push(file);
+        }
+
         let result = operation();
-        let _ = file.unlock();
+        for file in files.into_iter().rev() {
+            let _ = file.unlock();
+        }
         result
     }
 
@@ -1132,6 +1278,22 @@ fn default_home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn classify_refresh_failure(error: &CliError) -> RefreshFailure {
+    let lowered = error.message.to_lowercase();
+    let needs_login = lowered.contains("invalid_grant")
+        || lowered.contains("refresh token not found or invalid")
+        || lowered.contains("oauth token has been revoked");
+
+    RefreshFailure {
+        kind: if needs_login {
+            RefreshFailureKind::NeedsLogin
+        } else {
+            RefreshFailureKind::Error
+        },
+        message: error.message.clone(),
+    }
 }
 
 fn default_process_runner(executable: &str, arguments: &[String]) -> ProcessExecutionResult {
@@ -2031,6 +2193,126 @@ mod tests {
         assert_eq!(b_tokens.0.as_deref(), Some("at-deduped"));
         assert_eq!(b_tokens.1.as_deref(), Some("rt-deduped"));
         assert_eq!(*refresh_count.lock().expect("refresh count"), 1);
+    }
+
+    #[test]
+    fn refresh_continues_when_one_profile_invalid_grant() {
+        let temp = TempDir::new().expect("temp dir");
+        let home = temp.path().to_path_buf();
+        let good_account = "acct_claude_good_example_com";
+        let bad_account = "acct_claude_bad_example_com";
+        let good_root = home.join(format!(".agent-island/accounts/{}", good_account));
+        let bad_root = home.join(format!(".agent-island/accounts/{}", bad_account));
+        let good_path = good_root.join(".claude/.credentials.json");
+        let bad_path = bad_root.join(".claude/.credentials.json");
+
+        write_credentials(
+            &good_path,
+            "at-good-before",
+            "rt-good-before",
+            1_700_000_000_000,
+            Some("good@example.com"),
+            None,
+        )
+        .expect("write good credential");
+        write_credentials(
+            &bad_path,
+            "at-bad-before",
+            "rt-bad-before",
+            1_700_000_000_000,
+            Some("bad@example.com"),
+            None,
+        )
+        .expect("write bad credential");
+        write_credentials(
+            &home.join(".claude/.credentials.json"),
+            "at-good-before",
+            "rt-good-before",
+            1_700_000_000_000,
+            Some("good@example.com"),
+            None,
+        )
+        .expect("write active credential");
+
+        let store = AccountStore::new(home.join(".agent-island"));
+        let snapshot = AccountsSnapshot {
+            accounts: vec![
+                UsageAccount {
+                    id: good_account.to_string(),
+                    service: UsageService::Claude,
+                    label: "claude:good".to_string(),
+                    root_path: good_root.display().to_string(),
+                    updated_at: utc_now_iso(),
+                },
+                UsageAccount {
+                    id: bad_account.to_string(),
+                    service: UsageService::Claude,
+                    label: "claude:bad".to_string(),
+                    root_path: bad_root.display().to_string(),
+                    updated_at: utc_now_iso(),
+                },
+            ],
+            profiles: vec![
+                UsageProfile {
+                    name: "home".to_string(),
+                    claude_account_id: Some(good_account.to_string()),
+                    codex_account_id: None,
+                    gemini_account_id: None,
+                },
+                UsageProfile {
+                    name: "work3".to_string(),
+                    claude_account_id: Some(bad_account.to_string()),
+                    codex_account_id: None,
+                    gemini_account_id: None,
+                },
+            ],
+        };
+        store.save_snapshot(&snapshot).expect("save snapshot");
+
+        let recorder = ProcessRecorder::default();
+        let refresh_client: RefreshClient = Arc::new(move |refresh_token, _| {
+            if refresh_token == "rt-bad-before" {
+                return Err(CliError::new(
+                    "refresh failed (400): {\"error\":\"invalid_grant\",\"error_description\":\"Refresh token not found or invalid\"}",
+                    1,
+                ));
+            }
+
+            Ok(ClaudeRefreshPayload {
+                access_token: "at-good-after".to_string(),
+                refresh_token: Some("rt-good-after".to_string()),
+                expires_in: Some(28_800.0),
+                scope: Some("user:profile".to_string()),
+            })
+        });
+        let app = CAuthApp::with_clients(
+            home.clone(),
+            recorder.runner(),
+            refresh_client,
+            Arc::new(|_| None),
+        );
+
+        let err = app
+            .refresh_all_profiles()
+            .expect_err("one profile should fail with invalid_grant");
+        assert!(
+            err.message.contains("need login"),
+            "unexpected error: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("work3"),
+            "should include failing profile name: {}",
+            err.message
+        );
+
+        let good_tokens = read_tokens(&good_path).expect("good tokens");
+        let bad_tokens = read_tokens(&bad_path).expect("bad tokens");
+        assert_eq!(good_tokens.0.as_deref(), Some("at-good-after"));
+        assert_eq!(good_tokens.1.as_deref(), Some("rt-good-after"));
+        assert_eq!(bad_tokens.0.as_deref(), Some("at-bad-before"));
+        assert_eq!(bad_tokens.1.as_deref(), Some("rt-bad-before"));
+        assert_eq!(recorder.add_count(), 1);
     }
 
     fn write_credentials(

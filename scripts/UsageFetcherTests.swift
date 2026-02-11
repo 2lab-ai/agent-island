@@ -8,8 +8,11 @@ enum UsageFetcherTests {
         try testIncompleteIdentityCacheEntryIsNotReused()
         try await testCurrentIdentityCacheInvalidatesWhenCredentialsChange()
         try await testCurrentSnapshotForceRefreshBypassesFreshCache()
+        try await testDockerSocketErrorProducesActionableIssue()
+        try await testDockerCredentialHelperErrorProducesActionableIssue()
         try await testClaudeSubscriptionMetadataFallbackFromCredentials()
         try await testProfileTokenRefreshReflectsCredentialUpdateAfterDockerRun()
+        try await testProfileRefreshSkipsOlderClaudeCredentialOnSuccessSync()
         print("OK")
     }
 
@@ -181,6 +184,60 @@ enum UsageFetcherTests {
         assert(forced.isStale == true, "Expected forced refresh to bypass cache and fail into stale fallback with empty credentials.")
     }
 
+    private static func testDockerSocketErrorProducesActionableIssue() async throws {
+        let testHome = try makeIsolatedHome(name: "docker-sock-missing")
+        defer { try? FileManager.default.removeItem(at: testHome) }
+
+        let fetcher = UsageFetcher(
+            accountStore: AccountStore(rootDir: FileManager.default.temporaryDirectory),
+            cache: UsageCache(ttl: 0),
+            dockerRunner: { _, _, _ in
+                throw UsageFetcherError.dockerFailed(
+                    exitCode: 1,
+                    stderr: "failed to connect to the docker API at unix:///var/run/docker.sock: check if the path is correct and if the daemon is running: dial unix /var/run/docker.sock: connect: no such file or directory"
+                )
+            },
+            homeDirectory: testHome
+        )
+
+        let credentials = ExportCredentials(
+            claude: nil,
+            codex: Data("{\"tokens\":{\"access_token\":\"tok\"}}".utf8),
+            gemini: nil
+        )
+        let snapshot = await fetcher.fetchCurrentSnapshot(credentials: credentials, forceRefresh: true)
+
+        assert(snapshot.issue?.kind == .dockerDaemonUnavailable)
+        assert(snapshot.errorMessage?.contains("Docker Desktop is not running") == true)
+    }
+
+    private static func testDockerCredentialHelperErrorProducesActionableIssue() async throws {
+        let testHome = try makeIsolatedHome(name: "docker-creds-helper")
+        defer { try? FileManager.default.removeItem(at: testHome) }
+
+        let fetcher = UsageFetcher(
+            accountStore: AccountStore(rootDir: FileManager.default.temporaryDirectory),
+            cache: UsageCache(ttl: 0),
+            dockerRunner: { _, _, _ in
+                throw UsageFetcherError.dockerFailed(
+                    exitCode: 127,
+                    stderr: "Unable to find image 'node:20-alpine' locally docker: error getting credentials - err: exec: \"docker-credential-desktop\": executable file not found in $PATH"
+                )
+            },
+            homeDirectory: testHome
+        )
+
+        let credentials = ExportCredentials(
+            claude: nil,
+            codex: Data("{\"tokens\":{\"access_token\":\"tok\"}}".utf8),
+            gemini: nil
+        )
+        let snapshot = await fetcher.fetchCurrentSnapshot(credentials: credentials, forceRefresh: true)
+
+        assert(snapshot.issue?.kind == .dockerCredentialHelperMissing)
+        assert(snapshot.errorMessage?.contains("credential helper") == true)
+    }
+
     private static func testClaudeSubscriptionMetadataFallbackFromCredentials() async throws {
         let cache = UsageCache(ttl: 600)
         let fetcher = UsageFetcher(
@@ -307,6 +364,99 @@ enum UsageFetcherTests {
         )
     }
 
+    private static func testProfileRefreshSkipsOlderClaudeCredentialOnSuccessSync() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("usage-fetcher-stale-guard-\(UUID().uuidString)", isDirectory: true)
+        let accountRoot = root.appendingPathComponent("accounts/acct_claude_test", isDirectory: true)
+        let credentialsURL = accountRoot.appendingPathComponent(".claude/.credentials.json")
+        try fm.createDirectory(at: credentialsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let issuedAt = Date(timeIntervalSince1970: 1_910_000_000)
+        let latestExpiry = Date(timeIntervalSince1970: 1_910_010_800)
+        let staleExpiry = Date(timeIntervalSince1970: 1_910_003_600)
+        let latestCredential = try makeClaudeCredential(
+            accessToken: "at-latest",
+            refreshToken: "rt-latest",
+            expiresAt: latestExpiry,
+            issuedAt: issuedAt
+        )
+        let staleCredential = try makeClaudeCredential(
+            accessToken: "at-stale",
+            refreshToken: "rt-stale",
+            expiresAt: staleExpiry,
+            issuedAt: issuedAt
+        )
+        try latestCredential.write(to: credentialsURL, options: [.atomic])
+
+        let accountStore = AccountStore(rootDir: root)
+        try accountStore.saveSnapshot(
+            AccountsSnapshot(
+                accounts: [
+                    UsageAccount(
+                        id: "acct_claude_test",
+                        service: .claude,
+                        label: "claude:test",
+                        rootPath: accountRoot.path,
+                        updatedAt: Date()
+                    ),
+                ],
+                profiles: []
+            )
+        )
+
+        let fetcher = UsageFetcher(
+            accountStore: accountStore,
+            cache: UsageCache(ttl: 0),
+            dockerRunner: { homeURL, _, _ in
+                let updatedURL = homeURL.appendingPathComponent(".claude/.credentials.json")
+                try staleCredential.write(to: updatedURL, options: [.atomic])
+
+                let json = """
+                {
+                  "claude": { "name": "Claude", "available": true, "error": false },
+                  "codex": null,
+                  "gemini": null,
+                  "zai": null,
+                  "recommendation": null,
+                  "recommendationReason": "n/a"
+                }
+                """
+                return Data(json.utf8)
+            },
+            homeDirectory: root
+        )
+
+        let profile = UsageProfile(
+            name: "refresh-test",
+            claudeAccountId: "acct_claude_test",
+            codexAccountId: nil,
+            geminiAccountId: nil
+        )
+        let snapshot = await fetcher.fetchSnapshot(for: profile, forceRefresh: true)
+
+        guard let snapshotExpiry = snapshot.tokenRefresh.claude?.expiresAt else {
+            assertionFailure("Expected Claude token refresh info")
+            return
+        }
+
+        let latestOnDiskData = try Data(contentsOf: credentialsURL)
+        let latestOnDiskExpiry = try readClaudeExpiresAt(from: latestOnDiskData)
+        let latestOnDiskTokens = try readClaudeTokens(from: latestOnDiskData)
+
+        assert(
+            abs(snapshotExpiry.timeIntervalSince(latestExpiry)) < 1,
+            "Expected snapshot to keep latest destination credential expiry. snapshot=\(snapshotExpiry.timeIntervalSince1970) expected=\(latestExpiry.timeIntervalSince1970)"
+        )
+        assert(
+            abs(latestOnDiskExpiry.timeIntervalSince(latestExpiry)) < 1,
+            "Expected destination credential to keep newer expiry. disk=\(latestOnDiskExpiry.timeIntervalSince1970) expected=\(latestExpiry.timeIntervalSince1970)"
+        )
+        assert(latestOnDiskTokens.accessToken == "at-latest")
+        assert(latestOnDiskTokens.refreshToken == "rt-latest")
+    }
+
     private static func makeJWTBackedCredential(email: String) throws -> Data {
         let header = try base64URLJSON(["alg": "HS256", "typ": "JWT"])
         let payload = try base64URLJSON(["email": email, "exp": 1_910_000_000]) // 2030-07-18 UTC
@@ -320,11 +470,16 @@ enum UsageFetcherTests {
         return try JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
     }
 
-    private static func makeClaudeCredential(expiresAt: Date, issuedAt: Date) throws -> Data {
+    private static func makeClaudeCredential(
+        accessToken: String = "at-old",
+        refreshToken: String = "rt-stable",
+        expiresAt: Date,
+        issuedAt: Date
+    ) throws -> Data {
         let root: [String: Any] = [
             "claudeAiOauth": [
-                "accessToken": "at-old",
-                "refreshToken": "rt-stable",
+                "accessToken": accessToken,
+                "refreshToken": refreshToken,
                 "expiresAt": Int(expiresAt.timeIntervalSince1970 * 1000),
                 "issuedAt": Int(issuedAt.timeIntervalSince1970 * 1000),
                 "rateLimitTier": "default_claude_max_20x",
@@ -346,6 +501,19 @@ enum UsageFetcherTests {
             throw NSError(domain: "UsageFetcherTests", code: 3)
         }
         return Date(timeIntervalSince1970: millis.doubleValue / 1000)
+    }
+
+    private static func readClaudeTokens(from data: Data) throws -> (accessToken: String?, refreshToken: String?) {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "UsageFetcherTests", code: 11)
+        }
+        guard let oauth = root["claudeAiOauth"] as? [String: Any] else {
+            throw NSError(domain: "UsageFetcherTests", code: 12)
+        }
+        return (
+            accessToken: oauth["accessToken"] as? String,
+            refreshToken: oauth["refreshToken"] as? String
+        )
     }
 
     private static func base64URLJSON(_ object: [String: Any]) throws -> String {
