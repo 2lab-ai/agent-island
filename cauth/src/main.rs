@@ -357,12 +357,12 @@ impl CAuthApp {
             )
         })?;
 
-        let account_id = self.resolve_claude_account_id(&credential_data);
+        let mut snapshot = self.account_store.load_snapshot()?;
+        let account_id = self.resolve_snapshot_account_id_for_credentials(&snapshot, &credential_data);
         let account_root = self.accounts_dir.join(&account_id);
         let account_credential_path = account_root.join(".claude/.credentials.json");
         write_file_atomic(&account_credential_path, &credential_data)?;
 
-        let mut snapshot = self.account_store.load_snapshot()?;
         let account = UsageAccount {
             id: account_id.clone(),
             service: UsageService::Claude,
@@ -561,7 +561,87 @@ impl CAuthApp {
             }
         }
 
+        if let Some(account_id) = self.resolve_snapshot_account_id_by_metadata(snapshot, data) {
+            return account_id;
+        }
+
         direct_account_id
+    }
+
+    fn resolve_snapshot_account_id_by_metadata(
+        &self,
+        snapshot: &AccountsSnapshot,
+        data: &[u8],
+    ) -> Option<String> {
+        let parsed = parse_claude_credentials(data);
+        let target_email = extract_claude_email(&parsed.root);
+        let target_team = resolve_claude_is_team(&parsed.root);
+        let target_plan = resolve_claude_plan(&parsed.root);
+        if target_email.is_none() && target_team.is_none() && target_plan.is_none() {
+            return None;
+        }
+
+        let mut scored: Vec<(String, i32)> = Vec::new();
+        for account in snapshot
+            .accounts
+            .iter()
+            .filter(|account| account.service == UsageService::Claude)
+        {
+            let credential_path =
+                PathBuf::from(&account.root_path).join(".claude/.credentials.json");
+            let Ok(existing_data) = fs::read(&credential_path) else {
+                continue;
+            };
+
+            let existing = parse_claude_credentials(&existing_data);
+            let existing_email = extract_claude_email(&existing.root);
+            let existing_team = resolve_claude_is_team(&existing.root);
+            let existing_plan = resolve_claude_plan(&existing.root);
+
+            let mut score = 0;
+
+            if let Some(target_email) = target_email.as_ref() {
+                if existing_email.as_ref() == Some(target_email) {
+                    score += 100;
+                } else {
+                    continue;
+                }
+            }
+
+            if let Some(target_team) = target_team {
+                if let Some(existing_team) = existing_team {
+                    if existing_team == target_team {
+                        score += 30;
+                    } else {
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(target_plan) = target_plan.as_ref() {
+                if existing_plan.as_ref() == Some(target_plan) {
+                    score += 10;
+                }
+            }
+
+            if score > 0 {
+                scored.push((account.id.clone(), score));
+            }
+        }
+
+        if scored.is_empty() {
+            return None;
+        }
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        if scored.len() > 1 && scored[0].1 == scored[1].1 {
+            return None;
+        }
+        Some(scored[0].0.clone())
     }
 
     fn profile_inventory_lines(&self) -> CliResult<Vec<String>> {
@@ -799,7 +879,33 @@ impl CAuthApp {
         let active_data = self.load_current_credentials();
         let active_account_id = active_data
             .as_ref()
-            .map(|data| self.resolve_claude_account_id(data));
+            .map(|data| self.resolve_snapshot_account_id_for_credentials(&snapshot, data));
+
+        let mut snapshot_changed = false;
+        if let (Some(active_data), Some(active_account_id)) =
+            (active_data.as_ref(), active_account_id.as_ref())
+        {
+            if let Some(index) = snapshot
+                .accounts
+                .iter()
+                .position(|account| account.service == UsageService::Claude && account.id == *active_account_id)
+            {
+                let credential_path =
+                    PathBuf::from(&snapshot.accounts[index].root_path).join(".claude/.credentials.json");
+                let needs_write = match fs::read(&credential_path) {
+                    Ok(existing_data) => existing_data != *active_data,
+                    Err(_) => true,
+                };
+                if needs_write {
+                    write_file_atomic(&credential_path, active_data)?;
+                    snapshot.accounts[index].updated_at = utc_now_iso();
+                    snapshot_changed = true;
+                }
+            }
+        }
+        if snapshot_changed {
+            self.account_store.save_snapshot(&snapshot)?;
+        }
 
         let mut refreshed_by_account_id: HashMap<String, AccountRefreshOutcome> = HashMap::new();
         let mut refreshed_by_lock_id: HashMap<String, AccountRefreshOutcome> = HashMap::new();
