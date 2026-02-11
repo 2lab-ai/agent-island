@@ -1,6 +1,7 @@
 # cauth
 
 `cauth` is a standalone Rust CLI for Claude auth profile save/switch/refresh.
+Running `cauth` with no arguments prints full profile/account inventory.
 
 ## Build and run
 
@@ -72,3 +73,7 @@ cargo test
 - `CAUTH_SECURITY_BIN`
 
 These are primarily for testing and controlled environments.
+- `cauth list` (or just `cauth`)
+  - Prints:
+    - all profiles and linked Claude account state
+    - all accounts and link/file/status summary

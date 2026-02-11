@@ -48,6 +48,7 @@ type CliResult<T> = Result<T, CliError>;
 #[derive(Debug)]
 enum CliCommand {
     Help,
+    List,
     Save(String),
     Switch(String),
     Refresh,
@@ -56,11 +57,17 @@ enum CliCommand {
 impl CliCommand {
     fn parse(args: &[String]) -> CliResult<Self> {
         let Some(first) = args.first() else {
-            return Ok(Self::Help);
+            return Ok(Self::List);
         };
 
         match first.as_str() {
             "-h" | "--help" | "help" => Ok(Self::Help),
+            "list" | "ls" => {
+                if args.len() != 1 {
+                    return Err(CliError::new("usage: cauth list", 2));
+                }
+                Ok(Self::List)
+            }
             "save" => {
                 if args.len() != 2 {
                     return Err(CliError::new("usage: cauth save <profile-name>", 2));
@@ -301,6 +308,7 @@ impl CAuthApp {
         println!(
             "cauth - Claude auth profile CLI\n\n\
              Usage:\n\
+               cauth list                     List saved profiles and current account\n\
                cauth save <profile-name>      Save current Claude auth into named profile\n\
                cauth switch <profile-name>    Switch active Claude auth to named profile\n\
                cauth refresh                  Refresh all saved Claude profiles and print usage\n\
@@ -411,6 +419,170 @@ impl CAuthApp {
         let plan = resolve_claude_plan(&parsed.root).unwrap_or_else(|| "-".to_string());
         println!("switched profile {}: {} {}", profile_name, email, plan);
         Ok(())
+    }
+
+    fn list_profiles(&self) -> CliResult<()> {
+        for line in self.profile_inventory_lines()? {
+            println!("{}", line);
+        }
+        Ok(())
+    }
+
+    fn profile_inventory_lines(&self) -> CliResult<Vec<String>> {
+        let snapshot = self.account_store.load_snapshot()?;
+        let mut profiles = snapshot.profiles.clone();
+        profiles.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let account_by_id: HashMap<String, UsageAccount> = snapshot
+            .accounts
+            .iter()
+            .cloned()
+            .map(|account| (account.id.clone(), account))
+            .collect();
+        let active_data = self.load_current_credentials();
+        let active_account_id = active_data
+            .as_ref()
+            .map(|data| self.resolve_claude_account_id(data));
+
+        let mut lines = Vec::new();
+        lines.push("Profiles:".to_string());
+        if profiles.is_empty() {
+            lines.push("  (none)".to_string());
+        }
+        for profile in &profiles {
+            let Some(account_id) = profile.claude_account_id.as_deref() else {
+                lines.push(format!("  {}: no Claude account", profile.name));
+                continue;
+            };
+
+            let Some(account) = account_by_id.get(account_id) else {
+                lines.push(format!(
+                    "  {}: missing account {}",
+                    profile.name, account_id
+                ));
+                continue;
+            };
+            let credential_path =
+                PathBuf::from(&account.root_path).join(".claude/.credentials.json");
+            let (email, plan, key_remaining) = if credential_path.exists() {
+                match fs::read(&credential_path) {
+                    Ok(data) => {
+                        let parsed = parse_claude_credentials(&data);
+                        (
+                            extract_claude_email(&parsed.root).unwrap_or_else(|| "-".to_string()),
+                            resolve_claude_plan(&parsed.root).unwrap_or_else(|| "-".to_string()),
+                            format_key_remaining(parsed.expires_at.as_ref()),
+                        )
+                    }
+                    Err(_) => ("-".to_string(), "-".to_string(), "--".to_string()),
+                }
+            } else {
+                ("-".to_string(), "-".to_string(), "--".to_string())
+            };
+
+            let current_marker = if active_account_id.as_deref() == Some(account_id) {
+                " [current]"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "  {}: {} {} (key {}) (account {}){}",
+                profile.name, email, plan, key_remaining, account_id, current_marker
+            ));
+        }
+
+        lines.push("Accounts:".to_string());
+        let mut accounts = snapshot.accounts.clone();
+        accounts.sort_by(|left, right| left.id.cmp(&right.id));
+        if accounts.is_empty() {
+            lines.push("  (none)".to_string());
+        }
+
+        for account in accounts {
+            let linked_profiles = match account.service {
+                UsageService::Claude => profiles
+                    .iter()
+                    .filter(|profile| {
+                        profile.claude_account_id.as_deref() == Some(account.id.as_str())
+                    })
+                    .map(|profile| profile.name.clone())
+                    .collect::<Vec<_>>(),
+                UsageService::Codex => profiles
+                    .iter()
+                    .filter(|profile| {
+                        profile.codex_account_id.as_deref() == Some(account.id.as_str())
+                    })
+                    .map(|profile| profile.name.clone())
+                    .collect::<Vec<_>>(),
+                UsageService::Gemini => profiles
+                    .iter()
+                    .filter(|profile| {
+                        profile.gemini_account_id.as_deref() == Some(account.id.as_str())
+                    })
+                    .map(|profile| profile.name.clone())
+                    .collect::<Vec<_>>(),
+            };
+            let linked_text = if linked_profiles.is_empty() {
+                "-".to_string()
+            } else {
+                linked_profiles.join(",")
+            };
+
+            if account.service == UsageService::Claude {
+                let credential_path =
+                    PathBuf::from(&account.root_path).join(".claude/.credentials.json");
+                let (email, plan, key_remaining, file_state) = if credential_path.exists() {
+                    match fs::read(&credential_path) {
+                        Ok(data) => {
+                            let parsed = parse_claude_credentials(&data);
+                            (
+                                extract_claude_email(&parsed.root)
+                                    .unwrap_or_else(|| "-".to_string()),
+                                resolve_claude_plan(&parsed.root)
+                                    .unwrap_or_else(|| "-".to_string()),
+                                format_key_remaining(parsed.expires_at.as_ref()),
+                                "ok".to_string(),
+                            )
+                        }
+                        Err(_) => (
+                            "-".to_string(),
+                            "-".to_string(),
+                            "--".to_string(),
+                            "read-error".to_string(),
+                        ),
+                    }
+                } else {
+                    (
+                        "-".to_string(),
+                        "-".to_string(),
+                        "--".to_string(),
+                        "missing".to_string(),
+                    )
+                };
+                let current_marker = if active_account_id.as_deref() == Some(account.id.as_str()) {
+                    " [current]"
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "  {} [claude]: linked={} file={} email={} plan={} key={}{}",
+                    account.id, linked_text, file_state, email, plan, key_remaining, current_marker
+                ));
+                continue;
+            }
+
+            let service_name = match account.service {
+                UsageService::Codex => "codex",
+                UsageService::Gemini => "gemini",
+                UsageService::Claude => "claude",
+            };
+            lines.push(format!(
+                "  {} [{}]: linked={}",
+                account.id, service_name, linked_text
+            ));
+        }
+
+        Ok(lines)
     }
 
     fn refresh_all_profiles(&self) -> CliResult<()> {
@@ -771,6 +943,7 @@ fn run() -> CliResult<()> {
             app.print_usage();
             Ok(())
         }
+        CliCommand::List => app.list_profiles(),
         CliCommand::Save(name) => app.save_current_profile(&name),
         CliCommand::Switch(name) => app.switch_profile(&name),
         CliCommand::Refresh => app.refresh_all_profiles(),
@@ -1360,6 +1533,72 @@ mod tests {
             .find(|item| item.name == "home")
             .expect("profile home");
         assert_eq!(profile.claude_account_id.as_deref(), Some(account_id));
+    }
+
+    #[test]
+    fn list_profiles_shows_saved_profiles_and_current_marker() {
+        let temp = TempDir::new().expect("temp dir");
+        let home = temp.path().to_path_buf();
+        let account_id = "acct_claude_home_example_com";
+        let account_root = home.join(format!(".agent-island/accounts/{}", account_id));
+        let stored_path = account_root.join(".claude/.credentials.json");
+        write_credentials(
+            &stored_path,
+            "at-list",
+            "rt-list",
+            1_800_000_000_000,
+            Some("home@example.com"),
+            None,
+        )
+        .expect("write stored credentials");
+        write_credentials(
+            &home.join(".claude/.credentials.json"),
+            "at-list",
+            "rt-list",
+            1_800_000_000_000,
+            Some("home@example.com"),
+            None,
+        )
+        .expect("write active credentials");
+
+        let store = AccountStore::new(home.join(".agent-island"));
+        let snapshot = AccountsSnapshot {
+            accounts: vec![UsageAccount {
+                id: account_id.to_string(),
+                service: UsageService::Claude,
+                label: "claude:test".to_string(),
+                root_path: account_root.display().to_string(),
+                updated_at: utc_now_iso(),
+            }],
+            profiles: vec![UsageProfile {
+                name: "home".to_string(),
+                claude_account_id: Some(account_id.to_string()),
+                codex_account_id: None,
+                gemini_account_id: None,
+            }],
+        };
+        store.save_snapshot(&snapshot).expect("save snapshot");
+
+        let recorder = ProcessRecorder::default();
+        let app = CAuthApp::with_clients(
+            home,
+            recorder.runner(),
+            Arc::new(|_, _| {
+                Err(CliError::new(
+                    "refresh client should not be called in list test",
+                    1,
+                ))
+            }),
+            Arc::new(|_| None),
+        );
+
+        let lines = app.profile_inventory_lines().expect("list lines");
+        let combined = lines.join("\n");
+        assert!(combined.contains("Profiles:"));
+        assert!(combined.contains("Accounts:"));
+        assert!(combined.contains("home@example.com"));
+        assert!(combined.contains("acct_claude_home_example_com"));
+        assert!(combined.contains("[current]"));
     }
 
     #[test]
