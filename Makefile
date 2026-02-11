@@ -1,4 +1,4 @@
-.PHONY: up deploy setup-tools bump-version
+.PHONY: up deploy install install-cauth setup-tools bump-version
 
 APP_NAME ?= Agent Island.app
 BUNDLE_ID ?= ai.2lab.AgentIsalnd
@@ -27,6 +27,11 @@ deploy:
 	bash scripts/bump-marketing-version.sh
 	bash scripts/build.sh
 	DEPLOY_NONINTERACTIVE=1 DEPLOY_SKIP_WEBSITE=1 bash scripts/create-release.sh
+
+install: install-cauth
+
+install-cauth:
+	bash scripts/install-cauth.sh
 
 bump-version:
 	bash scripts/bump-marketing-version.sh

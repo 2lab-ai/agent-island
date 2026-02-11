@@ -9,6 +9,14 @@ cd /Users/icedac/2lab.ai/agent-island/cauth
 cargo run -- help
 ```
 
+From repository root:
+
+```bash
+cd /Users/icedac/2lab.ai/agent-island
+make install
+cauth help
+```
+
 ## Commands
 
 - `cauth save <profile>`
