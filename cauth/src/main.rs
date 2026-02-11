@@ -214,6 +214,16 @@ struct RefreshResult {
     seven_day_reset: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone)]
+struct ClaudeInventoryStatus {
+    email: String,
+    plan: String,
+    key_remaining: String,
+    five_hour: String,
+    seven_day: String,
+    file_state: String,
+}
+
 struct CAuthApp {
     home_dir: PathBuf,
     agent_root: PathBuf,
@@ -428,6 +438,114 @@ impl CAuthApp {
         Ok(())
     }
 
+    fn collect_claude_inventory_status_from_data(
+        &self,
+        data: &[u8],
+        account_id: Option<&str>,
+    ) -> ClaudeInventoryStatus {
+        let parsed = parse_claude_credentials(data);
+        let email = extract_claude_email(&parsed.root)
+            .or_else(|| account_id.and_then(email_from_account_id))
+            .unwrap_or_else(|| "-".to_string());
+        let plan = resolve_claude_plan(&parsed.root).unwrap_or_else(|| "-".to_string());
+        let key_remaining = format_key_remaining(parsed.expires_at.as_ref());
+        let usage = self.fetch_claude_usage_summary(parsed.access_token.as_deref());
+        let five_hour = format_usage_window(
+            usage.as_ref().and_then(|item| item.five_hour_percent),
+            usage
+                .as_ref()
+                .and_then(|item| item.five_hour_reset.as_ref()),
+        );
+        let seven_day = format_usage_window(
+            usage.as_ref().and_then(|item| item.seven_day_percent),
+            usage
+                .as_ref()
+                .and_then(|item| item.seven_day_reset.as_ref()),
+        );
+
+        ClaudeInventoryStatus {
+            email,
+            plan,
+            key_remaining,
+            five_hour,
+            seven_day,
+            file_state: "ok".to_string(),
+        }
+    }
+
+    fn collect_claude_inventory_status_from_file(
+        &self,
+        credential_path: &Path,
+        account_id: Option<&str>,
+    ) -> ClaudeInventoryStatus {
+        if !credential_path.exists() {
+            return ClaudeInventoryStatus {
+                email: account_id
+                    .and_then(email_from_account_id)
+                    .unwrap_or_else(|| "-".to_string()),
+                plan: "-".to_string(),
+                key_remaining: "--".to_string(),
+                five_hour: "-- (--)".to_string(),
+                seven_day: "-- (--)".to_string(),
+                file_state: "missing".to_string(),
+            };
+        }
+
+        let data = match fs::read(credential_path) {
+            Ok(data) => data,
+            Err(_) => {
+                return ClaudeInventoryStatus {
+                    email: account_id
+                        .and_then(email_from_account_id)
+                        .unwrap_or_else(|| "-".to_string()),
+                    plan: "-".to_string(),
+                    key_remaining: "--".to_string(),
+                    five_hour: "-- (--)".to_string(),
+                    seven_day: "-- (--)".to_string(),
+                    file_state: "read-error".to_string(),
+                }
+            }
+        };
+
+        self.collect_claude_inventory_status_from_data(&data, account_id)
+    }
+
+    fn resolve_snapshot_account_id_for_credentials(
+        &self,
+        snapshot: &AccountsSnapshot,
+        data: &[u8],
+    ) -> String {
+        let direct_account_id = self.resolve_claude_account_id(data);
+        if snapshot.accounts.iter().any(|account| {
+            account.service == UsageService::Claude && account.id == direct_account_id
+        }) {
+            return direct_account_id;
+        }
+
+        let Some(active_lock_id) = refresh_lock_id_from_credentials_data(data) else {
+            return direct_account_id;
+        };
+
+        for account in snapshot
+            .accounts
+            .iter()
+            .filter(|account| account.service == UsageService::Claude)
+        {
+            let credential_path =
+                PathBuf::from(&account.root_path).join(".claude/.credentials.json");
+            let Ok(existing_data) = fs::read(&credential_path) else {
+                continue;
+            };
+            if refresh_lock_id_from_credentials_data(&existing_data).as_deref()
+                == Some(active_lock_id.as_str())
+            {
+                return account.id.clone();
+            }
+        }
+
+        direct_account_id
+    }
+
     fn profile_inventory_lines(&self) -> CliResult<Vec<String>> {
         let snapshot = self.account_store.load_snapshot()?;
         let mut profiles = snapshot.profiles.clone();
@@ -442,53 +560,123 @@ impl CAuthApp {
         let active_data = self.load_current_credentials();
         let active_account_id = active_data
             .as_ref()
-            .map(|data| self.resolve_claude_account_id(data));
+            .map(|data| self.resolve_snapshot_account_id_for_credentials(&snapshot, data));
+
+        let mut claude_status_by_account_id: HashMap<String, ClaudeInventoryStatus> =
+            HashMap::new();
+        for account in snapshot
+            .accounts
+            .iter()
+            .filter(|account| account.service == UsageService::Claude)
+        {
+            let credential_path =
+                PathBuf::from(&account.root_path).join(".claude/.credentials.json");
+            let status = self.collect_claude_inventory_status_from_file(
+                &credential_path,
+                Some(account.id.as_str()),
+            );
+            claude_status_by_account_id.insert(account.id.clone(), status);
+        }
 
         let mut lines = Vec::new();
+        lines.push("Current Claude:".to_string());
+        if let Some(data) = active_data.as_ref() {
+            let account_id_text = active_account_id.clone().unwrap_or_else(|| "-".to_string());
+            let current_status =
+                self.collect_claude_inventory_status_from_data(data, active_account_id.as_deref());
+
+            let linked_profiles = active_account_id
+                .as_ref()
+                .map(|account_id| {
+                    profiles
+                        .iter()
+                        .filter(|profile| {
+                            profile.claude_account_id.as_deref() == Some(account_id.as_str())
+                        })
+                        .map(|profile| profile.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let linked_profiles_text = if linked_profiles.is_empty() {
+                "-".to_string()
+            } else {
+                linked_profiles.join(",")
+            };
+
+            lines.push(format!("  account: {}", account_id_text));
+            lines.push(format!("  profiles: {}", linked_profiles_text));
+            lines.push(format!("  email: {}", current_status.email));
+            lines.push(format!("  plan: {}", current_status.plan));
+            lines.push(format!("  5h: {}", current_status.five_hour));
+            lines.push(format!("  7d: {}", current_status.seven_day));
+            lines.push(format!("  key: {}", current_status.key_remaining));
+        } else {
+            lines.push("  (none)".to_string());
+        }
+
         lines.push("Profiles:".to_string());
         if profiles.is_empty() {
             lines.push("  (none)".to_string());
         }
         for profile in &profiles {
-            let Some(account_id) = profile.claude_account_id.as_deref() else {
-                lines.push(format!("  {}: no Claude account", profile.name));
-                continue;
-            };
-
-            let Some(account) = account_by_id.get(account_id) else {
-                lines.push(format!(
-                    "  {}: missing account {}",
-                    profile.name, account_id
-                ));
-                continue;
-            };
-            let credential_path =
-                PathBuf::from(&account.root_path).join(".claude/.credentials.json");
-            let (email, plan, key_remaining) = if credential_path.exists() {
-                match fs::read(&credential_path) {
-                    Ok(data) => {
-                        let parsed = parse_claude_credentials(&data);
-                        (
-                            extract_claude_email(&parsed.root).unwrap_or_else(|| "-".to_string()),
-                            resolve_claude_plan(&parsed.root).unwrap_or_else(|| "-".to_string()),
-                            format_key_remaining(parsed.expires_at.as_ref()),
-                        )
-                    }
-                    Err(_) => ("-".to_string(), "-".to_string(), "--".to_string()),
-                }
-            } else {
-                ("-".to_string(), "-".to_string(), "--".to_string())
-            };
-
-            let current_marker = if active_account_id.as_deref() == Some(account_id) {
+            let current_marker = if profile.claude_account_id.as_ref() == active_account_id.as_ref()
+            {
                 " [current]"
             } else {
                 ""
             };
+            let codex_account_id = profile.codex_account_id.as_deref().unwrap_or("-");
+            let gemini_account_id = profile.gemini_account_id.as_deref().unwrap_or("-");
+
+            let Some(account_id) = profile.claude_account_id.as_deref() else {
+                lines.push(format!("  {}{}", profile.name, current_marker));
+                lines.push("    claude: -".to_string());
+                lines.push("    email: -".to_string());
+                lines.push("    plan: -".to_string());
+                lines.push("    5h: -- (--)".to_string());
+                lines.push("    7d: -- (--)".to_string());
+                lines.push("    key: --".to_string());
+                lines.push(format!("    codex: {}", codex_account_id));
+                lines.push(format!("    gemini: {}", gemini_account_id));
+                continue;
+            };
+
+            let Some(_account) = account_by_id.get(account_id) else {
+                lines.push(format!("  {}{}", profile.name, current_marker));
+                lines.push(format!("    claude: {}", account_id));
+                lines.push("    email: -".to_string());
+                lines.push("    plan: -".to_string());
+                lines.push("    5h: -- (--)".to_string());
+                lines.push("    7d: -- (--)".to_string());
+                lines.push("    key: --".to_string());
+                lines.push(format!("    codex: {}", codex_account_id));
+                lines.push(format!("    gemini: {}", gemini_account_id));
+                continue;
+            };
+            let status = claude_status_by_account_id
+                .get(account_id)
+                .cloned()
+                .unwrap_or_else(|| ClaudeInventoryStatus {
+                    email: email_from_account_id(account_id).unwrap_or_else(|| "-".to_string()),
+                    plan: "-".to_string(),
+                    key_remaining: "--".to_string(),
+                    five_hour: "-- (--)".to_string(),
+                    seven_day: "-- (--)".to_string(),
+                    file_state: "missing".to_string(),
+                });
+
+            lines.push(format!("  {}{}", profile.name, current_marker));
             lines.push(format!(
-                "  {}: {} {} (key {}) (account {}){}",
-                profile.name, email, plan, key_remaining, account_id, current_marker
+                "    claude: {} ({})",
+                account_id, status.file_state
             ));
+            lines.push(format!("    email: {}", status.email));
+            lines.push(format!("    plan: {}", status.plan));
+            lines.push(format!("    5h: {}", status.five_hour));
+            lines.push(format!("    7d: {}", status.seven_day));
+            lines.push(format!("    key: {}", status.key_remaining));
+            lines.push(format!("    codex: {}", codex_account_id));
+            lines.push(format!("    gemini: {}", gemini_account_id));
         }
 
         lines.push("Accounts:".to_string());
@@ -529,44 +717,34 @@ impl CAuthApp {
             };
 
             if account.service == UsageService::Claude {
-                let credential_path =
-                    PathBuf::from(&account.root_path).join(".claude/.credentials.json");
-                let (email, plan, key_remaining, file_state) = if credential_path.exists() {
-                    match fs::read(&credential_path) {
-                        Ok(data) => {
-                            let parsed = parse_claude_credentials(&data);
-                            (
-                                extract_claude_email(&parsed.root)
-                                    .unwrap_or_else(|| "-".to_string()),
-                                resolve_claude_plan(&parsed.root)
-                                    .unwrap_or_else(|| "-".to_string()),
-                                format_key_remaining(parsed.expires_at.as_ref()),
-                                "ok".to_string(),
-                            )
-                        }
-                        Err(_) => (
-                            "-".to_string(),
-                            "-".to_string(),
-                            "--".to_string(),
-                            "read-error".to_string(),
-                        ),
-                    }
-                } else {
-                    (
-                        "-".to_string(),
-                        "-".to_string(),
-                        "--".to_string(),
-                        "missing".to_string(),
-                    )
-                };
+                let status = claude_status_by_account_id
+                    .get(&account.id)
+                    .cloned()
+                    .unwrap_or_else(|| ClaudeInventoryStatus {
+                        email: email_from_account_id(&account.id)
+                            .unwrap_or_else(|| "-".to_string()),
+                        plan: "-".to_string(),
+                        key_remaining: "--".to_string(),
+                        five_hour: "-- (--)".to_string(),
+                        seven_day: "-- (--)".to_string(),
+                        file_state: "missing".to_string(),
+                    });
                 let current_marker = if active_account_id.as_deref() == Some(account.id.as_str()) {
                     " [current]"
                 } else {
                     ""
                 };
                 lines.push(format!(
-                    "  {} [claude]: linked={} file={} email={} plan={} key={}{}",
-                    account.id, linked_text, file_state, email, plan, key_remaining, current_marker
+                    "  {} [claude]: linked={} file={} email={} plan={} 5h={} 7d={} key={}{}",
+                    account.id,
+                    linked_text,
+                    status.file_state,
+                    status.email,
+                    status.plan,
+                    status.five_hour,
+                    status.seven_day,
+                    status.key_remaining,
+                    current_marker
                 ));
                 continue;
             }
@@ -1291,6 +1469,26 @@ fn email_slug(email: &str) -> Option<String> {
     }
 }
 
+fn email_from_account_id(account_id: &str) -> Option<String> {
+    let prefix = if let Some(rest) = account_id.strip_prefix("acct_claude_team_") {
+        Some(rest)
+    } else {
+        account_id.strip_prefix("acct_claude_")
+    }?;
+
+    let (local_part, domain_slug) = prefix.split_once('_')?;
+    if local_part.is_empty() || domain_slug.is_empty() {
+        return None;
+    }
+
+    let domain = domain_slug.replace('_', ".");
+    if domain.is_empty() {
+        return None;
+    }
+
+    Some(format!("{}@{}", local_part, domain))
+}
+
 fn short_hash_hex(data: &[u8]) -> String {
     let digest = Sha256::digest(data);
     hex::encode(digest)[..16].to_string()
@@ -1421,6 +1619,12 @@ fn format_duration(seconds: i64) -> String {
 
 fn utc_now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn refresh_lock_id_from_credentials_data(data: &[u8]) -> Option<String> {
+    let parsed = parse_claude_credentials(data);
+    let refresh_token = parsed.refresh_token?;
+    Some(short_hash_hex(refresh_token.as_bytes()))
 }
 
 fn upsert_account(snapshot: &mut AccountsSnapshot, account: UsageAccount) {
