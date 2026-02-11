@@ -56,6 +56,43 @@ final class CredentialExporter {
         )
     }
 
+    func syncActiveClaudeCredentials(
+        _ data: Data,
+        activeHomeDir: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) throws {
+        let activePath = activeHomeDir
+            .appendingPathComponent(".claude/.credentials.json")
+        let accountsRoot = activeHomeDir
+            .appendingPathComponent(".agent-island/accounts", isDirectory: true)
+        let activeFileData = try? Data(contentsOf: activePath)
+
+        let previousKeychainRaw = readKeychain(service: "Claude Code-credentials")
+        let previousKeychainData = previousKeychainRaw?.data(using: .utf8)
+        let mergedData = mergedClaudeCredentials(
+            keychainData: data,
+            fallbackFileData: activeFileData ?? previousKeychainData,
+            accountsRoot: accountsRoot
+        ) ?? data
+        guard let mergedRaw = String(data: mergedData, encoding: .utf8) else {
+            throw NSError(
+                domain: "CredentialExporter",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Claude credentials are not valid UTF-8 JSON."]
+            )
+        }
+
+        try saveClaudeCredentialsToKeychain(raw: mergedRaw)
+
+        do {
+            try writeFile(data: mergedData, to: activePath)
+        } catch {
+            if let previousKeychainRaw {
+                try? saveClaudeCredentialsToKeychain(raw: previousKeychainRaw)
+            }
+            throw error
+        }
+    }
+
     private func readClaudeCredentials() -> Data? {
         let path = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/.credentials.json")
@@ -73,6 +110,18 @@ final class CredentialExporter {
     }
 
     private func mergedClaudeCredentials(keychainData: Data, fallbackFileData: Data?) -> Data? {
+        mergedClaudeCredentials(
+            keychainData: keychainData,
+            fallbackFileData: fallbackFileData,
+            accountsRoot: nil
+        )
+    }
+
+    private func mergedClaudeCredentials(
+        keychainData: Data,
+        fallbackFileData: Data?,
+        accountsRoot: URL?
+    ) -> Data? {
         guard var keychainRoot = parseJSONObject(from: keychainData) else { return nil }
 
         let keychainRefreshToken = readClaudeRefreshToken(from: keychainRoot)
@@ -85,7 +134,10 @@ final class CredentialExporter {
             }
 
             if let keychainRefreshToken,
-               let matched = loadStoredClaudeRoot(refreshToken: keychainRefreshToken) {
+               let matched = loadStoredClaudeRoot(
+                   refreshToken: keychainRefreshToken,
+                   accountsRoot: accountsRoot
+               ) {
                 return matched
             }
 
@@ -132,8 +184,11 @@ final class CredentialExporter {
         }
     }
 
-    private func loadStoredClaudeRoot(refreshToken: String) -> [String: Any]? {
-        let accountsRoot = FileManager.default.homeDirectoryForCurrentUser
+    private func loadStoredClaudeRoot(
+        refreshToken: String,
+        accountsRoot: URL?
+    ) -> [String: Any]? {
+        let accountsRoot = accountsRoot ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".agent-island/accounts", isDirectory: true)
         guard let accountDirectories = try? FileManager.default.contentsOfDirectory(
             at: accountsRoot,
@@ -201,24 +256,88 @@ final class CredentialExporter {
             arguments.append(contentsOf: ["-a", accountValue])
         }
         arguments.append("-w")
-        return runCommand(executable: "/usr/bin/security", arguments: arguments)
+        guard let result = runCommandDetailed(executable: "/usr/bin/security", arguments: arguments) else {
+            return nil
+        }
+        guard result.status == 0 else { return nil }
+        let trimmed = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
-    private func runCommand(executable: String, arguments: [String]) -> String? {
+    private func saveClaudeCredentialsToKeychain(raw: String) throws {
+        let account = resolveClaudeKeychainAccountName()
+            ?? Foundation.ProcessInfo.processInfo.environment["USER"]
+            ?? "default"
+        let arguments = [
+            "add-generic-password",
+            "-U",
+            "-a", account,
+            "-s", "Claude Code-credentials",
+            "-w", raw,
+        ]
+        guard let result = runCommandDetailed(executable: "/usr/bin/security", arguments: arguments) else {
+            throw NSError(
+                domain: "CredentialExporter",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to execute security command for keychain write."]
+            )
+        }
+        guard result.status == 0 else {
+            throw NSError(
+                domain: "CredentialExporter",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to update Claude keychain entry: \(result.stderr.trimmingCharacters(in: .whitespacesAndNewlines))"]
+            )
+        }
+    }
+
+    private func resolveClaudeKeychainAccountName() -> String? {
+        let arguments = [
+            "find-generic-password",
+            "-s", "Claude Code-credentials",
+            "-g",
+        ]
+        guard let result = runCommandDetailed(executable: "/usr/bin/security", arguments: arguments) else {
+            return nil
+        }
+        guard result.status == 0 else { return nil }
+        let stderr = result.stderr
+        let needle = "\"acct\"<blob>=\""
+        guard let range = stderr.range(of: needle) else { return nil }
+        let tail = stderr[range.upperBound...]
+        guard let end = tail.firstIndex(of: "\"") else { return nil }
+        let account = String(tail[..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return account.isEmpty ? nil : account
+    }
+
+    private struct CommandResult {
+        let status: Int32
+        let stdout: String
+        let stderr: String
+    }
+
+    private func runCommandDetailed(executable: String, arguments: [String]) -> CommandResult? {
         let process = Process()
-        let pipe = Pipe()
+        let outPipe = Pipe()
+        let errPipe = Pipe()
 
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
-        process.standardOutput = pipe
-        process.standardError = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
 
         do {
             try process.run()
             process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return nil }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let stdoutData = outPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderrData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
+            let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+            return CommandResult(
+                status: process.terminationStatus,
+                stdout: stdout,
+                stderr: stderr
+            )
         } catch {
             return nil
         }

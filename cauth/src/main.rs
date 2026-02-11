@@ -438,9 +438,8 @@ impl CAuthApp {
                 1,
             )
         })?;
-        let active_path = self.home_dir.join(".claude/.credentials.json");
-        write_file_atomic(&active_path, &data)?;
-        self.save_claude_credentials_to_keychain(&data)?;
+        let lock_keys = self.refresh_lock_keys(&data, &account_id);
+        self.with_refresh_lock(&lock_keys, || self.sync_active_claude_credentials(&data))?;
 
         let parsed = parse_claude_credentials(&data);
         let email = extract_claude_email(&parsed.root).unwrap_or_else(|| "-".to_string());
@@ -1124,9 +1123,7 @@ impl CAuthApp {
         write_file_atomic(credential_path, refreshed_data)?;
 
         if active_account_id == Some(account_id) {
-            let active_path = self.home_dir.join(".claude/.credentials.json");
-            write_file_atomic(&active_path, refreshed_data)?;
-            self.save_claude_credentials_to_keychain(refreshed_data)?;
+            self.sync_active_claude_credentials(refreshed_data)?;
         }
 
         Ok(())
@@ -1134,12 +1131,93 @@ impl CAuthApp {
 
     fn load_current_credentials(&self) -> Option<Vec<u8>> {
         let active_path = self.home_dir.join(".claude/.credentials.json");
-        if let Ok(data) = fs::read(&active_path) {
-            return Some(data);
+        let file_data = fs::read(&active_path).ok();
+        let keychain_data = self
+            .read_keychain(&self.keychain_service_name, None)
+            .map(|raw| raw.into_bytes());
+
+        if let Some(keychain_data) = keychain_data {
+            return self.merge_current_claude_credentials(&keychain_data, file_data.as_deref());
         }
 
-        self.read_keychain(&self.keychain_service_name, None)
-            .map(|raw| raw.into_bytes())
+        file_data
+    }
+
+    fn sync_active_claude_credentials(&self, data: &[u8]) -> CliResult<()> {
+        let previous_keychain = self.read_keychain(&self.keychain_service_name, None);
+        self.save_claude_credentials_to_keychain(data)?;
+
+        let active_path = self.home_dir.join(".claude/.credentials.json");
+        if let Err(err) = write_file_atomic(&active_path, data) {
+            if let Some(previous_raw) = previous_keychain {
+                let _ = self.save_claude_credentials_to_keychain(previous_raw.as_bytes());
+            }
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn merge_current_claude_credentials(
+        &self,
+        keychain_data: &[u8],
+        fallback_file_data: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        let mut keychain_root = serde_json::from_slice::<Value>(keychain_data).ok()?;
+        if !keychain_root.is_object() {
+            return Some(keychain_data.to_vec());
+        }
+
+        let keychain_refresh = parse_claude_credentials(keychain_data).refresh_token;
+        let fallback_root = if let Some(file_data) = fallback_file_data {
+            let parsed = serde_json::from_slice::<Value>(file_data).ok();
+            if let (Some(parsed_root), Some(keychain_refresh)) =
+                (parsed.as_ref(), keychain_refresh.as_ref())
+            {
+                let parsed_refresh = parse_claude_credentials(file_data).refresh_token;
+                if parsed_refresh.as_deref() == Some(keychain_refresh.as_str()) {
+                    Some(parsed_root.clone())
+                } else {
+                    self.load_stored_claude_root_by_refresh(keychain_refresh)
+                        .or_else(|| serde_json::from_slice::<Value>(file_data).ok())
+                }
+            } else {
+                parsed
+            }
+        } else if let Some(keychain_refresh) = keychain_refresh.as_ref() {
+            self.load_stored_claude_root_by_refresh(keychain_refresh)
+        } else {
+            None
+        };
+
+        let Some(fallback_root) = fallback_root else {
+            return Some(keychain_data.to_vec());
+        };
+        if !fallback_root.is_object() {
+            return Some(keychain_data.to_vec());
+        }
+
+        merge_claude_metadata_value(&mut keychain_root, &fallback_root);
+        serde_json::to_vec_pretty(&keychain_root).ok()
+    }
+
+    fn load_stored_claude_root_by_refresh(&self, refresh_token: &str) -> Option<Value> {
+        let account_dirs = fs::read_dir(&self.accounts_dir).ok()?;
+        for entry in account_dirs.flatten() {
+            let account_path = entry.path();
+            let credential_path = account_path.join(".claude/.credentials.json");
+            let Ok(data) = fs::read(&credential_path) else {
+                continue;
+            };
+            let parsed = parse_claude_credentials(&data);
+            if parsed.refresh_token.as_deref() != Some(refresh_token) {
+                continue;
+            }
+            if let Ok(root) = serde_json::from_slice::<Value>(&data) {
+                return Some(root);
+            }
+        }
+        None
     }
 
     fn resolve_claude_account_id(&self, data: &[u8]) -> String {
@@ -1566,6 +1644,62 @@ fn ensure_oauth_object(root: &mut Value) -> CliResult<&mut Map<String, Value>> {
         .get_mut("claudeAiOauth")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| CliError::new("claudeAiOauth is not object", 1))
+}
+
+fn merge_claude_metadata_value(primary: &mut Value, fallback: &Value) {
+    let Some(primary_map) = primary.as_object_mut() else {
+        return;
+    };
+    let Some(fallback_map) = fallback.as_object() else {
+        return;
+    };
+
+    let metadata_keys = [
+        "email",
+        "account",
+        "organization",
+        "subscriptionType",
+        "rateLimitTier",
+        "isTeam",
+    ];
+    for key in metadata_keys {
+        if let Some(value) = fallback_map.get(key) {
+            let should_copy = !primary_map.contains_key(key)
+                || primary_map
+                    .get(key)
+                    .map(|item| item.is_null())
+                    .unwrap_or(true);
+            if should_copy {
+                primary_map.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    let mut primary_oauth = primary_map
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let fallback_oauth = fallback_map
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    for key in metadata_keys {
+        if let Some(value) = fallback_oauth.get(key) {
+            let should_copy = !primary_oauth.contains_key(key)
+                || primary_oauth
+                    .get(key)
+                    .map(|item| item.is_null())
+                    .unwrap_or(true);
+            if should_copy {
+                primary_oauth.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    primary_map.insert("claudeAiOauth".to_string(), Value::Object(primary_oauth));
 }
 
 fn extract_claude_email(root: &Value) -> Option<String> {
@@ -2005,6 +2139,89 @@ mod tests {
             .find(|item| item.name == "home")
             .expect("profile home");
         assert_eq!(profile.claude_account_id.as_deref(), Some(account_id));
+    }
+
+    #[test]
+    fn load_current_prefers_keychain_and_merges_metadata_from_matching_file() {
+        let temp = TempDir::new().expect("temp dir");
+        let home = temp.path().to_path_buf();
+        let active_path = home.join(".claude/.credentials.json");
+        write_credentials(
+            &active_path,
+            "at-file",
+            "rt-shared",
+            1_800_000_000_000,
+            Some("z@iq.io"),
+            Some(true),
+        )
+        .expect("write file credentials");
+
+        let keychain_raw = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "at-keychain",
+                "refreshToken": "rt-shared",
+                "expiresAt": 1_800_001_000_000i64,
+                "scopes": ["user:profile"]
+            }
+        })
+        .to_string();
+        let keychain_for_find = keychain_raw.clone();
+
+        let process_runner: ProcessRunner = Arc::new(move |executable, arguments| {
+            if !executable.ends_with("security") {
+                return ProcessExecutionResult {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "unexpected executable".to_string(),
+                };
+            }
+            let Some(command) = arguments.first() else {
+                return ProcessExecutionResult {
+                    status: 1,
+                    stdout: String::new(),
+                    stderr: "missing command".to_string(),
+                };
+            };
+            if command == "find-generic-password" && arguments.iter().any(|arg| arg == "-w") {
+                return ProcessExecutionResult {
+                    status: 0,
+                    stdout: keychain_for_find.clone(),
+                    stderr: String::new(),
+                };
+            }
+            if command == "find-generic-password" && arguments.iter().any(|arg| arg == "-g") {
+                return ProcessExecutionResult {
+                    status: 0,
+                    stdout: String::new(),
+                    stderr: "keychain: \"acct\"<blob>=\"tester\"\n".to_string(),
+                };
+            }
+            ProcessExecutionResult {
+                status: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        });
+
+        let app = CAuthApp::with_clients(
+            home,
+            process_runner,
+            Arc::new(|_, _| Err(CliError::new("refresh should not run", 1))),
+            Arc::new(|_| None),
+        );
+
+        let current = app
+            .load_current_credentials()
+            .expect("should load current credentials");
+        let parsed = parse_claude_credentials(&current);
+        assert_eq!(parsed.access_token.as_deref(), Some("at-keychain"));
+        assert_eq!(parsed.refresh_token.as_deref(), Some("rt-shared"));
+        assert_eq!(extract_claude_email(&parsed.root).as_deref(), Some("z@iq.io"));
+        assert_eq!(resolve_claude_is_team(&parsed.root), Some(true));
+        assert_eq!(
+            app.resolve_claude_account_id(&current),
+            "acct_claude_team_z_iq_io".to_string()
+        );
     }
 
     #[test]

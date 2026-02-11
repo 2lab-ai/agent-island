@@ -12,6 +12,7 @@ enum UsageFetcherTests {
         try await testDockerCredentialHelperErrorProducesActionableIssue()
         try await testClaudeSubscriptionMetadataFallbackFromCredentials()
         try await testProfileTokenRefreshReflectsCredentialUpdateAfterDockerRun()
+        try await testProfileRefreshPersistsRotatedTokenWhenExpiryEqual()
         try await testProfileRefreshSkipsOlderClaudeCredentialOnSuccessSync()
         print("OK")
     }
@@ -362,6 +363,83 @@ enum UsageFetcherTests {
             abs(expiresAt.timeIntervalSince(newExpiry)) < 1,
             "Expected snapshot to use refreshed credential expiration. snapshot=\(expiresAt.timeIntervalSince1970) disk=\(latestOnDisk.timeIntervalSince1970) expected=\(newExpiry.timeIntervalSince1970)"
         )
+    }
+
+    private static func testProfileRefreshPersistsRotatedTokenWhenExpiryEqual() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("usage-fetcher-token-rotation-\(UUID().uuidString)", isDirectory: true)
+        let accountRoot = root.appendingPathComponent("accounts/acct_claude_test", isDirectory: true)
+        let credentialsURL = accountRoot.appendingPathComponent(".claude/.credentials.json")
+        try fm.createDirectory(at: credentialsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let issuedAt = Date(timeIntervalSince1970: 1_910_000_000)
+        let sharedExpiry = Date(timeIntervalSince1970: 1_910_010_800)
+        let initialClaude = try makeClaudeCredential(
+            accessToken: "at-before",
+            refreshToken: "rt-before",
+            expiresAt: sharedExpiry,
+            issuedAt: issuedAt
+        )
+        let rotatedClaude = try makeClaudeCredential(
+            accessToken: "at-after",
+            refreshToken: "rt-after",
+            expiresAt: sharedExpiry,
+            issuedAt: issuedAt
+        )
+        try initialClaude.write(to: credentialsURL, options: [.atomic])
+
+        let accountStore = AccountStore(rootDir: root)
+        try accountStore.saveSnapshot(
+            AccountsSnapshot(
+                accounts: [
+                    UsageAccount(
+                        id: "acct_claude_test",
+                        service: .claude,
+                        label: "claude:test",
+                        rootPath: accountRoot.path,
+                        updatedAt: Date()
+                    ),
+                ],
+                profiles: []
+            )
+        )
+
+        let fetcher = UsageFetcher(
+            accountStore: accountStore,
+            cache: UsageCache(ttl: 0),
+            dockerRunner: { homeURL, _, _ in
+                let updatedURL = homeURL.appendingPathComponent(".claude/.credentials.json")
+                try rotatedClaude.write(to: updatedURL, options: [.atomic])
+
+                let json = """
+                {
+                  "claude": { "name": "Claude", "available": true, "error": false },
+                  "codex": null,
+                  "gemini": null,
+                  "zai": null,
+                  "recommendation": null,
+                  "recommendationReason": "n/a"
+                }
+                """
+                return Data(json.utf8)
+            },
+            homeDirectory: root
+        )
+
+        let profile = UsageProfile(
+            name: "rotation-test",
+            claudeAccountId: "acct_claude_test",
+            codexAccountId: nil,
+            geminiAccountId: nil
+        )
+        _ = await fetcher.fetchSnapshot(for: profile, forceRefresh: true)
+
+        let latestOnDiskData = try Data(contentsOf: credentialsURL)
+        let latestOnDiskTokens = try readClaudeTokens(from: latestOnDiskData)
+        assert(latestOnDiskTokens.accessToken == "at-after")
+        assert(latestOnDiskTokens.refreshToken == "rt-after")
     }
 
     private static func testProfileRefreshSkipsOlderClaudeCredentialOnSuccessSync() async throws {

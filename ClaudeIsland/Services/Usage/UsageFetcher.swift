@@ -847,6 +847,7 @@ final class UsageFetcher {
         sourceData: Data,
         destinationData: Data?
     ) -> CredentialSyncDecision {
+        let staleGuardSeconds: TimeInterval = 300
         if reason == "success" {
             guard let destinationData else {
                 return .write("destination_missing_on_success")
@@ -866,19 +867,13 @@ final class UsageFetcher {
                 return .skip("same_token_material_on_success")
             }
 
-            guard let sourceExpiry = source.expiresAt else {
-                return .skip("missing_source_expiry_on_success")
+            if let sourceExpiry = source.expiresAt,
+               let destinationExpiry = destination.expiresAt,
+               sourceExpiry.timeIntervalSince(destinationExpiry) < -staleGuardSeconds {
+                return .skip("token_changed_but_source_much_older_on_success")
             }
 
-            guard let destinationExpiry = destination.expiresAt else {
-                return .write("token_changed_and_destination_missing_expiry_on_success")
-            }
-
-            if sourceExpiry.timeIntervalSince(destinationExpiry) > 5 {
-                return .write("token_changed_and_newer_expiry_on_success")
-            }
-
-            return .skip("token_changed_but_not_newer_on_success")
+            return .write("token_changed_and_within_staleness_guard_on_success")
         }
 
         guard let destinationData else {
@@ -899,19 +894,13 @@ final class UsageFetcher {
             return .skip("same_token_material_on_error")
         }
 
-        guard let sourceExpiry = source.expiresAt else {
-            return .skip("missing_source_expiry_on_error")
+        if let sourceExpiry = source.expiresAt,
+           let destinationExpiry = destination.expiresAt,
+           sourceExpiry.timeIntervalSince(destinationExpiry) < -staleGuardSeconds {
+            return .skip("token_changed_but_source_much_older_on_error")
         }
 
-        guard let destinationExpiry = destination.expiresAt else {
-            return .write("token_changed_and_destination_missing_expiry_on_error")
-        }
-
-        if sourceExpiry.timeIntervalSince(destinationExpiry) > 300 {
-            return .write("token_changed_and_newer_expiry_on_error")
-        }
-
-        return .skip("token_changed_but_not_newer_on_error")
+        return .write("token_changed_and_within_staleness_guard_on_error")
     }
 
     private func appendClaudeSyncFingerprints(

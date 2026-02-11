@@ -365,11 +365,10 @@ final class ProfileSwitcher {
             if let account = accounts.first(where: { $0.id == id }) {
                 let src = URL(fileURLWithPath: account.rootPath, isDirectory: true)
                     .appendingPathComponent(".claude/.credentials.json")
-                let dst = activeHomeDir.appendingPathComponent(".claude/.credentials.json")
-                if copyCredentialFileIfPresent(from: src, to: dst) {
+                if applyActiveClaudeCredentialsIfPresent(from: src) {
                     claudeSwitched = true
                 } else {
-                    warnings.append("Claude credentials missing for account \(id)")
+                    warnings.append("Claude credentials missing or failed to apply for account \(id)")
                 }
             } else {
                 warnings.append("Claude account not found: \(id)")
@@ -788,6 +787,17 @@ final class ProfileSwitcher {
         do {
             let data = try Data(contentsOf: sourceURL)
             try writeCredentialData(data, to: destinationURL)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func applyActiveClaudeCredentialsIfPresent(from sourceURL: URL) -> Bool {
+        guard fileManager.fileExists(atPath: sourceURL.path) else { return false }
+        do {
+            let data = try Data(contentsOf: sourceURL)
+            try exporter.syncActiveClaudeCredentials(data, activeHomeDir: activeHomeDir)
             return true
         } catch {
             return false
