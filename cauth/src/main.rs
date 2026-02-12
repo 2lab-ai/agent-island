@@ -56,6 +56,10 @@ enum CliCommand {
     Save(String),
     Switch(String),
     Refresh,
+    CheckUsage {
+        account_id: Option<String>,
+        json: bool,
+    },
 }
 
 impl CliCommand {
@@ -95,6 +99,34 @@ impl CliCommand {
                     return Err(CliError::new("usage: cauth refresh", 2));
                 }
                 Ok(Self::Refresh)
+            }
+            "check-usage" => {
+                let mut account_id = None;
+                let mut json = false;
+                let mut i = 1;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--json" => json = true,
+                        "--account" => {
+                            i += 1;
+                            if i >= args.len() {
+                                return Err(CliError::new(
+                                    "usage: cauth check-usage [--account <id>] [--json]",
+                                    2,
+                                ));
+                            }
+                            account_id = Some(args[i].clone());
+                        }
+                        _ => {
+                            return Err(CliError::new(
+                                "usage: cauth check-usage [--account <id>] [--json]",
+                                2,
+                            ));
+                        }
+                    }
+                    i += 1;
+                }
+                Ok(Self::CheckUsage { account_id, json })
             }
             _ => Err(CliError::new(format!("unknown command: {}", first), 2)),
         }
@@ -216,6 +248,64 @@ struct UsageSummary {
 struct UsageRawResult {
     request_raw: String,
     response_raw: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckUsageInfo {
+    name: String,
+    available: bool,
+    error: bool,
+    five_hour_percent: Option<f64>,
+    seven_day_percent: Option<f64>,
+    five_hour_reset: Option<String>,
+    seven_day_reset: Option<String>,
+    model: Option<String>,
+    plan: Option<String>,
+    buckets: Option<Vec<CheckUsageBucket>>,
+}
+
+impl CheckUsageInfo {
+    fn error_result(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            available: true,
+            error: true,
+            five_hour_percent: None,
+            seven_day_percent: None,
+            five_hour_reset: None,
+            seven_day_reset: None,
+            model: None,
+            plan: None,
+            buckets: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckUsageBucket {
+    model_id: String,
+    used_percent: Option<f64>,
+    reset_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckUsageOutput {
+    claude: CheckUsageInfo,
+    codex: Option<CheckUsageInfo>,
+    gemini: Option<CheckUsageInfo>,
+    zai: Option<CheckUsageInfo>,
+    recommendation: Option<String>,
+    recommendation_reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct GeminiCredentials {
+    access_token: String,
+    refresh_token: Option<String>,
+    expiry_date: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -456,6 +546,7 @@ impl CAuthApp {
                cauth save <profile-name>      Save current Claude auth into named profile\n\
                cauth switch <profile-name>    Switch active Claude auth to named profile\n\
                cauth refresh                  Refresh all saved Claude profiles and print usage\n\
+               cauth check-usage [--json]     Check usage for all providers (Claude/Codex/Gemini/z.ai)\n\
                cauth help                     Show this help"
         );
     }
@@ -1794,6 +1885,621 @@ impl CAuthApp {
             Some(account)
         }
     }
+
+    fn check_usage(&self, account_id: Option<&str>, json: bool) -> CliResult<()> {
+        let claude = self.fetch_claude_check_usage(account_id);
+        let codex = self.fetch_codex_check_usage();
+        let gemini = self.fetch_gemini_check_usage();
+        let zai = self.fetch_zai_check_usage();
+
+        let recommendation =
+            compute_check_usage_recommendation(&claude, codex.as_ref(), gemini.as_ref(), zai.as_ref());
+
+        let output = CheckUsageOutput {
+            claude,
+            codex,
+            gemini,
+            zai,
+            recommendation: recommendation.0,
+            recommendation_reason: recommendation.1,
+        };
+
+        if json {
+            let json_string = serde_json::to_string_pretty(&output).map_err(|err| {
+                CliError::new(format!("failed to serialize check-usage output: {}", err), 1)
+            })?;
+            println!("{}", json_string);
+        } else {
+            self.print_check_usage_text(&output);
+        }
+        Ok(())
+    }
+
+    fn print_check_usage_text(&self, output: &CheckUsageOutput) {
+        self.print_check_usage_provider_text(&output.claude);
+        if let Some(ref codex) = output.codex {
+            self.print_check_usage_provider_text(codex);
+        }
+        if let Some(ref gemini) = output.gemini {
+            self.print_check_usage_provider_text(gemini);
+        }
+        if let Some(ref zai) = output.zai {
+            self.print_check_usage_provider_text(zai);
+        }
+        if let Some(ref name) = output.recommendation {
+            println!("recommendation: {} ({})", name, output.recommendation_reason);
+        } else {
+            println!("recommendation: {}", output.recommendation_reason);
+        }
+    }
+
+    fn print_check_usage_provider_text(&self, info: &CheckUsageInfo) {
+        if !info.available {
+            println!("{}: not installed", info.name);
+            return;
+        }
+        if info.error {
+            println!("{}: error", info.name);
+            return;
+        }
+        let five = info
+            .five_hour_percent
+            .map(|v| format!("{}%", v as i32))
+            .unwrap_or_else(|| "--".to_string());
+        let seven = info
+            .seven_day_percent
+            .map(|v| format!("{}%", v as i32))
+            .unwrap_or_else(|| "--".to_string());
+        let plan = info.plan.as_deref().unwrap_or("-");
+        let model = info.model.as_deref().unwrap_or("-");
+        println!(
+            "{}: 5h {} 7d {} plan={} model={}",
+            info.name, five, seven, plan, model
+        );
+    }
+
+    fn fetch_claude_check_usage(&self, account_id: Option<&str>) -> CheckUsageInfo {
+        let data = if let Some(account_id) = account_id {
+            let snapshot = match self.account_store.load_snapshot() {
+                Ok(s) => s,
+                Err(_) => return CheckUsageInfo::error_result("Claude"),
+            };
+            let account = match snapshot.accounts.iter().find(|a| {
+                a.id == account_id && a.service == UsageService::Claude
+            }) {
+                Some(a) => a,
+                None => return CheckUsageInfo::error_result("Claude"),
+            };
+            let path = PathBuf::from(&account.root_path).join(".claude/.credentials.json");
+            match fs::read(&path) {
+                Ok(d) => d,
+                Err(_) => return CheckUsageInfo::error_result("Claude"),
+            }
+        } else {
+            match self.load_current_credentials() {
+                Some(d) => d,
+                None => return CheckUsageInfo::error_result("Claude"),
+            }
+        };
+
+        let working_data = match self.refresh_claude_credentials_always(&data) {
+            Ok(refreshed) => {
+                let _ = self.sync_active_claude_credentials(&refreshed);
+                refreshed
+            }
+            Err(_) => data,
+        };
+
+        let parsed = parse_claude_credentials(&working_data);
+        let plan = resolve_claude_plan(&parsed.root);
+        let usage = self.fetch_claude_usage_summary(parsed.access_token.as_deref());
+
+        CheckUsageInfo {
+            name: "Claude".to_string(),
+            available: true,
+            error: usage.is_none(),
+            five_hour_percent: usage
+                .as_ref()
+                .and_then(|u| u.five_hour_percent)
+                .map(|v| v as f64),
+            seven_day_percent: usage
+                .as_ref()
+                .and_then(|u| u.seven_day_percent)
+                .map(|v| v as f64),
+            five_hour_reset: usage
+                .as_ref()
+                .and_then(|u| u.five_hour_reset.as_ref())
+                .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true)),
+            seven_day_reset: usage
+                .as_ref()
+                .and_then(|u| u.seven_day_reset.as_ref())
+                .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true)),
+            model: None,
+            plan,
+            buckets: None,
+        }
+    }
+
+    fn fetch_codex_check_usage(&self) -> Option<CheckUsageInfo> {
+        let auth_path = self.home_dir.join(".codex/auth.json");
+        if !auth_path.exists() {
+            return None;
+        }
+
+        let auth_data = match fs::read(&auth_path) {
+            Ok(d) => d,
+            Err(_) => return Some(CheckUsageInfo::error_result("Codex")),
+        };
+        let auth_root: Value = match serde_json::from_slice(&auth_data) {
+            Ok(v) => v,
+            Err(_) => return Some(CheckUsageInfo::error_result("Codex")),
+        };
+
+        let access_token = get_path_string(&auth_root, &["tokens", "access_token"]);
+        let account_id = get_path_string(&auth_root, &["tokens", "account_id"]);
+        let (access_token, account_id) = match (access_token, account_id) {
+            (Some(at), Some(ai)) => (at, ai),
+            _ => return Some(CheckUsageInfo::error_result("Codex")),
+        };
+
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return Some(CheckUsageInfo::error_result("Codex")),
+        };
+
+        let response = match client
+            .get("https://chatgpt.com/backend-api/wham/usage")
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "cauth/0.1")
+            .bearer_auth(&access_token)
+            .header("ChatGPT-Account-Id", &account_id)
+            .send()
+        {
+            Ok(r) => r,
+            Err(_) => return Some(CheckUsageInfo::error_result("Codex")),
+        };
+
+        if !response.status().is_success() {
+            return Some(CheckUsageInfo::error_result("Codex"));
+        }
+
+        let root: Value = match response.json() {
+            Ok(v) => v,
+            Err(_) => return Some(CheckUsageInfo::error_result("Codex")),
+        };
+
+        if root.get("rate_limit").is_none() || root.get("plan_type").is_none() {
+            return Some(CheckUsageInfo::error_result("Codex"));
+        }
+
+        let plan_type = value_as_string(root.get("plan_type"));
+        let rate_limit = root.get("rate_limit");
+        let primary = rate_limit.and_then(|rl| rl.get("primary_window"));
+        let secondary = rate_limit.and_then(|rl| rl.get("secondary_window"));
+
+        let five_hour_percent = primary
+            .and_then(|w| w.get("used_percent"))
+            .and_then(value_as_f64)
+            .map(|v| v.round());
+        let five_hour_reset = primary
+            .and_then(|w| w.get("reset_at"))
+            .and_then(value_as_f64)
+            .and_then(|ts| DateTime::<Utc>::from_timestamp(ts as i64, 0))
+            .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true));
+        let seven_day_percent = secondary
+            .and_then(|w| w.get("used_percent"))
+            .and_then(value_as_f64)
+            .map(|v| v.round());
+        let seven_day_reset = secondary
+            .and_then(|w| w.get("reset_at"))
+            .and_then(value_as_f64)
+            .and_then(|ts| DateTime::<Utc>::from_timestamp(ts as i64, 0))
+            .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true));
+
+        let model = self.read_codex_model();
+
+        Some(CheckUsageInfo {
+            name: "Codex".to_string(),
+            available: true,
+            error: false,
+            five_hour_percent,
+            seven_day_percent,
+            five_hour_reset,
+            seven_day_reset,
+            model,
+            plan: plan_type,
+            buckets: None,
+        })
+    }
+
+    fn read_codex_model(&self) -> Option<String> {
+        let config_path = self.home_dir.join(".codex/config.toml");
+        let raw = fs::read_to_string(&config_path).ok()?;
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            let after_model = trimmed.strip_prefix("model")?;
+            let after_eq = after_model.trim().strip_prefix('=')?;
+            let value = after_eq.trim();
+            if let Some(quoted) = value.strip_prefix('"') {
+                return quoted.split('"').next().map(|s| s.to_string());
+            }
+            if let Some(quoted) = value.strip_prefix('\'') {
+                return quoted.split('\'').next().map(|s| s.to_string());
+            }
+        }
+        None
+    }
+
+    fn fetch_gemini_check_usage(&self) -> Option<CheckUsageInfo> {
+        if !self.is_gemini_installed() {
+            return None;
+        }
+
+        let credentials = match self.get_gemini_credentials() {
+            Some(c) => c,
+            None => return Some(CheckUsageInfo::error_result("Gemini")),
+        };
+
+        let valid_credentials = if self.gemini_token_needs_refresh(&credentials) {
+            match self.refresh_gemini_token(&credentials) {
+                Some(c) => c,
+                None => return Some(CheckUsageInfo::error_result("Gemini")),
+            }
+        } else {
+            credentials
+        };
+
+        let project_id = match self.get_gemini_project_id(&valid_credentials) {
+            Some(id) => id,
+            None => return Some(CheckUsageInfo::error_result("Gemini")),
+        };
+
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return Some(CheckUsageInfo::error_result("Gemini")),
+        };
+
+        let response = match client
+            .post("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota")
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "cauth/0.1")
+            .bearer_auth(&valid_credentials.access_token)
+            .json(&serde_json::json!({ "project": project_id }))
+            .send()
+        {
+            Ok(r) => r,
+            Err(_) => return Some(CheckUsageInfo::error_result("Gemini")),
+        };
+
+        if !response.status().is_success() {
+            return Some(CheckUsageInfo::error_result("Gemini"));
+        }
+
+        let root: Value = match response.json() {
+            Ok(v) => v,
+            Err(_) => return Some(CheckUsageInfo::error_result("Gemini")),
+        };
+
+        let model = self.read_gemini_model();
+        let raw_buckets = root.get("buckets").and_then(Value::as_array);
+
+        let mut buckets = Vec::new();
+        let mut primary_used_percent: Option<f64> = None;
+        let mut primary_reset_at: Option<String> = None;
+        let mut model_used_percent: Option<f64> = None;
+        let mut model_reset_at: Option<String> = None;
+
+        if let Some(raw_buckets) = raw_buckets {
+            for bucket in raw_buckets {
+                let model_id = value_as_string(bucket.get("modelId"))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let remaining_fraction = bucket.get("remainingFraction").and_then(value_as_f64);
+                let used_percent = remaining_fraction.map(|r| ((1.0 - r) * 100.0).round());
+                let reset_time = value_as_string(bucket.get("resetTime"))
+                    .and_then(|s| normalize_to_iso(&s));
+
+                if model
+                    .as_deref()
+                    .map(|m| model_id.contains(m))
+                    .unwrap_or(false)
+                {
+                    model_used_percent = used_percent;
+                    model_reset_at = reset_time.clone();
+                }
+
+                if primary_used_percent.is_none() {
+                    primary_used_percent = used_percent;
+                    primary_reset_at = reset_time.clone();
+                }
+
+                buckets.push(CheckUsageBucket {
+                    model_id,
+                    used_percent,
+                    reset_at: reset_time,
+                });
+            }
+        }
+
+        let active_used_percent = model_used_percent.or(primary_used_percent);
+        let active_reset_at = if model_used_percent.is_some() {
+            model_reset_at
+        } else {
+            primary_reset_at
+        };
+
+        Some(CheckUsageInfo {
+            name: "Gemini".to_string(),
+            available: true,
+            error: false,
+            five_hour_percent: active_used_percent,
+            seven_day_percent: None,
+            five_hour_reset: active_reset_at,
+            seven_day_reset: None,
+            model,
+            plan: None,
+            buckets: if buckets.is_empty() {
+                None
+            } else {
+                Some(buckets)
+            },
+        })
+    }
+
+    fn is_gemini_installed(&self) -> bool {
+        if self.get_gemini_token_from_keychain().is_some() {
+            return true;
+        }
+        self.home_dir.join(".gemini/oauth_creds.json").exists()
+    }
+
+    fn get_gemini_token_from_keychain(&self) -> Option<GeminiCredentials> {
+        let raw = self.read_keychain("gemini-cli-oauth", Some("main-account"))?;
+        let root: Value = serde_json::from_str(&raw).ok()?;
+        let access_token = get_path_string(&root, &["token", "accessToken"])?;
+        let refresh_token = get_path_string(&root, &["token", "refreshToken"]);
+        let expiry_date = get_path_value(&root, &["token", "expiresAt"]).and_then(value_as_f64);
+        Some(GeminiCredentials {
+            access_token,
+            refresh_token,
+            expiry_date,
+        })
+    }
+
+    fn get_gemini_credentials(&self) -> Option<GeminiCredentials> {
+        if let Some(creds) = self.get_gemini_token_from_keychain() {
+            return Some(creds);
+        }
+        let oauth_path = self.home_dir.join(".gemini/oauth_creds.json");
+        let raw = fs::read_to_string(&oauth_path).ok()?;
+        let root: Value = serde_json::from_str(&raw).ok()?;
+        let access_token = value_as_string(root.get("access_token"))?;
+        let refresh_token = value_as_string(root.get("refresh_token"));
+        let expiry_date = root.get("expiry_date").and_then(value_as_f64);
+        Some(GeminiCredentials {
+            access_token,
+            refresh_token,
+            expiry_date,
+        })
+    }
+
+    fn gemini_token_needs_refresh(&self, credentials: &GeminiCredentials) -> bool {
+        let Some(expiry) = credentials.expiry_date else {
+            return false;
+        };
+        let buffer_ms = 5.0 * 60.0 * 1000.0;
+        expiry < (Utc::now().timestamp_millis() as f64) + buffer_ms
+    }
+
+    fn refresh_gemini_token(&self, credentials: &GeminiCredentials) -> Option<GeminiCredentials> {
+        let refresh_token = credentials.refresh_token.as_deref()?;
+        let client_id = std::env::var("GEMINI_OAUTH_CLIENT_ID").ok()?;
+        let client_secret = std::env::var("GEMINI_OAUTH_CLIENT_SECRET").ok()?;
+        if client_id.is_empty() || client_secret.is_empty() {
+            return None;
+        }
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .ok()?;
+
+        let response = client
+            .post("https://oauth2.googleapis.com/token")
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+                ("client_id", client_id.as_str()),
+                ("client_secret", client_secret.as_str()),
+            ])
+            .send()
+            .ok()?;
+
+        if !response.status().is_success() {
+            return None;
+        }
+
+        let root: Value = response.json().ok()?;
+        let access_token = value_as_string(root.get("access_token"))?;
+        let new_refresh = value_as_string(root.get("refresh_token"))
+            .unwrap_or_else(|| refresh_token.to_string());
+        let expires_in = root.get("expires_in").and_then(value_as_f64);
+        let expiry_date =
+            expires_in.map(|e| Utc::now().timestamp_millis() as f64 + e * 1000.0);
+
+        Some(GeminiCredentials {
+            access_token,
+            refresh_token: Some(new_refresh),
+            expiry_date,
+        })
+    }
+
+    fn get_gemini_project_id(&self, credentials: &GeminiCredentials) -> Option<String> {
+        if let Ok(project_id) = std::env::var("GOOGLE_CLOUD_PROJECT") {
+            if !project_id.is_empty() {
+                return Some(project_id);
+            }
+        }
+        if let Ok(project_id) = std::env::var("GOOGLE_CLOUD_PROJECT_ID") {
+            if !project_id.is_empty() {
+                return Some(project_id);
+            }
+        }
+
+        let settings = self.read_gemini_settings();
+        if let Some(project) = settings
+            .as_ref()
+            .and_then(|s| s.get("cloudaicompanionProject"))
+            .and_then(|v| value_as_string(Some(v)))
+        {
+            return Some(project);
+        }
+        if let Some(project) = settings
+            .as_ref()
+            .and_then(|s| s.get("project"))
+            .and_then(|v| value_as_string(Some(v)))
+        {
+            return Some(project);
+        }
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .ok()?;
+
+        let response = client
+            .post("https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist")
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .bearer_auth(&credentials.access_token)
+            .json(&serde_json::json!({
+                "metadata": {
+                    "ideType": "GEMINI_CLI",
+                    "platform": "PLATFORM_UNSPECIFIED",
+                    "pluginType": "GEMINI"
+                }
+            }))
+            .send()
+            .ok()?;
+
+        if !response.status().is_success() {
+            return None;
+        }
+
+        let root: Value = response.json().ok()?;
+        value_as_string(root.get("cloudaicompanionProject"))
+    }
+
+    fn read_gemini_settings(&self) -> Option<Value> {
+        let settings_path = self.home_dir.join(".gemini/settings.json");
+        let raw = fs::read_to_string(&settings_path).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    fn read_gemini_model(&self) -> Option<String> {
+        let settings = self.read_gemini_settings()?;
+        value_as_string(settings.get("selectedModel"))
+            .or_else(|| value_as_string(settings.get("model")))
+    }
+
+    fn fetch_zai_check_usage(&self) -> Option<CheckUsageInfo> {
+        let base_url = std::env::var("ANTHROPIC_BASE_URL").ok()?;
+        if !base_url.contains("api.z.ai") && !base_url.contains("bigmodel.cn") {
+            return None;
+        }
+
+        let auth_token = match std::env::var("ANTHROPIC_AUTH_TOKEN").ok() {
+            Some(t) if !t.trim().is_empty() => t,
+            _ => return None,
+        };
+
+        let origin = extract_url_origin(&base_url)?;
+
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return Some(CheckUsageInfo::error_result("z.ai")),
+        };
+
+        let url = format!("{}/api/monitor/usage/quota/limit", origin);
+        let response = match client
+            .get(&url)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .bearer_auth(&auth_token)
+            .send()
+        {
+            Ok(r) => r,
+            Err(_) => return Some(CheckUsageInfo::error_result("z.ai")),
+        };
+
+        if !response.status().is_success() {
+            return Some(CheckUsageInfo::error_result("z.ai"));
+        }
+
+        let root: Value = match response.json() {
+            Ok(v) => v,
+            Err(_) => return Some(CheckUsageInfo::error_result("z.ai")),
+        };
+
+        let limits = root
+            .get("data")
+            .and_then(|d| d.get("limits"))
+            .and_then(Value::as_array);
+        let Some(limits) = limits else {
+            return Some(CheckUsageInfo::error_result("z.ai"));
+        };
+
+        let mut tokens_percent: Option<f64> = None;
+        let mut tokens_reset_at: Option<String> = None;
+        let mut mcp_percent: Option<f64> = None;
+        let mut mcp_reset_at: Option<String> = None;
+
+        for limit in limits {
+            match value_as_string(limit.get("type")).as_deref() {
+                Some("TOKENS_LIMIT") => {
+                    tokens_percent = limit
+                        .get("currentValue")
+                        .and_then(value_as_f64)
+                        .map(|v| (v * 100.0).round().min(100.0).max(0.0));
+                    tokens_reset_at = value_as_string(limit.get("nextResetTime"))
+                        .and_then(|s| normalize_to_iso(&s));
+                }
+                Some("TIME_LIMIT") => {
+                    mcp_percent = limit
+                        .get("usage")
+                        .and_then(value_as_f64)
+                        .or_else(|| limit.get("currentValue").and_then(value_as_f64))
+                        .map(|v| (v * 100.0).round().min(100.0).max(0.0));
+                    mcp_reset_at = value_as_string(limit.get("nextResetTime"))
+                        .and_then(|s| normalize_to_iso(&s));
+                }
+                _ => {}
+            }
+        }
+
+        Some(CheckUsageInfo {
+            name: "z.ai".to_string(),
+            available: true,
+            error: false,
+            five_hour_percent: tokens_percent,
+            seven_day_percent: mcp_percent,
+            five_hour_reset: tokens_reset_at,
+            seven_day_reset: mcp_reset_at,
+            model: Some("GLM".to_string()),
+            plan: None,
+            buckets: None,
+        })
+    }
 }
 
 fn main() {
@@ -1818,6 +2524,9 @@ fn run() -> CliResult<()> {
         CliCommand::Save(name) => app.save_current_profile(&name),
         CliCommand::Switch(name) => app.switch_profile(&name),
         CliCommand::Refresh => app.refresh_all_profiles(),
+        CliCommand::CheckUsage { account_id, json } => {
+            app.check_usage(account_id.as_deref(), json)
+        }
     }
 }
 
@@ -2531,6 +3240,74 @@ fn write_file_atomic(path: &Path, data: &[u8]) -> CliResult<()> {
 
 fn truncate_chars(raw: &str, max_chars: usize) -> String {
     raw.chars().take(max_chars).collect::<String>()
+}
+
+fn normalize_to_iso(date_str: &str) -> Option<String> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(date_str) {
+        return Some(
+            dt.with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Millis, true),
+        );
+    }
+    if let Ok(ts) = date_str.parse::<f64>() {
+        return date_from_timestamp(ts)
+            .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true));
+    }
+    None
+}
+
+fn extract_url_origin(url: &str) -> Option<String> {
+    let scheme_end = url.find("://")?;
+    let after_scheme = &url[scheme_end + 3..];
+    let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    Some(format!("{}{}", &url[..scheme_end + 3], &after_scheme[..host_end]))
+}
+
+fn compute_check_usage_recommendation(
+    claude: &CheckUsageInfo,
+    codex: Option<&CheckUsageInfo>,
+    gemini: Option<&CheckUsageInfo>,
+    zai: Option<&CheckUsageInfo>,
+) -> (Option<String>, String) {
+    let mut candidates: Vec<(&str, f64)> = Vec::new();
+
+    if !claude.error {
+        if let Some(percent) = claude.five_hour_percent {
+            candidates.push(("claude", percent));
+        }
+    }
+    if let Some(info) = codex {
+        if info.available && !info.error {
+            if let Some(percent) = info.five_hour_percent {
+                candidates.push(("codex", percent));
+            }
+        }
+    }
+    if let Some(info) = gemini {
+        if info.available && !info.error {
+            if let Some(percent) = info.five_hour_percent {
+                candidates.push(("gemini", percent));
+            }
+        }
+    }
+    if let Some(info) = zai {
+        if info.available && !info.error {
+            if let Some(percent) = info.five_hour_percent {
+                candidates.push(("z.ai", percent));
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return (None, "No usage data available".to_string());
+    }
+
+    candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let best = candidates[0];
+    (
+        Some(best.0.to_string()),
+        format!("Lowest usage ({}% used)", best.1 as i32),
+    )
 }
 
 fn render_raw_credential(data: &[u8]) -> String {
@@ -3451,5 +4228,155 @@ mod tests {
         fn last_added_secret(&self) -> Option<String> {
             self.last_added_secret.lock().expect("secret").clone()
         }
+    }
+
+    #[test]
+    fn parse_supports_check_usage_command() {
+        let command = CliCommand::parse(&["check-usage".to_string()])
+            .expect("check-usage command should parse");
+        assert!(matches!(
+            command,
+            CliCommand::CheckUsage {
+                account_id: None,
+                json: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_supports_check_usage_json_flag() {
+        let command = CliCommand::parse(&["check-usage".to_string(), "--json".to_string()])
+            .expect("check-usage --json should parse");
+        assert!(matches!(
+            command,
+            CliCommand::CheckUsage {
+                account_id: None,
+                json: true
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_supports_check_usage_account_and_json() {
+        let command = CliCommand::parse(&[
+            "check-usage".to_string(),
+            "--account".to_string(),
+            "acct_test".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("check-usage --account --json should parse");
+        match command {
+            CliCommand::CheckUsage { account_id, json } => {
+                assert_eq!(account_id.as_deref(), Some("acct_test"));
+                assert!(json);
+            }
+            _ => panic!("expected CheckUsage"),
+        }
+    }
+
+    #[test]
+    fn recommendation_picks_lowest_usage() {
+        let claude = CheckUsageInfo {
+            name: "Claude".to_string(),
+            available: true,
+            error: false,
+            five_hour_percent: Some(60.0),
+            seven_day_percent: Some(20.0),
+            five_hour_reset: None,
+            seven_day_reset: None,
+            model: None,
+            plan: None,
+            buckets: None,
+        };
+        let codex = CheckUsageInfo {
+            name: "Codex".to_string(),
+            available: true,
+            error: false,
+            five_hour_percent: Some(30.0),
+            seven_day_percent: None,
+            five_hour_reset: None,
+            seven_day_reset: None,
+            model: None,
+            plan: None,
+            buckets: None,
+        };
+        let (name, reason) =
+            compute_check_usage_recommendation(&claude, Some(&codex), None, None);
+        assert_eq!(name.as_deref(), Some("codex"));
+        assert!(reason.contains("30%"));
+    }
+
+    #[test]
+    fn recommendation_returns_none_when_no_data() {
+        let claude = CheckUsageInfo::error_result("Claude");
+        let (name, reason) = compute_check_usage_recommendation(&claude, None, None, None);
+        assert!(name.is_none());
+        assert_eq!(reason, "No usage data available");
+    }
+
+    #[test]
+    fn normalize_to_iso_parses_rfc3339() {
+        let result = normalize_to_iso("2026-02-12T10:00:00Z");
+        assert!(result.is_some());
+        assert!(result.unwrap().starts_with("2026-02-12T10:00:00"));
+    }
+
+    #[test]
+    fn extract_url_origin_works() {
+        assert_eq!(
+            extract_url_origin("https://api.z.ai/v1/messages"),
+            Some("https://api.z.ai".to_string())
+        );
+        assert_eq!(
+            extract_url_origin("https://bigmodel.cn"),
+            Some("https://bigmodel.cn".to_string())
+        );
+    }
+
+    #[test]
+    fn check_usage_json_output_matches_swift_decodable() {
+        let output = CheckUsageOutput {
+            claude: CheckUsageInfo {
+                name: "Claude".to_string(),
+                available: true,
+                error: false,
+                five_hour_percent: Some(42.0),
+                seven_day_percent: Some(15.0),
+                five_hour_reset: Some("2026-02-12T10:00:00.000Z".to_string()),
+                seven_day_reset: Some("2026-02-15T00:00:00.000Z".to_string()),
+                model: None,
+                plan: None,
+                buckets: None,
+            },
+            codex: None,
+            gemini: None,
+            zai: None,
+            recommendation: Some("claude".to_string()),
+            recommendation_reason: "Lowest usage (42% used)".to_string(),
+        };
+        let json = serde_json::to_string_pretty(&output).expect("serialize");
+        let parsed: Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(
+            parsed.get("claude").unwrap().get("name").unwrap(),
+            "Claude"
+        );
+        assert_eq!(
+            parsed.get("claude").unwrap().get("available").unwrap(),
+            true
+        );
+        assert_eq!(
+            parsed
+                .get("claude")
+                .unwrap()
+                .get("fiveHourPercent")
+                .unwrap(),
+            42.0
+        );
+        assert!(parsed.get("codex").unwrap().is_null());
+        assert_eq!(parsed.get("recommendation").unwrap(), "claude");
+        assert_eq!(
+            parsed.get("recommendationReason").unwrap(),
+            "Lowest usage (42% used)"
+        );
     }
 }
