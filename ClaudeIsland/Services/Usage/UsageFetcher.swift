@@ -319,16 +319,16 @@ final class UsageFetcher {
             )
             let build = try buildTempHome(credentials: effectiveCredentials)
             defer { try? FileManager.default.removeItem(at: build.homeURL) }
+            let preDockerClaudeFp = claudeTokenFingerprint(from: effectiveCredentials.claude)
             var fields: [String: String?] = [
                 "trace_id": traceID,
                 "scope": "current",
                 "temp_home": build.homeURL.path,
                 "lock_key_count": String(lockKeys.count),
             ]
-            let fileClaude = claudeTokenFingerprint(from: effectiveCredentials.claude)
-            fields["current_claude_file_refresh_fp"] = fileClaude.refreshFingerprint
-            fields["current_claude_file_access_fp"] = fileClaude.accessFingerprint
-            fields["current_claude_file_expires_at"] = fileClaude.expiresAtISO8601
+            fields["current_claude_file_refresh_fp"] = preDockerClaudeFp.refreshFingerprint
+            fields["current_claude_file_access_fp"] = preDockerClaudeFp.accessFingerprint
+            fields["current_claude_file_expires_at"] = preDockerClaudeFp.expiresAtISO8601
             let keychainClaude = claudeTokenFingerprint(from: readClaudeKeychainCredentials())
             fields["current_claude_keychain_refresh_fp"] = keychainClaude.refreshFingerprint
             fields["current_claude_keychain_access_fp"] = keychainClaude.accessFingerprint
@@ -337,7 +337,28 @@ final class UsageFetcher {
 
             do {
                 let output = try await fetchUsageFromDocker(homeURL: build.homeURL, traceID: traceID)
-                let syncReason = output.claude.error ? "claude_auth_failed" : "success"
+                var syncReason = output.claude.error ? "claude_auth_failed" : "success"
+
+                if syncReason == "success" {
+                    let activeClaudePath = homeDirectory.appendingPathComponent(credentialRelativePath(for: .claude))
+                    let postDockerFileData = try? Data(contentsOf: activeClaudePath)
+                    let postDockerFp = claudeTokenFingerprint(from: postDockerFileData)
+                    let fileChangedExternally =
+                        preDockerClaudeFp.refreshFingerprint != postDockerFp.refreshFingerprint ||
+                        preDockerClaudeFp.accessFingerprint != postDockerFp.accessFingerprint
+                    if fileChangedExternally {
+                        logRefresh(event: "credential_external_change_detected", fields: [
+                            "trace_id": traceID,
+                            "scope": "current",
+                            "pre_refresh_fp": preDockerClaudeFp.refreshFingerprint,
+                            "pre_access_fp": preDockerClaudeFp.accessFingerprint,
+                            "post_refresh_fp": postDockerFp.refreshFingerprint,
+                            "post_access_fp": postDockerFp.accessFingerprint,
+                        ])
+                        syncReason = "external_change_detected"
+                    }
+                }
+
                 try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: syncReason)
                 logRefresh(event: "refresh_cycle_completed", fields: [
                     "trace_id": traceID,
@@ -712,6 +733,10 @@ final class UsageFetcher {
         }
     }
 
+    private var sharedClaudeRefreshLockPath: String {
+        homeDirectory.appendingPathComponent(".claude/.refresh.lock").path
+    }
+
     private func claudeRefreshLockKeys(profile: UsageProfile, accounts: [UsageAccount]) -> [String] {
         guard let accountId = profile.claudeAccountId,
               let account = accounts.first(where: { $0.id == accountId }) else {
@@ -719,7 +744,8 @@ final class UsageFetcher {
         }
 
         let root = URL(fileURLWithPath: account.rootPath, isDirectory: true)
-        var keys = [root.appendingPathComponent(credentialRelativePath(for: .claude)).path]
+        var keys = [sharedClaudeRefreshLockPath,
+                    root.appendingPathComponent(credentialRelativePath(for: .claude)).path]
         let credentialData = loadCredentialFile(
             accounts: accounts,
             accountId: accountId,
@@ -733,7 +759,8 @@ final class UsageFetcher {
 
     private func claudeRefreshLockKeys(credentials: ExportCredentials) -> [String] {
         guard credentials.claude != nil else { return [] }
-        var keys = [homeDirectory.appendingPathComponent(credentialRelativePath(for: .claude)).path]
+        var keys = [sharedClaudeRefreshLockPath,
+                    homeDirectory.appendingPathComponent(credentialRelativePath(for: .claude)).path]
         if let tokenKey = claudeRefreshTokenLockKey(from: credentials.claude) {
             keys.append(tokenKey)
         }
@@ -959,7 +986,7 @@ final class UsageFetcher {
                     destinationData: existingData
                 )
                 logRefresh(event: "credential_sync_skipped", fields: fields)
-                if syncsActiveClaude && reason != "claude_auth_failed" {
+                if syncsActiveClaude && reason != "claude_auth_failed" && reason != "external_change_detected" {
                     try syncActiveClaudeCredential(
                         sourceData: sourceData,
                         destinationURL: target.destinationURL,
@@ -1083,6 +1110,10 @@ final class UsageFetcher {
     ) -> CredentialSyncDecision {
         if reason == "claude_auth_failed" && relativePath.hasPrefix(".claude/") {
             return .skip("claude_auth_failed_skip_claude_credential")
+        }
+
+        if reason == "external_change_detected" && relativePath.hasPrefix(".claude/") {
+            return .skip("external_change_detected_skip_claude_credential")
         }
 
         let staleGuardSeconds: TimeInterval = 300
