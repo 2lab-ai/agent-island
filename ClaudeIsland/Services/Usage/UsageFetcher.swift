@@ -865,7 +865,7 @@ final class UsageFetcher {
         private let fd: Int32
         private var isLocked = true
 
-        init(path: String) throws {
+        init(path: String, timeoutSeconds: TimeInterval = 60) throws {
             let descriptor = open(path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
             guard descriptor >= 0 else {
                 throw NSError(
@@ -875,14 +875,30 @@ final class UsageFetcher {
                 )
             }
 
-            if flock(descriptor, LOCK_EX) != 0 {
-                let error = NSError(
-                    domain: "UsageFetcher.ProcessFileLock",
-                    code: Int(errno),
-                    userInfo: [NSLocalizedDescriptionKey: "flock(\(path)) failed with errno \(errno)"]
-                )
+            if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+                _ = fchmod(descriptor, S_IRUSR | S_IWUSR)
+                fd = descriptor
+                return
+            }
+
+            let deadline = CFAbsoluteTimeGetCurrent() + timeoutSeconds
+            let pollInterval: useconds_t = 200_000 // 200ms
+            var acquired = false
+            while CFAbsoluteTimeGetCurrent() < deadline {
+                usleep(pollInterval)
+                if flock(descriptor, LOCK_EX | LOCK_NB) == 0 {
+                    acquired = true
+                    break
+                }
+            }
+
+            guard acquired else {
                 close(descriptor)
-                throw error
+                throw NSError(
+                    domain: "UsageFetcher.ProcessFileLock",
+                    code: 110, // ETIMEDOUT
+                    userInfo: [NSLocalizedDescriptionKey: "flock(\(path)) timed out after \(Int(timeoutSeconds))s"]
+                )
             }
 
             _ = fchmod(descriptor, S_IRUSR | S_IWUSR)
