@@ -307,38 +307,139 @@ final class UsageDashboardViewModel: ObservableObject {
             ?? normalizedIdentityEmail(lastKnownEmailByAccountId[currentClaudeId])
         let currentTeam = currentSnapshot.identities.claudeIsTeam
             ?? lastKnownClaudeIsTeamByAccountId[currentClaudeId]
+        let currentPlan = normalizeClaudePlanKey(
+            currentSnapshot.identities.claudeTier
+                ?? lastKnownPlanByAccountId[currentClaudeId]
+                ?? lastKnownTierByAccountId[currentClaudeId]
+        )
 
-        guard let currentEmail else { return ids.sorted() }
+        if let currentEmail {
+            if let canonicalId = UsageAccountIdFormatter.displayAccountId(
+                provider: .claude,
+                email: currentEmail,
+                claudeIsTeam: currentTeam
+            ), accounts.contains(where: { $0.service == .claude && $0.id == canonicalId }) {
+                ids.insert(canonicalId)
+            }
 
-        if let canonicalId = UsageAccountIdFormatter.displayAccountId(
-            provider: .claude,
-            email: currentEmail,
-            claudeIsTeam: currentTeam
-        ), accounts.contains(where: { $0.service == .claude && $0.id == canonicalId }) {
-            ids.insert(canonicalId)
+            for profile in profiles {
+                guard let profileClaudeId = profile.claudeAccountId else { continue }
+                guard accounts.contains(where: { $0.service == .claude && $0.id == profileClaudeId }) else { continue }
+
+                if profileClaudeId == currentClaudeId {
+                    ids.insert(profileClaudeId)
+                    continue
+                }
+
+                let profileEmail = normalizedIdentityEmail(lastKnownEmailByAccountId[profileClaudeId])
+                guard profileEmail == currentEmail else { continue }
+
+                let profileTeam = lastKnownClaudeIsTeamByAccountId[profileClaudeId]
+                if let currentTeam, let profileTeam, currentTeam != profileTeam {
+                    continue
+                }
+
+                ids.insert(profileClaudeId)
+            }
         }
 
-        for profile in profiles {
-            guard let profileClaudeId = profile.claudeAccountId else { continue }
-            guard accounts.contains(where: { $0.service == .claude && $0.id == profileClaudeId }) else { continue }
+        if ids.isEmpty, currentEmail == nil, (currentTeam != nil || currentPlan != nil) {
+            let candidates = accounts
+                .filter { $0.service == .claude }
+                .compactMap { account -> String? in
+                    guard let metadata = storedClaudeMetadata(for: account) else { return nil }
+                    var matchedDimensions = 0
 
-            if profileClaudeId == currentClaudeId {
-                ids.insert(profileClaudeId)
-                continue
+                    if let currentTeam {
+                        guard let metadataTeam = metadata.isTeam else { return nil }
+                        guard metadataTeam == currentTeam else { return nil }
+                        matchedDimensions += 1
+                    }
+
+                    if let currentPlan {
+                        guard let metadataPlan = normalizeClaudePlanKey(metadata.plan) else { return nil }
+                        guard metadataPlan == currentPlan else { return nil }
+                        matchedDimensions += 1
+                    }
+
+                    return matchedDimensions > 0 ? account.id : nil
+                }
+
+            if candidates.count == 1, let candidate = candidates.first {
+                ids.insert(candidate)
             }
-
-            let profileEmail = normalizedIdentityEmail(lastKnownEmailByAccountId[profileClaudeId])
-            guard profileEmail == currentEmail else { continue }
-
-            let profileTeam = lastKnownClaudeIsTeamByAccountId[profileClaudeId]
-            if let currentTeam, let profileTeam, currentTeam != profileTeam {
-                continue
-            }
-
-            ids.insert(profileClaudeId)
         }
 
         return ids.sorted()
+    }
+
+    private struct StoredClaudeMetadata {
+        let isTeam: Bool?
+        let plan: String?
+    }
+
+    private func storedClaudeMetadata(for account: UsageAccount) -> StoredClaudeMetadata? {
+        guard account.service == .claude else { return nil }
+        let credentialURL = URL(fileURLWithPath: account.rootPath, isDirectory: true)
+            .appendingPathComponent(".claude/.credentials.json")
+        guard let data = try? Data(contentsOf: credentialURL) else { return nil }
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+
+        let oauth = root["claudeAiOauth"] as? [String: Any] ?? [:]
+        let oauthSubscriptionType = normalizedLowercaseString(oauth["subscriptionType"] as? String)
+        let rootSubscriptionType = normalizedLowercaseString(root["subscriptionType"] as? String)
+        let isTeam = parseClaudeBool(oauth["isTeam"])
+            ?? parseClaudeBool(root["isTeam"])
+            ?? oauthSubscriptionType?.contains("team")
+            ?? rootSubscriptionType?.contains("team")
+
+        let plan = firstNonEmptyClaudeString([
+            oauth["rateLimitTier"] as? String,
+            root["rateLimitTier"] as? String,
+            oauth["subscriptionType"] as? String,
+            root["subscriptionType"] as? String,
+        ])
+
+        return StoredClaudeMetadata(isTeam: isTeam, plan: plan)
+    }
+
+    private func firstNonEmptyClaudeString(_ values: [String?]) -> String? {
+        for value in values {
+            let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let normalized, !normalized.isEmpty {
+                return normalized
+            }
+        }
+        return nil
+    }
+
+    private func normalizedLowercaseString(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private func parseClaudeBool(_ value: Any?) -> Bool? {
+        if let bool = value as? Bool { return bool }
+        if let number = value as? NSNumber { return number.boolValue }
+        if let string = value as? String {
+            let lowered = string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if lowered == "true" || lowered == "1" { return true }
+            if lowered == "false" || lowered == "0" { return false }
+            if lowered.contains("team") { return true }
+        }
+        return nil
+    }
+
+    private func normalizeClaudePlanKey(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let lowered = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lowered.isEmpty else { return nil }
+        if lowered.contains("max") && lowered.contains("20") { return "max20" }
+        if lowered.contains("max") && lowered.contains("5") { return "max5" }
+        if lowered.contains("pro") { return "pro" }
+        if lowered.contains("max") { return "max" }
+        return lowered
     }
 
     private func writeCredentialData(_ data: Data, to destinationURL: URL) throws {
@@ -420,7 +521,8 @@ final class UsageDashboardViewModel: ObservableObject {
             tokenRefresh: snapshot.tokenRefresh,
             fetchedAt: snapshot.fetchedAt,
             isStale: snapshot.isStale,
-            errorMessage: snapshot.errorMessage
+            errorMessage: snapshot.errorMessage,
+            issue: snapshot.issue
         )
     }
 
@@ -1295,7 +1397,8 @@ struct UsageDashboardView: View {
                         claudeIsTeam: snapshot?.identities.claudeIsTeam,
                         tokenRefresh: snapshot?.tokenRefresh.claude,
                         info: snapshot?.output?.claude,
-                        errorMessage: snapshot?.errorMessage
+                        errorMessage: snapshot?.errorMessage,
+                        issue: snapshot?.issue
                     )
                 )
             }
@@ -1312,7 +1415,8 @@ struct UsageDashboardView: View {
                         claudeIsTeam: nil,
                         tokenRefresh: snapshot?.tokenRefresh.codex,
                         info: snapshot?.output?.codex,
-                        errorMessage: snapshot?.errorMessage
+                        errorMessage: snapshot?.errorMessage,
+                        issue: snapshot?.issue
                     )
                 )
             }
@@ -1329,7 +1433,8 @@ struct UsageDashboardView: View {
                         claudeIsTeam: nil,
                         tokenRefresh: snapshot?.tokenRefresh.gemini,
                         info: snapshot?.output?.gemini,
-                        errorMessage: snapshot?.errorMessage
+                        errorMessage: snapshot?.errorMessage,
+                        issue: snapshot?.issue
                     )
                 )
             }
@@ -1351,7 +1456,8 @@ struct UsageDashboardView: View {
                         claudeIsTeam: snapshot?.identities.claudeIsTeam,
                         tokenRefresh: snapshot?.tokenRefresh.claude,
                         info: snapshot?.output?.claude,
-                        errorMessage: snapshot?.errorMessage
+                        errorMessage: snapshot?.errorMessage,
+                        issue: snapshot?.issue
                     )
                 )
             }
@@ -1368,7 +1474,8 @@ struct UsageDashboardView: View {
                         claudeIsTeam: nil,
                         tokenRefresh: snapshot?.tokenRefresh.codex,
                         info: snapshot?.output?.codex,
-                        errorMessage: snapshot?.errorMessage
+                        errorMessage: snapshot?.errorMessage,
+                        issue: snapshot?.issue
                     )
                 )
             }
@@ -1385,7 +1492,8 @@ struct UsageDashboardView: View {
                         claudeIsTeam: nil,
                         tokenRefresh: snapshot?.tokenRefresh.gemini,
                         info: snapshot?.output?.gemini,
-                        errorMessage: snapshot?.errorMessage
+                        errorMessage: snapshot?.errorMessage,
+                        issue: snapshot?.issue
                     )
                 )
             }
@@ -1645,6 +1753,7 @@ private struct UsageAccountTile: Identifiable {
     let tokenRefresh: TokenRefreshInfo?
     let info: CLIUsageInfo?
     let errorMessage: String?
+    let issue: UsageIssue?
 }
 
 private struct UsageAccountTileRowHeightsPreferenceKey: PreferenceKey {
@@ -1771,11 +1880,15 @@ private struct UsageAccountTileCard: View {
                 onSetClaudeCodeTokenEnabled: onSetClaudeCodeTokenEnabled
             )
 
-            Text((tile.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil) ?? " ")
-                .font(.system(size: 10))
-                .foregroundColor(TerminalColors.amber.opacity(0.9))
-                .lineLimit(1)
-                .opacity((tile.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil) == nil ? 0 : 1)
+            if let issue = tile.issue {
+                UsageIssueInlineView(issue: issue)
+            } else {
+                Text((tile.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil) ?? " ")
+                    .font(.system(size: 10))
+                    .foregroundColor(TerminalColors.amber.opacity(0.9))
+                    .lineLimit(1)
+                    .opacity((tile.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmptyOrNil) == nil ? 0 : 1)
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -1871,7 +1984,9 @@ private struct UsageDashboardPanel: View {
                 )
             }
 
-            if let message = snapshot?.errorMessage {
+            if let issue = snapshot?.issue {
+                UsageIssueInlineView(issue: issue)
+            } else if let message = snapshot?.errorMessage {
                 Text(message)
                     .font(.system(size: 10))
                     .foregroundColor(TerminalColors.amber.opacity(0.9))
@@ -1976,6 +2091,103 @@ private struct UsageDashboardPanel: View {
         let minutes = seconds / 60
         if minutes < 60 { return "\(minutes)m" }
         return "\(minutes / 60)h"
+    }
+}
+
+private struct UsageIssueInlineView: View {
+    let issue: UsageIssue
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(issue.message)
+                .font(.system(size: 10))
+                .foregroundColor(TerminalColors.amber.opacity(0.9))
+                .lineLimit(2)
+
+            HStack(spacing: 6) {
+                if showsOpenDockerDesktop {
+                    UsageIssueActionButton(title: "Open Docker Desktop", action: UsageIssueActionRunner.openDockerDesktop)
+                }
+
+                if issue.kind == .dockerCredentialHelperMissing {
+                    UsageIssueActionButton(title: "Open Docker Config", action: UsageIssueActionRunner.openDockerConfig)
+                }
+
+                if issue.kind == .dockerCLIUnavailable {
+                    UsageIssueActionButton(title: "Install Guide", action: UsageIssueActionRunner.openDockerInstallGuide)
+                }
+            }
+        }
+    }
+
+    private var showsOpenDockerDesktop: Bool {
+        switch issue.kind {
+        case .dockerDaemonUnavailable, .dockerCredentialHelperMissing, .dockerCLIUnavailable:
+            return true
+        }
+    }
+}
+
+private struct UsageIssueActionButton: View {
+    let title: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(.white.opacity(0.82))
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(0.08))
+                )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private enum UsageIssueActionRunner {
+    static func openDockerDesktop() {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.docker.docker") {
+            _ = NSWorkspace.shared.open(appURL)
+            return
+        }
+
+        let bundledURL = URL(fileURLWithPath: "/Applications/Docker.app")
+        if FileManager.default.fileExists(atPath: bundledURL.path) {
+            _ = NSWorkspace.shared.open(bundledURL)
+            return
+        }
+
+        _ = NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications"))
+    }
+
+    static func openDockerConfig() {
+        let fileManager = FileManager.default
+        let homeURL = fileManager.homeDirectoryForCurrentUser
+        let configURL = homeURL.appendingPathComponent(".docker/config.json")
+
+        if fileManager.fileExists(atPath: configURL.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([configURL])
+            return
+        }
+
+        let dockerDirURL = homeURL.appendingPathComponent(".docker", isDirectory: true)
+        if fileManager.fileExists(atPath: dockerDirURL.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([dockerDirURL])
+            return
+        }
+
+        NSWorkspace.shared.activateFileViewerSelecting([homeURL])
+    }
+
+    static func openDockerInstallGuide() {
+        guard let installURL = URL(string: "https://docs.docker.com/desktop/setup/install/mac-install/") else {
+            return
+        }
+        _ = NSWorkspace.shared.open(installURL)
     }
 }
 

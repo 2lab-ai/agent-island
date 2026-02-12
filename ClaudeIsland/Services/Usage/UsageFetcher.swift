@@ -81,6 +81,7 @@ enum UsageFetcherError: LocalizedError {
 
 final class UsageFetcher {
     typealias DockerCheckUsageRunner = (URL, String, String?) async throws -> Data
+    typealias ActiveClaudeCredentialSync = (Data, URL) throws -> Void
 
     private static let claudeRefreshLockRegistry = ClaudeRefreshLockRegistry()
 
@@ -88,6 +89,7 @@ final class UsageFetcher {
     private let cache: UsageCache
     private let dockerImage: String
     private let dockerRunner: DockerCheckUsageRunner?
+    private let activeClaudeCredentialSync: ActiveClaudeCredentialSync
     private let homeDirectory: URL
     private let refreshLogWriter: UsageRefreshLogWriter
     private let identityCache = IdentityCache()
@@ -97,12 +99,16 @@ final class UsageFetcher {
         cache: UsageCache = UsageCache(),
         dockerImage: String = "node:20-alpine",
         dockerRunner: DockerCheckUsageRunner? = nil,
+        activeClaudeCredentialSync: @escaping ActiveClaudeCredentialSync = { data, activeHomeDir in
+            try CredentialExporter().syncActiveClaudeCredentials(data, activeHomeDir: activeHomeDir)
+        },
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) {
         self.accountStore = accountStore
         self.cache = cache
         self.dockerImage = dockerImage
         self.dockerRunner = dockerRunner
+        self.activeClaudeCredentialSync = activeClaudeCredentialSync
         self.homeDirectory = homeDirectory
         self.refreshLogWriter = UsageRefreshLogWriter(homeDirectory: homeDirectory)
     }
@@ -306,7 +312,11 @@ final class UsageFetcher {
             traceID: traceID,
             scope: "current"
         ) {
-            let build = try buildTempHome(credentials: credentials)
+            let effectiveCredentials = recoverIncompleteCurrentClaudeCredentialIfNeeded(
+                currentCredentials: credentials,
+                traceID: traceID
+            )
+            let build = try buildTempHome(credentials: effectiveCredentials)
             defer { try? FileManager.default.removeItem(at: build.homeURL) }
             var fields: [String: String?] = [
                 "trace_id": traceID,
@@ -314,7 +324,7 @@ final class UsageFetcher {
                 "temp_home": build.homeURL.path,
                 "lock_key_count": String(lockKeys.count),
             ]
-            let fileClaude = claudeTokenFingerprint(from: credentials.claude)
+            let fileClaude = claudeTokenFingerprint(from: effectiveCredentials.claude)
             fields["current_claude_file_refresh_fp"] = fileClaude.refreshFingerprint
             fields["current_claude_file_access_fp"] = fileClaude.accessFingerprint
             fields["current_claude_file_expires_at"] = fileClaude.expiresAtISO8601
@@ -344,6 +354,151 @@ final class UsageFetcher {
                 throw error
             }
         }
+    }
+
+    private struct IncompleteCurrentRefreshCycle {
+        let traceID: String
+        let tempHomeURL: URL
+        let startedAt: Date?
+    }
+
+    private func recoverIncompleteCurrentClaudeCredentialIfNeeded(
+        currentCredentials: ExportCredentials,
+        traceID: String
+    ) -> ExportCredentials {
+        guard let currentClaudeData = currentCredentials.claude else { return currentCredentials }
+        guard let incompleteCycle = latestIncompleteCurrentRefreshCycle() else { return currentCredentials }
+
+        let now = Date()
+        if let startedAt = incompleteCycle.startedAt,
+           now.timeIntervalSince(startedAt) > 12 * 60 * 60 {
+            logRefresh(event: "incomplete_current_recovery_skipped", fields: [
+                "trace_id": traceID,
+                "incomplete_trace_id": incompleteCycle.traceID,
+                "reason": "incomplete_cycle_too_old",
+            ])
+            return currentCredentials
+        }
+
+        let recoveredCredentialURL = incompleteCycle.tempHomeURL
+            .appendingPathComponent(credentialRelativePath(for: .claude))
+        guard let recoveredClaudeData = try? Data(contentsOf: recoveredCredentialURL) else {
+            logRefresh(event: "incomplete_current_recovery_skipped", fields: [
+                "trace_id": traceID,
+                "incomplete_trace_id": incompleteCycle.traceID,
+                "reason": "missing_recovered_credential_file",
+                "recovered_path": recoveredCredentialURL.path,
+            ])
+            return currentCredentials
+        }
+
+        let currentFingerprint = claudeTokenFingerprint(from: currentClaudeData)
+        let recoveredFingerprint = claudeTokenFingerprint(from: recoveredClaudeData)
+        let tokenMaterialChanged =
+            currentFingerprint.accessFingerprint != recoveredFingerprint.accessFingerprint ||
+            currentFingerprint.refreshFingerprint != recoveredFingerprint.refreshFingerprint
+        guard tokenMaterialChanged else { return currentCredentials }
+
+        if let recoveredExpiry = recoveredFingerprint.expiresAt {
+            if recoveredExpiry.timeIntervalSince(now) <= 120 {
+                logRefresh(event: "incomplete_current_recovery_skipped", fields: [
+                    "trace_id": traceID,
+                    "incomplete_trace_id": incompleteCycle.traceID,
+                    "reason": "recovered_token_expiring_soon",
+                    "recovered_expires_at": recoveredFingerprint.expiresAtISO8601,
+                ])
+                return currentCredentials
+            }
+            if let currentExpiry = currentFingerprint.expiresAt,
+               recoveredExpiry.timeIntervalSince(currentExpiry) <= 60 {
+                logRefresh(event: "incomplete_current_recovery_skipped", fields: [
+                    "trace_id": traceID,
+                    "incomplete_trace_id": incompleteCycle.traceID,
+                    "reason": "recovered_token_not_newer_enough",
+                    "current_expires_at": currentFingerprint.expiresAtISO8601,
+                    "recovered_expires_at": recoveredFingerprint.expiresAtISO8601,
+                ])
+                return currentCredentials
+            }
+        }
+
+        do {
+            try activeClaudeCredentialSync(recoveredClaudeData, homeDirectory)
+            let activePath = homeDirectory
+                .appendingPathComponent(credentialRelativePath(for: .claude))
+            let syncedData = (try? Data(contentsOf: activePath)) ?? recoveredClaudeData
+            let syncedFingerprint = claudeTokenFingerprint(from: syncedData)
+
+            logRefresh(event: "incomplete_current_recovery_applied", fields: [
+                "trace_id": traceID,
+                "incomplete_trace_id": incompleteCycle.traceID,
+                "source_access_fp": recoveredFingerprint.accessFingerprint,
+                "source_refresh_fp": recoveredFingerprint.refreshFingerprint,
+                "source_expires_at": recoveredFingerprint.expiresAtISO8601,
+                "destination_access_fp": syncedFingerprint.accessFingerprint,
+                "destination_refresh_fp": syncedFingerprint.refreshFingerprint,
+                "destination_expires_at": syncedFingerprint.expiresAtISO8601,
+                "recovered_path": recoveredCredentialURL.path,
+            ])
+
+            return ExportCredentials(
+                claude: syncedData,
+                codex: currentCredentials.codex,
+                gemini: currentCredentials.gemini
+            )
+        } catch {
+            logRefresh(event: "incomplete_current_recovery_failed", fields: [
+                "trace_id": traceID,
+                "incomplete_trace_id": incompleteCycle.traceID,
+                "error": String(describing: error),
+                "recovered_path": recoveredCredentialURL.path,
+            ])
+            return currentCredentials
+        }
+    }
+
+    private func latestIncompleteCurrentRefreshCycle() -> IncompleteCurrentRefreshCycle? {
+        let logURL = homeDirectory
+            .appendingPathComponent(".agent-island/logs/usage-refresh.log")
+        guard let data = try? Data(contentsOf: logURL), !data.isEmpty else { return nil }
+        guard let contents = String(data: data, encoding: .utf8) else { return nil }
+
+        var latestStarted: IncompleteCurrentRefreshCycle?
+        var completedTraceIDs = Set<String>()
+
+        for line in contents.split(whereSeparator: \.isNewline) {
+            let lineData = Data(line.utf8)
+            guard let object = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                  let event = object["event"] as? String else {
+                continue
+            }
+
+            if event == "refresh_cycle_completed",
+               let scope = object["scope"] as? String,
+               scope == "current",
+               let traceID = object["trace_id"] as? String {
+                completedTraceIDs.insert(traceID)
+                continue
+            }
+
+            if event == "refresh_cycle_started",
+               let scope = object["scope"] as? String,
+               scope == "current",
+               let traceID = object["trace_id"] as? String,
+               let tempHomePath = object["temp_home"] as? String {
+                let startedAt = (object["timestamp"] as? String)
+                    .flatMap { UsageRefreshLogWriter.iso8601Formatter.date(from: $0) }
+                latestStarted = IncompleteCurrentRefreshCycle(
+                    traceID: traceID,
+                    tempHomeURL: URL(fileURLWithPath: tempHomePath, isDirectory: true),
+                    startedAt: startedAt
+                )
+            }
+        }
+
+        guard let latestStarted else { return nil }
+        guard !completedTraceIDs.contains(latestStarted.traceID) else { return nil }
+        return latestStarted
     }
 
     private func fetchUsageFromDocker(homeURL: URL, traceID: String) async throws -> CheckUsageOutput {
@@ -771,6 +926,7 @@ final class UsageFetcher {
 
             let sourceData = try Data(contentsOf: sourceURL)
             let existingData = try? Data(contentsOf: target.destinationURL)
+            let syncsActiveClaude = shouldSyncActiveClaudeCredential(target)
             if let existingData, existingData == sourceData {
                 var fields: [String: String?] = [
                     "trace_id": traceID,
@@ -785,6 +941,15 @@ final class UsageFetcher {
                     destinationData: existingData
                 )
                 logRefresh(event: "credential_sync_skipped", fields: fields)
+                if syncsActiveClaude {
+                    try syncActiveClaudeCredential(
+                        sourceData: sourceData,
+                        destinationURL: target.destinationURL,
+                        traceID: traceID,
+                        reason: reason,
+                        decisionDetail: "active_claude_sync_on_unchanged"
+                    )
+                }
                 continue
             }
 
@@ -812,7 +977,17 @@ final class UsageFetcher {
                 )
                 logRefresh(event: "credential_sync_skipped", fields: fields)
             case .write(let detail):
-                try writeFile(data: sourceData, to: target.destinationURL)
+                if syncsActiveClaude {
+                    try syncActiveClaudeCredential(
+                        sourceData: sourceData,
+                        destinationURL: target.destinationURL,
+                        traceID: traceID,
+                        reason: reason,
+                        decisionDetail: detail
+                    )
+                } else {
+                    try writeFile(data: sourceData, to: target.destinationURL)
+                }
                 var fields: [String: String?] = [
                     "trace_id": traceID,
                     "reason": reason,
@@ -834,6 +1009,47 @@ final class UsageFetcher {
             "trace_id": traceID,
             "reason": reason,
         ])
+    }
+
+    private func shouldSyncActiveClaudeCredential(_ target: CredentialSyncTarget) -> Bool {
+        guard target.relativePath == credentialRelativePath(for: .claude) else { return false }
+        let activeClaudePath = homeDirectory
+            .appendingPathComponent(credentialRelativePath(for: .claude))
+            .standardizedFileURL.path
+        return target.destinationURL.standardizedFileURL.path == activeClaudePath
+    }
+
+    private func syncActiveClaudeCredential(
+        sourceData: Data,
+        destinationURL: URL,
+        traceID: String,
+        reason: String,
+        decisionDetail: String
+    ) throws {
+        do {
+            try activeClaudeCredentialSync(sourceData, homeDirectory)
+            var fields: [String: String?] = [
+                "trace_id": traceID,
+                "reason": reason,
+                "decision_detail": decisionDetail,
+                "destination_path": destinationURL.path,
+            ]
+            appendClaudeSyncFingerprints(
+                into: &fields,
+                sourceData: sourceData,
+                destinationData: try? Data(contentsOf: destinationURL)
+            )
+            logRefresh(event: "credential_sync_active_claude_synced", fields: fields)
+        } catch {
+            logRefresh(event: "credential_sync_active_claude_failed", fields: [
+                "trace_id": traceID,
+                "reason": reason,
+                "decision_detail": decisionDetail,
+                "destination_path": destinationURL.path,
+                "error": String(describing: error),
+            ])
+            throw error
+        }
     }
 
     private enum CredentialSyncDecision {

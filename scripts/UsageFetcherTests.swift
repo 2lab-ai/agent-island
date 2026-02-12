@@ -14,6 +14,8 @@ enum UsageFetcherTests {
         try await testProfileTokenRefreshReflectsCredentialUpdateAfterDockerRun()
         try await testProfileRefreshPersistsRotatedTokenWhenExpiryEqual()
         try await testProfileRefreshSkipsOlderClaudeCredentialOnSuccessSync()
+        try await testCurrentRefreshSyncsActiveClaudeCredentialsWhenUnchanged()
+        try await testCurrentRefreshRecoversIncompleteTempHomeCredential()
         print("OK")
     }
 
@@ -533,6 +535,149 @@ enum UsageFetcherTests {
         )
         assert(latestOnDiskTokens.accessToken == "at-latest")
         assert(latestOnDiskTokens.refreshToken == "rt-latest")
+    }
+
+    private static func testCurrentRefreshSyncsActiveClaudeCredentialsWhenUnchanged() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("usage-fetcher-active-sync-\(UUID().uuidString)", isDirectory: true)
+        let activeClaudeURL = root.appendingPathComponent(".claude/.credentials.json")
+        try fm.createDirectory(at: activeClaudeURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let issuedAt = Date(timeIntervalSince1970: 1_910_000_000)
+        let expiresAt = Date(timeIntervalSince1970: 1_910_010_800)
+        let claudeCredential = try makeClaudeCredential(
+            accessToken: "at-stable",
+            refreshToken: "rt-stable",
+            expiresAt: expiresAt,
+            issuedAt: issuedAt
+        )
+        try claudeCredential.write(to: activeClaudeURL, options: [.atomic])
+
+        final class CallCounter {
+            var value: Int = 0
+        }
+        let counter = CallCounter()
+
+        let fetcher = UsageFetcher(
+            accountStore: AccountStore(rootDir: root),
+            cache: UsageCache(ttl: 0),
+            dockerRunner: { _, _, _ in
+                let json = """
+                {
+                  "claude": { "name": "Claude", "available": true, "error": false },
+                  "codex": null,
+                  "gemini": null,
+                  "zai": null,
+                  "recommendation": null,
+                  "recommendationReason": "n/a"
+                }
+                """
+                return Data(json.utf8)
+            },
+            activeClaudeCredentialSync: { _, _ in
+                counter.value += 1
+            },
+            homeDirectory: root
+        )
+
+        let credentials = ExportCredentials(claude: claudeCredential, codex: nil, gemini: nil)
+        _ = await fetcher.fetchCurrentSnapshot(credentials: credentials, forceRefresh: true)
+
+        assert(counter.value == 1, "Expected active Claude credential sync to run once even when file is unchanged.")
+    }
+
+    private static func testCurrentRefreshRecoversIncompleteTempHomeCredential() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("usage-fetcher-incomplete-recovery-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let activeClaudeURL = root.appendingPathComponent(".claude/.credentials.json")
+        try fm.createDirectory(at: activeClaudeURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+        let oldCredential = try makeClaudeCredential(
+            accessToken: "at-old",
+            refreshToken: "rt-old",
+            expiresAt: Date(timeIntervalSince1970: 1_910_003_600),
+            issuedAt: Date(timeIntervalSince1970: 1_910_000_000)
+        )
+        let recoveredCredential = try makeClaudeCredential(
+            accessToken: "at-recovered",
+            refreshToken: "rt-recovered",
+            expiresAt: Date(timeIntervalSince1970: 1_910_010_800),
+            issuedAt: Date(timeIntervalSince1970: 1_910_000_000)
+        )
+        try oldCredential.write(to: activeClaudeURL, options: [.atomic])
+
+        let incompleteHome = root
+            .appendingPathComponent(".agent-island/tmp-homes/incomplete", isDirectory: true)
+        let incompleteClaudeURL = incompleteHome.appendingPathComponent(".claude/.credentials.json")
+        try fm.createDirectory(at: incompleteClaudeURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try recoveredCredential.write(to: incompleteClaudeURL, options: [.atomic])
+
+        let logURL = root.appendingPathComponent(".agent-island/logs/usage-refresh.log")
+        try fm.createDirectory(at: logURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let startedEntry: [String: String] = [
+            "timestamp": formatter.string(from: Date()),
+            "event": "refresh_cycle_started",
+            "scope": "current",
+            "trace_id": "incomplete-trace",
+            "temp_home": incompleteHome.path,
+        ]
+        let startedData = try JSONSerialization.data(withJSONObject: startedEntry, options: [])
+        try Data(startedData + Data("\n".utf8)).write(to: logURL, options: [.atomic])
+
+        final class Recorder {
+            var syncCalls: Int = 0
+            var dockerAccessToken: String?
+        }
+        let recorder = Recorder()
+
+        let fetcher = UsageFetcher(
+            accountStore: AccountStore(rootDir: root),
+            cache: UsageCache(ttl: 0),
+            dockerRunner: { homeURL, _, _ in
+                let dockerCredentialURL = homeURL.appendingPathComponent(".claude/.credentials.json")
+                let dockerCredentialData = try Data(contentsOf: dockerCredentialURL)
+                recorder.dockerAccessToken = try readClaudeTokens(from: dockerCredentialData).accessToken
+
+                let json = """
+                {
+                  "claude": { "name": "Claude", "available": true, "error": false },
+                  "codex": null,
+                  "gemini": null,
+                  "zai": null,
+                  "recommendation": null,
+                  "recommendationReason": "n/a"
+                }
+                """
+                return Data(json.utf8)
+            },
+            activeClaudeCredentialSync: { data, activeHomeDir in
+                recorder.syncCalls += 1
+                let destination = activeHomeDir.appendingPathComponent(".claude/.credentials.json")
+                try FileManager.default.createDirectory(
+                    at: destination.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try data.write(to: destination, options: [.atomic])
+            },
+            homeDirectory: root
+        )
+
+        let credentials = ExportCredentials(claude: oldCredential, codex: nil, gemini: nil)
+        _ = await fetcher.fetchCurrentSnapshot(credentials: credentials, forceRefresh: true)
+
+        let finalActiveData = try Data(contentsOf: activeClaudeURL)
+        let finalTokens = try readClaudeTokens(from: finalActiveData)
+        assert(recorder.dockerAccessToken == "at-recovered")
+        assert(finalTokens.accessToken == "at-recovered")
+        assert(finalTokens.refreshToken == "rt-recovered")
+        assert(recorder.syncCalls >= 2, "Expected recovery sync and final unchanged sync to both run.")
     }
 
     private static func makeJWTBackedCredential(email: String) throws -> Data {

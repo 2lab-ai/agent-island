@@ -68,9 +68,9 @@ final class CredentialExporter {
 
         let previousKeychainRaw = readKeychain(service: "Claude Code-credentials")
         let previousKeychainData = previousKeychainRaw?.data(using: .utf8)
-        let mergedData = mergedClaudeCredentials(
-            keychainData: data,
-            fallbackFileData: activeFileData ?? previousKeychainData,
+        let mergedData = mergeClaudeCredentials(
+            primaryData: data,
+            fallbackData: activeFileData ?? previousKeychainData,
             accountsRoot: accountsRoot
         ) ?? data
         guard let mergedRaw = String(data: mergedData, encoding: .utf8) else {
@@ -94,62 +94,98 @@ final class CredentialExporter {
     }
 
     private func readClaudeCredentials() -> Data? {
-        let path = FileManager.default.homeDirectoryForCurrentUser
+        let activeHomeDir = FileManager.default.homeDirectoryForCurrentUser
+        let path = activeHomeDir
             .appendingPathComponent(".claude/.credentials.json")
         let fileData = try? Data(contentsOf: path)
-        guard let keychain = readKeychain(service: "Claude Code-credentials"),
-              let keychainData = keychain.data(using: .utf8)
-        else {
-            return fileData
-        }
+        let keychainData = readKeychain(service: "Claude Code-credentials")
+            .flatMap { $0.data(using: .utf8) }
+        let accountsRoot = activeHomeDir
+            .appendingPathComponent(".agent-island/accounts", isDirectory: true)
 
-        return mergedClaudeCredentials(
+        return resolveCurrentClaudeCredentialData(
+            fileData: fileData,
             keychainData: keychainData,
-            fallbackFileData: fileData
-        ) ?? keychainData
+            accountsRoot: accountsRoot
+        )
     }
 
-    private func mergedClaudeCredentials(keychainData: Data, fallbackFileData: Data?) -> Data? {
-        mergedClaudeCredentials(
-            keychainData: keychainData,
-            fallbackFileData: fallbackFileData,
+    private func mergeClaudeCredentials(primaryData: Data, fallbackData: Data?) -> Data? {
+        mergeClaudeCredentials(
+            primaryData: primaryData,
+            fallbackData: fallbackData,
             accountsRoot: nil
         )
     }
 
-    private func mergedClaudeCredentials(
-        keychainData: Data,
-        fallbackFileData: Data?,
+    private func mergeClaudeCredentials(
+        primaryData: Data,
+        fallbackData: Data?,
         accountsRoot: URL?
     ) -> Data? {
-        guard var keychainRoot = parseJSONObject(from: keychainData) else { return nil }
+        guard var primaryRoot = parseJSONObject(from: primaryData) else { return nil }
 
-        let keychainRefreshToken = readClaudeRefreshToken(from: keychainRoot)
+        let primaryRefreshToken = readClaudeRefreshToken(from: primaryRoot)
         let fallbackRoot: [String: Any]? = {
-            if let fallbackFileData,
-               let parsed = parseJSONObject(from: fallbackFileData),
-               let keychainRefreshToken,
-               readClaudeRefreshToken(from: parsed) == keychainRefreshToken {
+            if let fallbackData,
+               let parsed = parseJSONObject(from: fallbackData),
+               let primaryRefreshToken,
+               readClaudeRefreshToken(from: parsed) == primaryRefreshToken {
                 return parsed
             }
 
-            if let keychainRefreshToken,
+            if let primaryRefreshToken,
                let matched = loadStoredClaudeRoot(
-                   refreshToken: keychainRefreshToken,
+                   refreshToken: primaryRefreshToken,
                    accountsRoot: accountsRoot
                ) {
                 return matched
             }
 
-            return fallbackFileData.flatMap(parseJSONObject)
+            return fallbackData.flatMap(parseJSONObject)
         }()
 
         guard let fallbackRoot else {
-            return keychainData
+            return primaryData
         }
 
-        keychainRoot = mergeClaudeMetadata(primary: keychainRoot, fallback: fallbackRoot)
-        return try? JSONSerialization.data(withJSONObject: keychainRoot, options: [.prettyPrinted])
+        primaryRoot = mergeClaudeMetadata(primary: primaryRoot, fallback: fallbackRoot)
+        return try? JSONSerialization.data(withJSONObject: primaryRoot, options: [.prettyPrinted])
+    }
+
+    func resolveCurrentClaudeCredentialData(
+        fileData: Data?,
+        keychainData: Data?,
+        accountsRoot: URL
+    ) -> Data? {
+        let fileUsable = fileData.map(isUsableClaudeCredentialData) ?? false
+        let keychainUsable = keychainData.map(isUsableClaudeCredentialData) ?? false
+
+        if fileUsable, let fileData {
+            return mergeClaudeCredentials(
+                primaryData: fileData,
+                fallbackData: keychainData,
+                accountsRoot: accountsRoot
+            ) ?? fileData
+        }
+
+        if keychainUsable, let keychainData {
+            return mergeClaudeCredentials(
+                primaryData: keychainData,
+                fallbackData: fileData,
+                accountsRoot: accountsRoot
+            ) ?? keychainData
+        }
+
+        if let fileData { return fileData }
+        return keychainData
+    }
+
+    private func isUsableClaudeCredentialData(_ data: Data) -> Bool {
+        guard let root = parseJSONObject(from: data) else { return false }
+        let oauth = root["claudeAiOauth"] as? [String: Any] ?? [:]
+        guard let accessToken = oauth["accessToken"] as? String else { return false }
+        return !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func mergeClaudeMetadata(primary: [String: Any], fallback: [String: Any]) -> [String: Any] {
