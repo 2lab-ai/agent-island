@@ -16,6 +16,8 @@ enum UsageFetcherTests {
         try await testProfileRefreshSkipsOlderClaudeCredentialOnSuccessSync()
         try await testCurrentRefreshSyncsActiveClaudeCredentialsWhenUnchanged()
         try await testCurrentRefreshRecoversIncompleteTempHomeCredential()
+        try await testClaudeAuthFailedSkipsCredentialSync()
+        try await testClaudeAuthFailedSkipsActiveSyncOnUnchanged()
         print("OK")
     }
 
@@ -678,6 +680,130 @@ enum UsageFetcherTests {
         assert(finalTokens.accessToken == "at-recovered")
         assert(finalTokens.refreshToken == "rt-recovered")
         assert(recorder.syncCalls >= 2, "Expected recovery sync and final unchanged sync to both run.")
+    }
+
+    private static func testClaudeAuthFailedSkipsCredentialSync() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("usage-fetcher-auth-failed-\(UUID().uuidString)", isDirectory: true)
+        let accountRoot = root.appendingPathComponent("accounts/acct_claude_test", isDirectory: true)
+        let credentialsURL = accountRoot.appendingPathComponent(".claude/.credentials.json")
+        try fm.createDirectory(at: credentialsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let issuedAt = Date(timeIntervalSince1970: 1_910_000_000)
+        let expiresAt = Date(timeIntervalSince1970: 1_910_010_800)
+        let originalCredential = try makeClaudeCredential(
+            accessToken: "at-original",
+            refreshToken: "rt-original",
+            expiresAt: expiresAt,
+            issuedAt: issuedAt
+        )
+        try originalCredential.write(to: credentialsURL, options: [.atomic])
+
+        let accountStore = AccountStore(rootDir: root)
+        try accountStore.saveSnapshot(
+            AccountsSnapshot(
+                accounts: [
+                    UsageAccount(
+                        id: "acct_claude_test",
+                        service: .claude,
+                        label: "claude:test",
+                        rootPath: accountRoot.path,
+                        updatedAt: Date()
+                    ),
+                ],
+                profiles: []
+            )
+        )
+
+        let fetcher = UsageFetcher(
+            accountStore: accountStore,
+            cache: UsageCache(ttl: 0),
+            dockerRunner: { _, _, _ in
+                // Docker returns success but Claude auth failed (error: true)
+                let json = """
+                {
+                  "claude": { "name": "Claude", "available": true, "error": true },
+                  "codex": null,
+                  "gemini": null,
+                  "zai": null,
+                  "recommendation": null,
+                  "recommendationReason": "n/a"
+                }
+                """
+                return Data(json.utf8)
+            },
+            homeDirectory: root
+        )
+
+        let profile = UsageProfile(
+            name: "auth-fail-test",
+            claudeAccountId: "acct_claude_test",
+            codexAccountId: nil,
+            geminiAccountId: nil
+        )
+        _ = await fetcher.fetchSnapshot(for: profile, forceRefresh: true)
+
+        let finalData = try Data(contentsOf: credentialsURL)
+        let finalTokens = try readClaudeTokens(from: finalData)
+        assert(finalTokens.accessToken == "at-original",
+               "Claude credential should NOT be overwritten when Claude auth failed.")
+        assert(finalTokens.refreshToken == "rt-original",
+               "Claude refresh token should NOT be overwritten when Claude auth failed.")
+    }
+
+    private static func testClaudeAuthFailedSkipsActiveSyncOnUnchanged() async throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("usage-fetcher-auth-failed-unchanged-\(UUID().uuidString)", isDirectory: true)
+        let activeClaudeURL = root.appendingPathComponent(".claude/.credentials.json")
+        try fm.createDirectory(at: activeClaudeURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let issuedAt = Date(timeIntervalSince1970: 1_910_000_000)
+        let expiresAt = Date(timeIntervalSince1970: 1_910_010_800)
+        let claudeCredential = try makeClaudeCredential(
+            accessToken: "at-stable",
+            refreshToken: "rt-stable",
+            expiresAt: expiresAt,
+            issuedAt: issuedAt
+        )
+        try claudeCredential.write(to: activeClaudeURL, options: [.atomic])
+
+        final class CallCounter {
+            var value: Int = 0
+        }
+        let counter = CallCounter()
+
+        let fetcher = UsageFetcher(
+            accountStore: AccountStore(rootDir: root),
+            cache: UsageCache(ttl: 0),
+            dockerRunner: { _, _, _ in
+                // Docker returns success but Claude auth failed
+                let json = """
+                {
+                  "claude": { "name": "Claude", "available": true, "error": true },
+                  "codex": null,
+                  "gemini": null,
+                  "zai": null,
+                  "recommendation": null,
+                  "recommendationReason": "n/a"
+                }
+                """
+                return Data(json.utf8)
+            },
+            activeClaudeCredentialSync: { _, _ in
+                counter.value += 1
+            },
+            homeDirectory: root
+        )
+
+        let credentials = ExportCredentials(claude: claudeCredential, codex: nil, gemini: nil)
+        _ = await fetcher.fetchCurrentSnapshot(credentials: credentials, forceRefresh: true)
+
+        assert(counter.value == 0,
+               "Active Claude sync should NOT run when Claude auth failed (unchanged path).")
     }
 
     private static func makeJWTBackedCredential(email: String) throws -> Data {

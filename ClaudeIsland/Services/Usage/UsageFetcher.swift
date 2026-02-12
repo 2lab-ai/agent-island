@@ -284,11 +284,12 @@ final class UsageFetcher {
 
             do {
                 let output = try await fetchUsageFromDocker(homeURL: build.homeURL, traceID: traceID)
-                try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "success")
+                let syncReason = output.claude.error ? "claude_auth_failed" : "success"
+                try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: syncReason)
                 logRefresh(event: "refresh_cycle_completed", fields: [
                     "trace_id": traceID,
                     "scope": "profile",
-                    "result": "success",
+                    "result": syncReason,
                 ])
                 return output
             } catch {
@@ -336,11 +337,12 @@ final class UsageFetcher {
 
             do {
                 let output = try await fetchUsageFromDocker(homeURL: build.homeURL, traceID: traceID)
-                try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: "success")
+                let syncReason = output.claude.error ? "claude_auth_failed" : "success"
+                try persistUpdatedCredentials(from: build.homeURL, targets: build.syncTargets, traceID: traceID, reason: syncReason)
                 logRefresh(event: "refresh_cycle_completed", fields: [
                     "trace_id": traceID,
                     "scope": "current",
-                    "result": "success",
+                    "result": syncReason,
                 ])
                 return output
             } catch {
@@ -941,7 +943,7 @@ final class UsageFetcher {
                     destinationData: existingData
                 )
                 logRefresh(event: "credential_sync_skipped", fields: fields)
-                if syncsActiveClaude {
+                if syncsActiveClaude && reason != "claude_auth_failed" {
                     try syncActiveClaudeCredential(
                         sourceData: sourceData,
                         destinationURL: target.destinationURL,
@@ -1063,8 +1065,13 @@ final class UsageFetcher {
         sourceData: Data,
         destinationData: Data?
     ) -> CredentialSyncDecision {
+        if reason == "claude_auth_failed" && relativePath.hasPrefix(".claude/") {
+            return .skip("claude_auth_failed_skip_claude_credential")
+        }
+
         let staleGuardSeconds: TimeInterval = 300
-        if reason == "success" {
+        let effectiveReason = reason == "claude_auth_failed" ? "success" : reason
+        if effectiveReason == "success" {
             guard let destinationData else {
                 return .write("destination_missing_on_success")
             }
