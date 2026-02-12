@@ -846,7 +846,7 @@ impl CAuthApp {
                     five_hour: "-- (--)".to_string(),
                     seven_day: "-- (--)".to_string(),
                     file_state: "read-error".to_string(),
-                }
+                };
             }
         };
 
@@ -1892,8 +1892,12 @@ impl CAuthApp {
         let gemini = self.fetch_gemini_check_usage();
         let zai = self.fetch_zai_check_usage();
 
-        let recommendation =
-            compute_check_usage_recommendation(&claude, codex.as_ref(), gemini.as_ref(), zai.as_ref());
+        let recommendation = compute_check_usage_recommendation(
+            &claude,
+            codex.as_ref(),
+            gemini.as_ref(),
+            zai.as_ref(),
+        );
 
         let output = CheckUsageOutput {
             claude,
@@ -1906,7 +1910,10 @@ impl CAuthApp {
 
         if json {
             let json_string = serde_json::to_string_pretty(&output).map_err(|err| {
-                CliError::new(format!("failed to serialize check-usage output: {}", err), 1)
+                CliError::new(
+                    format!("failed to serialize check-usage output: {}", err),
+                    1,
+                )
             })?;
             println!("{}", json_string);
         } else {
@@ -1927,7 +1934,10 @@ impl CAuthApp {
             self.print_check_usage_provider_text(zai);
         }
         if let Some(ref name) = output.recommendation {
-            println!("recommendation: {} ({})", name, output.recommendation_reason);
+            println!(
+                "recommendation: {} ({})",
+                name, output.recommendation_reason
+            );
         } else {
             println!("recommendation: {}", output.recommendation_reason);
         }
@@ -1959,32 +1969,41 @@ impl CAuthApp {
     }
 
     fn fetch_claude_check_usage(&self, account_id: Option<&str>) -> CheckUsageInfo {
-        let data = if let Some(account_id) = account_id {
-            let snapshot = match self.account_store.load_snapshot() {
-                Ok(s) => s,
-                Err(_) => return CheckUsageInfo::error_result("Claude"),
+        let (data, account_credential_path, should_sync_active) =
+            if let Some(account_id) = account_id {
+                let snapshot = match self.account_store.load_snapshot() {
+                    Ok(s) => s,
+                    Err(_) => return CheckUsageInfo::error_result("Claude"),
+                };
+                let account = match snapshot
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == account_id && a.service == UsageService::Claude)
+                {
+                    Some(a) => a,
+                    None => return CheckUsageInfo::error_result("Claude"),
+                };
+                let path = PathBuf::from(&account.root_path).join(".claude/.credentials.json");
+                let data = match fs::read(&path) {
+                    Ok(d) => d,
+                    Err(_) => return CheckUsageInfo::error_result("Claude"),
+                };
+                (data, Some(path), false)
+            } else {
+                let data = match self.load_current_credentials() {
+                    Some(d) => d,
+                    None => return CheckUsageInfo::error_result("Claude"),
+                };
+                (data, None, true)
             };
-            let account = match snapshot.accounts.iter().find(|a| {
-                a.id == account_id && a.service == UsageService::Claude
-            }) {
-                Some(a) => a,
-                None => return CheckUsageInfo::error_result("Claude"),
-            };
-            let path = PathBuf::from(&account.root_path).join(".claude/.credentials.json");
-            match fs::read(&path) {
-                Ok(d) => d,
-                Err(_) => return CheckUsageInfo::error_result("Claude"),
-            }
-        } else {
-            match self.load_current_credentials() {
-                Some(d) => d,
-                None => return CheckUsageInfo::error_result("Claude"),
-            }
-        };
 
         let working_data = match self.refresh_claude_credentials_always(&data) {
             Ok(refreshed) => {
-                let _ = self.sync_active_claude_credentials(&refreshed);
+                if should_sync_active {
+                    let _ = self.sync_active_claude_credentials(&refreshed);
+                } else if let Some(path) = account_credential_path.as_ref() {
+                    let _ = write_file_atomic(path, &refreshed);
+                }
                 refreshed
             }
             Err(_) => data,
@@ -2199,12 +2218,12 @@ impl CAuthApp {
 
         if let Some(raw_buckets) = raw_buckets {
             for bucket in raw_buckets {
-                let model_id = value_as_string(bucket.get("modelId"))
-                    .unwrap_or_else(|| "unknown".to_string());
+                let model_id =
+                    value_as_string(bucket.get("modelId")).unwrap_or_else(|| "unknown".to_string());
                 let remaining_fraction = bucket.get("remainingFraction").and_then(value_as_f64);
                 let used_percent = remaining_fraction.map(|r| ((1.0 - r) * 100.0).round());
-                let reset_time = value_as_string(bucket.get("resetTime"))
-                    .and_then(|s| normalize_to_iso(&s));
+                let reset_time =
+                    value_as_string(bucket.get("resetTime")).and_then(|s| normalize_to_iso(&s));
 
                 if model
                     .as_deref()
@@ -2328,11 +2347,10 @@ impl CAuthApp {
 
         let root: Value = response.json().ok()?;
         let access_token = value_as_string(root.get("access_token"))?;
-        let new_refresh = value_as_string(root.get("refresh_token"))
-            .unwrap_or_else(|| refresh_token.to_string());
+        let new_refresh =
+            value_as_string(root.get("refresh_token")).unwrap_or_else(|| refresh_token.to_string());
         let expires_in = root.get("expires_in").and_then(value_as_f64);
-        let expiry_date =
-            expires_in.map(|e| Utc::now().timestamp_millis() as f64 + e * 1000.0);
+        let expiry_date = expires_in.map(|e| Utc::now().timestamp_millis() as f64 + e * 1000.0);
 
         Some(GeminiCredentials {
             access_token,
@@ -2470,7 +2488,7 @@ impl CAuthApp {
                     tokens_percent = limit
                         .get("currentValue")
                         .and_then(value_as_f64)
-                        .map(|v| (v * 100.0).round().min(100.0).max(0.0));
+                        .map(|v| (v * 100.0).round().clamp(0.0, 100.0));
                     tokens_reset_at = value_as_string(limit.get("nextResetTime"))
                         .and_then(|s| normalize_to_iso(&s));
                 }
@@ -2479,7 +2497,7 @@ impl CAuthApp {
                         .get("usage")
                         .and_then(value_as_f64)
                         .or_else(|| limit.get("currentValue").and_then(value_as_f64))
-                        .map(|v| (v * 100.0).round().min(100.0).max(0.0));
+                        .map(|v| (v * 100.0).round().clamp(0.0, 100.0));
                     mcp_reset_at = value_as_string(limit.get("nextResetTime"))
                         .and_then(|s| normalize_to_iso(&s));
                 }
@@ -2524,9 +2542,7 @@ fn run() -> CliResult<()> {
         CliCommand::Save(name) => app.save_current_profile(&name),
         CliCommand::Switch(name) => app.switch_profile(&name),
         CliCommand::Refresh => app.refresh_all_profiles(),
-        CliCommand::CheckUsage { account_id, json } => {
-            app.check_usage(account_id.as_deref(), json)
-        }
+        CliCommand::CheckUsage { account_id, json } => app.check_usage(account_id.as_deref(), json),
     }
 }
 
@@ -3250,8 +3266,7 @@ fn normalize_to_iso(date_str: &str) -> Option<String> {
         );
     }
     if let Ok(ts) = date_str.parse::<f64>() {
-        return date_from_timestamp(ts)
-            .map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true));
+        return date_from_timestamp(ts).map(|d| d.to_rfc3339_opts(SecondsFormat::Millis, true));
     }
     None
 }
@@ -3260,7 +3275,11 @@ fn extract_url_origin(url: &str) -> Option<String> {
     let scheme_end = url.find("://")?;
     let after_scheme = &url[scheme_end + 3..];
     let host_end = after_scheme.find('/').unwrap_or(after_scheme.len());
-    Some(format!("{}{}", &url[..scheme_end + 3], &after_scheme[..host_end]))
+    Some(format!(
+        "{}{}",
+        &url[..scheme_end + 3],
+        &after_scheme[..host_end]
+    ))
 }
 
 fn compute_check_usage_recommendation(
@@ -3888,6 +3907,89 @@ mod tests {
     }
 
     #[test]
+    fn check_usage_account_mode_does_not_mutate_active_credentials() {
+        let temp = TempDir::new().expect("temp dir");
+        let home = temp.path().to_path_buf();
+        let account_id = "acct_claude_home_example_com";
+        let account_root = home.join(format!(".agent-island/accounts/{}", account_id));
+        let account_path = account_root.join(".claude/.credentials.json");
+        let active_path = home.join(".claude/.credentials.json");
+
+        write_credentials(
+            &account_path,
+            "at-account-before",
+            "rt-account-before",
+            1_700_000_000_000,
+            Some("home@example.com"),
+            None,
+        )
+        .expect("write account credential");
+        write_credentials(
+            &active_path,
+            "at-active-before",
+            "rt-active-before",
+            1_700_000_000_000,
+            Some("active@example.com"),
+            None,
+        )
+        .expect("write active credential");
+
+        let store = AccountStore::new(home.join(".agent-island"));
+        let snapshot = AccountsSnapshot {
+            accounts: vec![UsageAccount {
+                id: account_id.to_string(),
+                service: UsageService::Claude,
+                label: "claude:test".to_string(),
+                root_path: account_root.display().to_string(),
+                updated_at: utc_now_iso(),
+            }],
+            profiles: vec![UsageProfile {
+                name: "home".to_string(),
+                claude_account_id: Some(account_id.to_string()),
+                codex_account_id: None,
+                gemini_account_id: None,
+            }],
+        };
+        store.save_snapshot(&snapshot).expect("save snapshot");
+
+        let recorder = ProcessRecorder::default();
+        let refresh_client: RefreshClient = Arc::new(move |refresh_token, _| {
+            assert_eq!(refresh_token, "rt-account-before");
+            Ok(ClaudeRefreshPayload {
+                access_token: "at-account-after".to_string(),
+                refresh_token: Some("rt-account-after".to_string()),
+                expires_in: Some(28_800.0),
+                scope: Some("user:profile".to_string()),
+            })
+        });
+        let usage_client: UsageClient = Arc::new(|_| {
+            Some(UsageSummary {
+                five_hour_percent: Some(42),
+                five_hour_reset: DateTime::<Utc>::from_timestamp(1_900_000_000, 0),
+                seven_day_percent: Some(21),
+                seven_day_reset: DateTime::<Utc>::from_timestamp(1_900_010_000, 0),
+            })
+        });
+
+        let app = CAuthApp::with_clients(
+            home.clone(),
+            recorder.runner(),
+            refresh_client,
+            usage_client,
+        );
+        app.check_usage(Some(account_id), true)
+            .expect("check-usage --account");
+
+        let account_tokens = read_tokens(&account_path).expect("account tokens");
+        let active_tokens = read_tokens(&active_path).expect("active tokens");
+        assert_eq!(account_tokens.0.as_deref(), Some("at-account-after"));
+        assert_eq!(account_tokens.1.as_deref(), Some("rt-account-after"));
+        assert_eq!(active_tokens.0.as_deref(), Some("at-active-before"));
+        assert_eq!(active_tokens.1.as_deref(), Some("rt-active-before"));
+        assert_eq!(recorder.add_count(), 0);
+    }
+
+    #[test]
     fn refresh_dedupes_by_refresh_token_for_legacy_duplicate_accounts() {
         let temp = TempDir::new().expect("temp dir");
         let home = temp.path().to_path_buf();
@@ -4300,8 +4402,7 @@ mod tests {
             plan: None,
             buckets: None,
         };
-        let (name, reason) =
-            compute_check_usage_recommendation(&claude, Some(&codex), None, None);
+        let (name, reason) = compute_check_usage_recommendation(&claude, Some(&codex), None, None);
         assert_eq!(name.as_deref(), Some("codex"));
         assert!(reason.contains("30%"));
     }
@@ -4356,10 +4457,7 @@ mod tests {
         };
         let json = serde_json::to_string_pretty(&output).expect("serialize");
         let parsed: Value = serde_json::from_str(&json).expect("parse");
-        assert_eq!(
-            parsed.get("claude").unwrap().get("name").unwrap(),
-            "Claude"
-        );
+        assert_eq!(parsed.get("claude").unwrap().get("name").unwrap(), "Claude");
         assert_eq!(
             parsed.get("claude").unwrap().get("available").unwrap(),
             true

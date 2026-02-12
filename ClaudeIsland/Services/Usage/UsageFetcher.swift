@@ -33,6 +33,9 @@ struct UsageTokenRefresh: Sendable {
 
 enum UsageIssueKind: Sendable, Equatable {
     case cauthUnavailable
+    case cauthExecutionFailed
+    case cauthOutputInvalid
+    case credentialsMissing
 }
 
 struct UsageIssue: Sendable, Equatable {
@@ -55,27 +58,36 @@ struct UsageSnapshot: Sendable, Identifiable {
 }
 
 enum UsageFetcherError: LocalizedError {
+    case cauthUnavailable
+    case cauthCommandFailed(exitCode: Int32, stderr: String)
     case invalidJSON(underlying: Error)
     case noCredentialsFound
-    case cauthNotImplemented
 
     var errorDescription: String? {
         switch self {
+        case .cauthUnavailable:
+            return "cauth CLI is not installed or not available in PATH."
+        case .cauthCommandFailed(let exitCode, let stderr):
+            if stderr.isEmpty {
+                return "cauth check-usage failed (exit code \(exitCode))."
+            }
+            return "cauth check-usage failed (exit code \(exitCode)): \(stderr)"
         case .invalidJSON:
             return "Failed to parse check-usage JSON output."
         case .noCredentialsFound:
             return "No CLI credentials found for Claude/Codex/Gemini. Log in and try again."
-        case .cauthNotImplemented:
-            return "cauth CLI integration is not yet implemented."
         }
     }
 }
 
 final class UsageFetcher {
+    typealias CauthCheckUsageRunner = (String?) async throws -> Data
+
     private static let claudeRefreshLockRegistry = ClaudeRefreshLockRegistry()
 
     private let accountStore: AccountStore
     private let cache: UsageCache
+    private let cauthRunner: CauthCheckUsageRunner?
     private let homeDirectory: URL
     private let refreshLogWriter: UsageRefreshLogWriter
     private let identityCache = IdentityCache()
@@ -83,10 +95,12 @@ final class UsageFetcher {
     init(
         accountStore: AccountStore = AccountStore(),
         cache: UsageCache = UsageCache(),
+        cauthRunner: CauthCheckUsageRunner? = nil,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) {
         self.accountStore = accountStore
         self.cache = cache
+        self.cauthRunner = cauthRunner
         self.homeDirectory = homeDirectory
         self.refreshLogWriter = UsageRefreshLogWriter(homeDirectory: homeDirectory)
     }
@@ -119,7 +133,6 @@ final class UsageFetcher {
                 )
             }
 
-            // TODO: Replace with cauth CLI call
             let output = try await fetchUsageFromCauth(accountId: profile.claudeAccountId)
             let refreshedCredentials = loadCredentials(profile: profile, accounts: snapshot.accounts)
             tokenRefresh = resolveTokenRefresh(credentials: refreshedCredentials)
@@ -180,7 +193,6 @@ final class UsageFetcher {
         }
 
         do {
-            // TODO: Replace with cauth CLI call
             let output = try await fetchUsageFromCauth(accountId: nil)
             tokenRefresh = resolveTokenRefresh(credentials: loadCurrentCredentialsFromHome())
 
@@ -217,8 +229,61 @@ final class UsageFetcher {
     // MARK: - Internals
 
     private func fetchUsageFromCauth(accountId: String?) async throws -> CheckUsageOutput {
-        // TODO: Replace with cauth CLI call
-        throw UsageFetcherError.cauthNotImplemented
+        if let cauthRunner {
+            let data = try await cauthRunner(accountId)
+            do {
+                return try Self.decodeUsageOutput(data)
+            } catch {
+                throw UsageFetcherError.invalidJSON(underlying: error)
+            }
+        }
+
+        var arguments = ["cauth", "check-usage", "--json"]
+        if let accountId {
+            let trimmed = accountId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                arguments.append(contentsOf: ["--account", trimmed])
+            }
+        }
+
+        let result = await ProcessExecutor.shared.runWithResult("/usr/bin/env", arguments: arguments)
+        switch result {
+        case .success(let processResult):
+            let output = processResult.output
+            do {
+                return try Self.decodeUsageOutput(Data(output.utf8))
+            } catch {
+                throw UsageFetcherError.invalidJSON(underlying: error)
+            }
+        case .failure(let processError):
+            throw Self.mapCauthProcessError(processError)
+        }
+    }
+
+    private static func mapCauthProcessError(_ error: ProcessExecutorError) -> UsageFetcherError {
+        switch error {
+        case .commandNotFound:
+            return .cauthUnavailable
+        case .launchFailed:
+            return .cauthUnavailable
+        case .invalidOutput(let command):
+            return .cauthCommandFailed(exitCode: 1, stderr: "invalid output from \(command)")
+        case .executionFailed(_, let exitCode, let stderr):
+            let details = stderr?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let lowered = details.lowercased()
+            if lowered.contains("current claude credentials not found") {
+                return .noCredentialsFound
+            }
+            if lowered.contains("cauth") && lowered.contains("no such file or directory") {
+                return .cauthUnavailable
+            }
+            if lowered.contains("unknown command: check-usage")
+                || lowered.contains("usage: cauth check-usage")
+            {
+                return .cauthUnavailable
+            }
+            return .cauthCommandFailed(exitCode: exitCode, stderr: details)
+        }
     }
 
     private func credentialRelativePath(for service: UsageService) -> String {
@@ -526,15 +591,36 @@ final class UsageFetcher {
     }
 
     static func classifyIssue(from error: Error) -> UsageIssue? {
-        if error is UsageFetcherError {
-            return UsageIssue(
-                kind: .cauthUnavailable,
-                message: "cauth CLI integration is not yet available. Usage data will be shown when cauth is connected.",
-                technicalDetails: error.localizedDescription
-            )
+        guard let usageError = error as? UsageFetcherError else {
+            return nil
         }
 
-        return nil
+        switch usageError {
+        case .cauthUnavailable:
+            return UsageIssue(
+                kind: .cauthUnavailable,
+                message: "cauth CLI를 찾을 수 없습니다. `make install`로 설치 후 다시 시도해 주세요.",
+                technicalDetails: usageError.localizedDescription
+            )
+        case .cauthCommandFailed:
+            return UsageIssue(
+                kind: .cauthExecutionFailed,
+                message: "cauth usage 조회가 실패했습니다. 로그를 확인한 뒤 다시 시도해 주세요.",
+                technicalDetails: usageError.localizedDescription
+            )
+        case .invalidJSON:
+            return UsageIssue(
+                kind: .cauthOutputInvalid,
+                message: "cauth 응답을 해석하지 못했습니다. cauth 버전이나 출력 형식을 확인해 주세요.",
+                technicalDetails: usageError.localizedDescription
+            )
+        case .noCredentialsFound:
+            return UsageIssue(
+                kind: .credentialsMissing,
+                message: "사용 가능한 CLI 자격증명이 없습니다. Claude/Codex/Gemini 로그인 후 다시 시도해 주세요.",
+                technicalDetails: usageError.localizedDescription
+            )
+        }
     }
 }
 

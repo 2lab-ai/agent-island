@@ -8,6 +8,8 @@ enum UsageFetcherTests {
         try testIncompleteIdentityCacheEntryIsNotReused()
         try await testCurrentIdentityCacheInvalidatesWhenCredentialsChange()
         try await testCurrentSnapshotForceRefreshBypassesFreshCache()
+        try await testCurrentSnapshotInvalidCauthOutputClassifiesIssue()
+        try await testCurrentSnapshotMissingCredentialsClassifiesIssue()
         try await testClaudeSubscriptionMetadataFallbackFromCredentials()
         print("OK")
     }
@@ -153,31 +155,99 @@ enum UsageFetcherTests {
         defer { try? FileManager.default.removeItem(at: testHome) }
 
         let cache = UsageCache(ttl: 600)
+        let freshJSON = """
+        {
+          "claude": { "name": "Claude", "available": true, "error": false },
+          "codex": null,
+          "gemini": null,
+          "zai": null,
+          "recommendation": "claude",
+          "recommendationReason": "fresh"
+        }
+        """
         let fetcher = UsageFetcher(
             accountStore: AccountStore(rootDir: FileManager.default.temporaryDirectory),
             cache: cache,
+            cauthRunner: { _ in Data(freshJSON.utf8) },
             homeDirectory: testHome
         )
 
-        let json = """
+        let cachedJSON = """
         {
           "claude": { "name": "Claude", "available": true, "error": false },
           "codex": null,
           "gemini": null,
           "zai": null,
           "recommendation": null,
-          "recommendationReason": "n/a"
+          "recommendationReason": "cached"
         }
         """
-        let output = try UsageFetcher.decodeUsageOutput(Data(json.utf8))
+        let output = try UsageFetcher.decodeUsageOutput(Data(cachedJSON.utf8))
         await cache.set(profileName: "__current__", output: output)
 
         let empty = ExportCredentials(claude: nil, codex: nil, gemini: nil)
         let cached = await fetcher.fetchCurrentSnapshot(credentials: empty)
         assert(cached.isStale == false, "Expected fresh cache path when force refresh is not requested.")
+        assert(cached.output?.recommendationReason == "cached")
 
         let forced = await fetcher.fetchCurrentSnapshot(credentials: empty, forceRefresh: true)
-        assert(forced.isStale == true, "Expected forced refresh to bypass cache and fail into stale fallback with empty credentials.")
+        assert(forced.isStale == false, "Expected forced refresh to bypass cache and fetch fresh cauth output.")
+        assert(forced.output?.recommendationReason == "fresh")
+    }
+
+    private static func testCurrentSnapshotInvalidCauthOutputClassifiesIssue() async throws {
+        let testHome = try makeIsolatedHome(name: "invalid-cauth-output")
+        defer { try? FileManager.default.removeItem(at: testHome) }
+
+        let cache = UsageCache(ttl: 600)
+        let fetcher = UsageFetcher(
+            accountStore: AccountStore(rootDir: FileManager.default.temporaryDirectory),
+            cache: cache,
+            cauthRunner: { _ in Data("not-json".utf8) },
+            homeDirectory: testHome
+        )
+
+        let cachedJSON = """
+        {
+          "claude": { "name": "Claude", "available": true, "error": false },
+          "codex": null,
+          "gemini": null,
+          "zai": null,
+          "recommendation": null,
+          "recommendationReason": "cached"
+        }
+        """
+        let cachedOutput = try UsageFetcher.decodeUsageOutput(Data(cachedJSON.utf8))
+        await cache.set(profileName: "__current__", output: cachedOutput)
+
+        let snapshot = await fetcher.fetchCurrentSnapshot(
+            credentials: ExportCredentials(claude: nil, codex: nil, gemini: nil),
+            forceRefresh: true
+        )
+        assert(snapshot.isStale == true, "Expected stale fallback when cauth returns invalid JSON.")
+        assert(snapshot.issue?.kind == .cauthOutputInvalid)
+        assert(snapshot.output?.recommendationReason == "cached")
+    }
+
+    private static func testCurrentSnapshotMissingCredentialsClassifiesIssue() async throws {
+        let testHome = try makeIsolatedHome(name: "missing-credentials")
+        defer { try? FileManager.default.removeItem(at: testHome) }
+
+        let fetcher = UsageFetcher(
+            accountStore: AccountStore(rootDir: FileManager.default.temporaryDirectory),
+            cache: UsageCache(ttl: 0),
+            cauthRunner: { _ in
+                throw UsageFetcherError.noCredentialsFound
+            },
+            homeDirectory: testHome
+        )
+
+        let snapshot = await fetcher.fetchCurrentSnapshot(
+            credentials: ExportCredentials(claude: nil, codex: nil, gemini: nil),
+            forceRefresh: true
+        )
+        assert(snapshot.issue?.kind == .credentialsMissing)
+        assert(snapshot.issue?.technicalDetails?.contains("No CLI credentials found") == true)
     }
 
     private static func testClaudeSubscriptionMetadataFallbackFromCredentials() async throws {
