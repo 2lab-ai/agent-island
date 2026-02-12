@@ -2267,7 +2267,8 @@ private final class UsageRefreshLogWriter {
     private let logFileURL: URL
     private let logDirURL: URL
     private let queue = DispatchQueue(label: "ai.2lab.agent-island.usage-refresh-log")
-    private let maxLogBytes = 5 * 1024 * 1024
+    private let maxLogBytes = 10 * 1024 * 1024
+    private let maxRotatedFiles = 2
 
     init(homeDirectory: URL) {
         logDirURL = homeDirectory.appendingPathComponent(".agent-island/logs", isDirectory: true)
@@ -2316,10 +2317,18 @@ private final class UsageRefreshLogWriter {
         let currentSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
         if currentSize <= maxLogBytes { return }
 
-        let rotatedURL = logDirURL.appendingPathComponent("usage-refresh.log.1")
-        if FileManager.default.fileExists(atPath: rotatedURL.path) {
-            try FileManager.default.removeItem(at: rotatedURL)
+        for i in stride(from: maxRotatedFiles, through: 1, by: -1) {
+            let older = logDirURL.appendingPathComponent("usage-refresh.log.\(i)")
+            if i == maxRotatedFiles {
+                try? FileManager.default.removeItem(at: older)
+            } else {
+                let newer = logDirURL.appendingPathComponent("usage-refresh.log.\(i + 1)")
+                if FileManager.default.fileExists(atPath: older.path) {
+                    try? FileManager.default.moveItem(at: older, to: newer)
+                }
+            }
         }
+        let rotatedURL = logDirURL.appendingPathComponent("usage-refresh.log.1")
         try FileManager.default.moveItem(at: logFileURL, to: rotatedURL)
         FileManager.default.createFile(
             atPath: logFileURL.path,
