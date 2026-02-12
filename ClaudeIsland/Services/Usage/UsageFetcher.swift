@@ -1106,6 +1106,11 @@ final class UsageFetcher {
                 return .skip("same_token_material_on_success")
             }
 
+            if let destinationExpiry = destination.expiresAt,
+               destinationExpiry.timeIntervalSinceNow < 0 {
+                return .write("destination_expired_on_success")
+            }
+
             if let sourceExpiry = source.expiresAt,
                let destinationExpiry = destination.expiresAt,
                sourceExpiry.timeIntervalSince(destinationExpiry) < -staleGuardSeconds {
@@ -1131,6 +1136,11 @@ final class UsageFetcher {
 
         if !tokenMaterialChanged {
             return .skip("same_token_material_on_error")
+        }
+
+        if let destinationExpiry = destination.expiresAt,
+           destinationExpiry.timeIntervalSinceNow < 0 {
+            return .write("destination_expired_on_error")
         }
 
         if let sourceExpiry = source.expiresAt,
